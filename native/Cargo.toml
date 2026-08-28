@@ -1,0 +1,3 @@
+[workspace]
+members = ["harness-fs"]
+resolver = "2"

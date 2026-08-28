@@ -1,14 +1,16 @@
 """Production-grade model router.
 
-Selects the best model for a task using scoring, health tracking,
-fallback chains, and budget enforcement. Supports multiple providers.
+Selects the best model for a task using 14-dimension scoring,
+health tracking, fallback chains, budget enforcement,
+task classification, and model registry capabilities.
+Supports multiple providers.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from harness_core.observability.events import Event, EventBus
 from harness_core.providers.base import (
@@ -25,6 +27,9 @@ from harness_core.routing.scoring import (
     ScoringWeights,
     rank_models,
 )
+
+if TYPE_CHECKING:
+    from harness_core.routing.task_aware import TaskAwareRouter
 
 
 @dataclass
@@ -77,10 +82,11 @@ class ModelRouter:
     Architecture:
         1. Discover models from all providers
         2. Filter by health and capability
-        3. Score by task context
-        4. Build fallback chain
-        5. Execute with retry/fallback via FallbackEngine
-        6. Track health and budget
+        3. Classify task (via TaskAwareRouter if available)
+        4. Score by 14 dimensions (task type, capability, history, etc.)
+        5. Build fallback chain
+        6. Execute with retry/fallback via FallbackEngine
+        7. Track health and budget
     """
 
     def __init__(
@@ -88,6 +94,7 @@ class ModelRouter:
         providers: list[ModelProvider] | None = None,
         config: RouterConfig | None = None,
         event_bus: EventBus | None = None,
+        task_aware: TaskAwareRouter | None = None,
     ) -> None:
         self.providers: dict[str, ModelProvider] = {}
         for p in (providers or []):
@@ -100,6 +107,7 @@ class ModelRouter:
             fallback_config=self.config.fallback,
         )
         self.event_bus = event_bus or EventBus()
+        self.task_aware = task_aware
         self._model_cache: list[ModelInfo] = []
         self._last_refresh: float = 0.0
         self._routing_decisions: list[RoutingDecision] = []
@@ -163,7 +171,11 @@ class ModelRouter:
         self,
         request: CompletionRequest,
     ) -> ScoringContext:
-        """Build scoring context from a completion request."""
+        """Build scoring context from a completion request.
+
+        Uses TaskAwareRouter for task classification when available.
+        Falls back to keyword heuristics otherwise.
+        """
         # Extract task description from the last user message
         task_desc = ""
         for msg in reversed(request.messages):
@@ -172,10 +184,36 @@ class ModelRouter:
                 break
 
         has_tools = bool(request.tools)
-        needs_vision = False  # TODO: detect from message content
+        needs_vision = False
 
         # Determine prefer_free based on routing mode
         prefer_free = self.config.prefer_free or self.config.routing_mode == "free"
+
+        # Use TaskAwareRouter for classification if available
+        task_type = ""
+        classification_confidence = 0.0
+        model_caps: dict[str, float] = {}
+        hist_success = 0.0
+        hist_latency = 0.0
+        hist_efficiency = 0.0
+
+        if self.task_aware is not None:
+            task_type_obj, profile, confidence = self.task_aware.classify_task(request)
+            task_type = task_type_obj.value if task_type_obj else ""
+            classification_confidence = confidence
+        else:
+            # Fallback: keyword heuristics
+            task_lower = task_desc.lower()
+            if any(kw in task_lower for kw in ["fix", "bug", "error", "fail"]):
+                task_type = "bug_fix"
+            elif any(kw in task_lower for kw in ["implement", "create", "add", "build"]):
+                task_type = "implementation"
+            elif any(kw in task_lower for kw in ["refactor", "restructure", "clean"]):
+                task_type = "refactoring"
+            elif any(kw in task_lower for kw in ["explain", "research", "analyze"]):
+                task_type = "research"
+            elif any(kw in task_lower for kw in ["test", "coverage"]):
+                task_type = "testing"
 
         # Detect task tags from content
         task_tags: list[str] = []
@@ -190,7 +228,10 @@ class ModelRouter:
         # Estimate context size from messages
         est_tokens = sum(
             len(str(msg.get("content", ""))) // 4 for msg in request.messages
-        ) + 1000  # buffer for system prompt + tools
+        ) + 1000
+
+        # User-selected model
+        user_model = request.model or ""
 
         return ScoringContext(
             task_description=task_desc,
@@ -200,6 +241,14 @@ class ModelRouter:
             prefer_free=prefer_free,
             routing_mode=self.config.routing_mode,
             task_tags=task_tags,
+            # New 14-dimension fields
+            task_type=task_type,
+            classification_confidence=classification_confidence,
+            model_capability_scores=model_caps,
+            historical_success_rate=hist_success,
+            historical_avg_latency_ms=hist_latency,
+            historical_tool_efficiency=hist_efficiency,
+            user_selected_model=user_model,
         )
 
     async def select_models(

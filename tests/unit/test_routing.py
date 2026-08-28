@@ -122,6 +122,9 @@ class TestScoringWeights:
         total = (
             w.capability + w.task_fit + w.tool_support + w.context_fit
             + w.cost + w.reliability + w.latency + w.free_bonus
+            + w.task_type_fit + w.capability_fit
+            + w.history_success + w.history_latency
+            + w.tool_efficiency + w.user_preference
         )
         assert abs(total - 1.0) < 1e-6
 
@@ -130,6 +133,9 @@ class TestScoringWeights:
         w = ScoringWeights(
             capability=5, task_fit=0, tool_support=0, context_fit=0,
             cost=5, reliability=0, latency=0, free_bonus=0,
+            task_type_fit=0, capability_fit=0,
+            history_success=0, history_latency=0,
+            tool_efficiency=0, user_preference=0,
         ).normalized()
         assert abs(w.capability - 0.5) < 1e-6
         assert abs(w.cost - 0.5) < 1e-6

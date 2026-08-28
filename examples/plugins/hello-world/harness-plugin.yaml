@@ -1,0 +1,11 @@
+name: hello-world
+version: 0.1.0
+description: "A minimal example Harness plugin that provides a hello-world tool."
+author: "Harness Team"
+entrypoint: plugin.py
+type: TOOL
+capabilities:
+  - hello
+permissions:
+  - filesystem.read
+dependencies: []

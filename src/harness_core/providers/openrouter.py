@@ -66,9 +66,13 @@ class OpenRouterProvider(ModelProvider):
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
 
+        # Handle content=None (reasoning models return content:null)
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls") or []
+
         return CompletionResponse(
-            content=message.get("content", ""),
-            tool_calls=message.get("tool_calls", []),
+            content=content,
+            tool_calls=tool_calls,
             model=data.get("model", ""),
             provider=self.name,
             usage=data.get("usage", {}),

@@ -1,13 +1,13 @@
 # Harness Engineering CLI
 
-A model-agnostic, autonomous software-engineering harness.
+A model-agnostic, autonomous AI software-engineering agent that runs in your terminal.
 
-## What is this?
+## What is Harness?
 
-Harness Engineering CLI is not another AI coding chatbot. It's an engineering harness that:
+Harness is not another AI chatbot. It's an engineering harness that:
 
 - **Plans** before implementing
-- **Inspects** the repository
+- **Inspects** your repository
 - **Executes** tools to modify code
 - **Verifies** changes work
 - **Recovers** from failures
@@ -18,117 +18,165 @@ The LLM is a replaceable reasoning component. The harness is the product.
 ## Installation
 
 ```bash
-# Clone the repository
+pip install harness-engineering
+```
+
+Or from source:
+
+```bash
 git clone https://github.com/kunalsanga/Harness-CLI.git
 cd Harness-CLI
-
-# Install with uv (recommended)
-uv sync
-
-# Or with pip
 pip install -e .
 ```
 
 ## Quick Start
 
 ```bash
-# Set up your API key
-cp .env.example .env
-# Edit .env and add your OpenRouter API key
+# 1. Setup a provider (OpenRouter recommended — free models available)
+export OPENROUTER_API_KEY="sk-or-v1-..."
+harness setup
 
-# Initialize a project
+# 2. Initialize a project
+cd your-project
 harness init
 
-# Run an engineering task
-harness run "Fix all failing tests without modifying the tests"
+# 3. Run a task
+harness run "Fix the failing tests"
 
-# Check system health
-harness doctor
-
-# List available models
-harness models
+# 4. Resume later
+harness session list
+harness session resume <id>
 ```
 
-## Configuration
+## Supported Providers
 
-Harness reads API keys from environment variables:
+| Provider | API Key | Free Models | Local |
+|----------|---------|-------------|-------|
+| [OpenRouter](https://openrouter.ai) | Required | 20+ free models | No |
+| [Ollama](https://ollama.com) | None | All local | Yes |
+| [LiteLLM](https://litellm.ai) | Required | Depends on backend | No |
 
-| Variable | Purpose | Required |
-|----------|---------|----------|
-| `OPENROUTER_API_KEY` | OpenRouter multi-model gateway | Yes (for cloud models) |
-| `LITELLM_API_KEY` | LiteLLM unified abstraction | No |
-| `OLLAMA_HOST` | Ollama local inference | No (default: localhost:11434) |
+### Free Models
 
-**Never commit API keys or `.env` files to version control.**
+Harness supports free models out of the box:
+
+```bash
+harness models list --free
+harness models recommend --task "Fix failing tests"
+```
+
+### Local Models (Ollama)
+
+```bash
+ollama serve
+ollama pull codellama
+harness models local
+harness run --model codellama "Fix the tests"
+```
+
+## Commands
+
+```bash
+harness --help                    # General help
+harness setup                     # Interactive setup wizard
+harness doctor                    # System health check
+harness init                      # Initialize a project
+harness run "task description"    # Run a coding task
+
+harness providers list            # List providers
+harness providers configure openrouter  # Setup provider
+
+harness models list               # List all models
+harness models list --free        # Free models only
+harness models recommend --task "..."  # Best model for a task
+harness models inspect <model>    # Model details
+harness models compare <a> <b>    # Compare models
+
+harness session list              # Recent sessions
+harness session show <id>         # Session details
+harness session resume <id>       # Resume a session
+
+harness agents list               # Available agents
+harness agents inspect <name>     # Agent details
+
+harness tools list                # Available tools
+harness plugin list               # Installed plugins
+harness mcp list                  # MCP servers
+harness hooks list                # Lifecycle hooks
+```
+
+## Multi-Agent Orchestration
+
+Harness can decompose complex tasks into specialized agents:
+
+```bash
+harness run --mode multi-agent "Implement auth, add tests, review changes"
+```
+
+Available agents: Planner, Researcher, Analyzer, Coder, Tester, Reviewer, Debugger.
 
 ## Architecture
 
 ```
-GOAL
-↓
-UNDERSTAND
-↓
-PLAN
-↓
-CONTEXT
-↓
-SELECT MODEL
-↓
-EXECUTE
-↓
-OBSERVE
-↓
-VERIFY
-↓
-EVALUATION
-↓
-SUCCESS?
-├── YES → DELIVER
-└── NO  → DIAGNOSE → REPLAN → EXECUTE
+USER → ORCHESTRATOR → SPECIALIZED AGENTS → MODEL ROUTER → TOOLS → VERIFICATION → RESULT
+                            ↓
+                    SESSION PERSISTENCE
 ```
 
-## Core Principles
+- **Model-agnostic**: Works with OpenRouter, Ollama, LiteLLM, or any OpenAI-compatible API
+- **Persistent sessions**: Resume work across interruptions
+- **Empirical intelligence**: Learns which models work best for which tasks
+- **Verification-first**: Always runs tests/checks before reporting success
+- **Secure**: Conservative defaults, permission controls, no source upload
 
-1. **Model Independence** — Use any model from any provider
-2. **Verification First** — Success is evidence-based
-3. **Recovery** — Failures are part of the loop
-4. **Security** — Permissions and sandboxing
-5. **Observability** — Every run is traceable
+## Configuration
+
+```yaml
+# .harness/config.yaml
+routing:
+  strategy: auto
+  prefer_free: true
+
+budgets:
+  max_cost_per_task: 1.0
+  max_tool_calls: 100
+```
+
+See [Configuration Guide](docs/configuration.md) for full reference.
+
+## Platform Support
+
+| Platform | Status |
+|----------|--------|
+| Windows (PowerShell/CMD) | First-class |
+| Linux | First-class |
+| macOS | First-class |
 
 ## Development
 
 ```bash
-# Run all tests
-uv run pytest tests/ -v
+# Install development dependencies
+pip install -e ".[dev]"
 
-# Run benchmarks
-uv run pytest tests/benchmarks/ -v -s
+# Run tests
+uv run pytest tests/ -q
 
-# Run with free models
-harness run --mode free "Your task here"
-
-# Run with budget limits
-harness run --max-cost 0.50 --max-iterations 5 "Your task here"
+# Build package
+python -m build
 ```
-
-## Documentation
-
-- [Vision](docs/vision.md)
-- [Architecture](docs/architecture.md)
-- [Competitive Analysis](docs/competitive-analysis.md)
-- [Roadmap](docs/roadmap.md)
-- [Security Model](docs/security-model.md)
-- [Model Routing](docs/model-routing.md)
-- [Performance](docs/performance.md)
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+- API keys stored in environment variables, never in source code
+- Conservative default permissions
+- Workspace boundary enforcement
+- No telemetry or source upload by default
+- See [Security Model](docs/security-model.md)
 
 ## License
 
-License decision required before public release.
+MIT License — see [LICENSE](LICENSE)
+
+## Contributing
+
+See [Development Guide](docs/development.md) for setup instructions.

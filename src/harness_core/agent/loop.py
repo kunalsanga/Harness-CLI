@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from harness_core.agent.types import (
     AgentConfig,
@@ -25,6 +25,9 @@ from harness_core.routing.router import ModelRouter, RouterConfig
 from harness_core.tools.base import Tool
 from harness_core.verification.engine import VerificationEngine
 
+if TYPE_CHECKING:
+    from harness_core.routing.task_aware import TaskAwareRouter
+
 
 class AgentLoop:
     """The core agent loop that drives the engineering workflow."""
@@ -37,6 +40,7 @@ class AgentLoop:
         config: AgentConfig | None = None,
         event_bus: EventBus | None = None,
         router: ModelRouter | None = None,
+        task_aware: TaskAwareRouter | None = None,
     ) -> None:
         self.provider = provider
         self.tools = {t.schema.name: t for t in tools}
@@ -44,6 +48,7 @@ class AgentLoop:
         self.config = config or AgentConfig()
         self.event_bus = event_bus or EventBus()
         self.router = router
+        self.task_aware = task_aware
         self.budget = BudgetManager() if router is None else router.budget
         self.context_engine = ContextEngine(self.workspace_root)
         self.permission_manager = PermissionManager(self.workspace_root)
@@ -169,6 +174,25 @@ When you are done, summarize what you did and provide evidence of success."""
             Event(type="task.started", source="agent_loop", data={"goal": goal})
         )
 
+        # Classify task if task_aware router is available
+        task_type = None
+        task_profile = None
+        classification_confidence = 0.0
+        if self.task_aware is not None:
+            # Build a minimal request for classification
+            classify_request = CompletionRequest(messages=[{"role": "user", "content": goal}])
+            task_type, task_profile, classification_confidence = self.task_aware.classify_task(classify_request)
+            await self.event_bus.emit(
+                Event(
+                    type="task.classified",
+                    source="agent_loop",
+                    data={
+                        "task_type": task_type.value if task_type else "unknown",
+                        "confidence": classification_confidence,
+                    },
+                )
+            )
+
         # Discover project
         project_info = await self.context_engine.discover_project()
 
@@ -273,6 +297,20 @@ When you are done, summarize what you did and provide evidence of success."""
         if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             task.status = TaskStatus.FAILED
             task.error = "Max iterations reached"
+
+        # Record performance if task_aware is available
+        if self.task_aware is not None and self.router is not None:
+            decisions = self.router.get_routing_decisions()
+            model_used = decisions[-1].selected_model if decisions else "unknown"
+            provider_used = decisions[-1].selected_provider if decisions else "unknown"
+            self.task_aware.record_task_result(
+                model_id=model_used,
+                provider=provider_used,
+                task_type=task_type.value if task_type else "unknown",
+                success=task.status == TaskStatus.COMPLETED,
+                tool_calls=len(task.tool_calls),
+                iterations=task.iterations,
+            )
 
         await self.event_bus.emit(
             Event(

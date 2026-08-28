@@ -1,41 +1,64 @@
 """Model scoring for intelligent routing.
 
-Each scoring function returns a value in [0.0, 1.0] where 1.0 is best.
-Weights are configurable and sum to 1.0 by default.
+14-dimension scoring system:
+ 1. capability       — context window as proxy for raw capability
+ 2. task_fit         — model naming alignment with task type
+ 3. tool_support     — whether model supports function calling
+ 4. context_fit      — whether context window fits the task
+ 5. cost             — cost per token (lower is better)
+ 6. reliability      — historical success rate
+ 7. latency          — response latency
+ 8. free_bonus       — bonus for free models when prefer_free
+ 9. task_type_fit    — how well model matches task classification
+10. capability_fit   — empirical capability from ModelRegistry
+11. history_success  — historical success rate from PerformanceHistory
+12. history_latency  — historical latency from PerformanceHistory
+13. tool_efficiency  — historical tool-call efficiency
+14. user_preference  — bonus for user-selected model
+
+Each scoring function returns [0.0, 1.0] where 1.0 is best.
+Weights are configurable and sum to 1.0.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from harness_core.providers.base import ModelInfo
 
 
 @dataclass
 class ScoringWeights:
-    """Configurable weights for model scoring. Must sum to 1.0."""
+    """Configurable weights for 14-dimension model scoring. Must sum to 1.0."""
 
-    capability: float = 0.20
-    task_fit: float = 0.15
-    tool_support: float = 0.15
-    context_fit: float = 0.10
-    cost: float = 0.10
-    reliability: float = 0.15
+    # Original 8 dimensions
+    capability: float = 0.10
+    task_fit: float = 0.08
+    tool_support: float = 0.10
+    context_fit: float = 0.07
+    cost: float = 0.07
+    reliability: float = 0.10
     latency: float = 0.05
-    free_bonus: float = 0.10
+    free_bonus: float = 0.05
+
+    # New 6 dimensions (M3.6)
+    task_type_fit: float = 0.10      # TaskClassifier alignment
+    capability_fit: float = 0.08     # Empirical capability from registry
+    history_success: float = 0.05    # Historical success rate
+    history_latency: float = 0.03    # Historical latency
+    tool_efficiency: float = 0.03    # Tool-call efficiency
+    user_preference: float = 0.01    # User-selected model bonus
 
     def normalized(self) -> ScoringWeights:
         """Return weights normalized to sum to 1.0."""
         total = (
-            self.capability
-            + self.task_fit
-            + self.tool_support
-            + self.context_fit
-            + self.cost
-            + self.reliability
-            + self.latency
-            + self.free_bonus
+            self.capability + self.task_fit + self.tool_support
+            + self.context_fit + self.cost + self.reliability
+            + self.latency + self.free_bonus
+            + self.task_type_fit + self.capability_fit
+            + self.history_success + self.history_latency
+            + self.tool_efficiency + self.user_preference
         )
         if total == 0:
             return ScoringWeights()
@@ -48,12 +71,21 @@ class ScoringWeights:
             reliability=self.reliability / total,
             latency=self.latency / total,
             free_bonus=self.free_bonus / total,
+            task_type_fit=self.task_type_fit / total,
+            capability_fit=self.capability_fit / total,
+            history_success=self.history_success / total,
+            history_latency=self.history_latency / total,
+            tool_efficiency=self.tool_efficiency / total,
+            user_preference=self.user_preference / total,
         )
 
 
 @dataclass
 class ScoringContext:
-    """Context for scoring a model against a specific task."""
+    """Context for scoring a model against a specific task.
+
+    Includes all 14 dimensions of routing context.
+    """
 
     task_description: str = ""
     requires_tools: bool = True
@@ -64,6 +96,22 @@ class ScoringContext:
     routing_mode: str = "auto"
     # Tag hints from the task (e.g. "coding", "reasoning", "research")
     task_tags: list[str] = field(default_factory=list)
+
+    # New: task classification (from TaskClassifier)
+    task_type: str = ""              # e.g. "bug_fix", "implementation"
+    classification_confidence: float = 0.0
+
+    # New: empirical capability (from ModelRegistry)
+    model_capability_scores: dict[str, float] = field(default_factory=dict)  # cap_name -> score
+
+    # New: historical performance (from PerformanceHistory)
+    historical_success_rate: float = 0.0
+    historical_avg_latency_ms: float = 0.0
+    historical_tool_efficiency: float = 0.0  # tool_calls / iterations (lower = more efficient)
+    historical_recovery_rate: float = 0.0
+
+    # New: user-selected model
+    user_selected_model: str = ""
 
 
 def score_capability(model: ModelInfo, ctx: ScoringContext) -> float:
@@ -191,12 +239,132 @@ def score_free_bonus(model: ModelInfo, ctx: ScoringContext) -> float:
     return 1.0 if model.is_free else 0.0
 
 
+def score_task_type_fit(model: ModelInfo, ctx: ScoringContext) -> float:
+    """Score based on task type classification alignment.
+
+    Uses TaskClassifier output to match model strengths to task type.
+    Returns 0.0–1.0.
+    """
+    if not ctx.task_type:
+        return 0.5  # no classification, neutral
+
+    model_id_lower = model.id.lower()
+
+    # Task type → model alignment scoring
+    task_alignments: dict[str, list[tuple[list[str], float]]] = {
+        "bug_fix": [
+            ("coder", 0.8), ("deepseek", 0.7), ("debug", 0.6),
+            ("claude", 0.7), ("gpt-4", 0.7),
+        ],
+        "implementation": [
+            ("coder", 0.8), ("deepseek-coder", 0.9), ("qwen-coder", 0.8),
+            ("starcoder", 0.8), ("codestral", 0.8),
+        ],
+        "debugging": [
+            ("deepseek", 0.8), ("claude", 0.7), ("gpt-4", 0.7),
+            ("reason", 0.6), ("think", 0.6),
+        ],
+        "refactoring": [
+            ("coder", 0.7), ("deepseek", 0.7), ("claude", 0.8),
+            ("gpt-4", 0.7),
+        ],
+        "testing": [
+            ("coder", 0.7), ("deepseek", 0.7), ("claude", 0.8),
+        ],
+        "research": [
+            ("claude", 0.8), ("gpt-4", 0.8), ("gemini", 0.7),
+            ("llama", 0.6),
+        ],
+        "repository_analysis": [
+            ("coder", 0.7), ("deepseek", 0.7), ("claude", 0.8),
+        ],
+        "documentation": [
+            ("claude", 0.8), ("gpt-4", 0.7), ("gemini", 0.7),
+        ],
+    }
+
+    alignments = task_alignments.get(ctx.task_type, [])
+    if not alignments:
+        return 0.5  # no alignment data
+
+    best_score = 0.0
+    for keywords, score in alignments:
+        for kw in keywords:
+            if kw in model_id_lower:
+                best_score = max(best_score, score)
+                break
+
+    return best_score if best_score > 0 else 0.4  # slight penalty for unknown alignment
+
+
+def score_capability_fit(model: ModelInfo, ctx: ScoringContext) -> float:
+    """Score based on empirical capability from ModelRegistry.
+
+    Uses actual measured capability scores, not just naming heuristics.
+    Returns 0.0–1.0. 0.5 = no data (neutral).
+    """
+    if not ctx.model_capability_scores:
+        return 0.5  # no data, neutral
+
+    # Average available capability scores
+    scores = [v for v in ctx.model_capability_scores.values() if v is not None]
+    if not scores:
+        return 0.5
+    return sum(scores) / len(scores)
+
+
+def score_history_success(model: ModelInfo, ctx: ScoringContext) -> float:
+    """Score based on historical success rate.
+
+    Returns 0.0–1.0. 0.5 = no history (neutral).
+    """
+    if ctx.historical_success_rate <= 0:
+        return 0.5  # no history, neutral
+    return max(0.0, min(1.0, ctx.historical_success_rate))
+
+
+def score_history_latency(model: ModelInfo, ctx: ScoringContext) -> float:
+    """Score based on historical latency.
+
+    Lower latency = higher score. 0 = unknown (neutral).
+    Returns 0.0–1.0.
+    """
+    if ctx.historical_avg_latency_ms <= 0:
+        return 0.5  # unknown, neutral
+    # <500ms = 1.0, 1s = 0.8, 2s = 0.6, 5s = 0.3, 10s+ = 0.1
+    return max(0.0, min(1.0, 1.0 - (ctx.historical_avg_latency_ms / 10000)))
+
+
+def score_tool_efficiency(model: ModelInfo, ctx: ScoringContext) -> float:
+    """Score based on tool-call efficiency (lower ratio = more efficient).
+
+    Efficiency = iterations / tool_calls. Higher is better.
+    Returns 0.0–1.0. 0.5 = no data (neutral).
+    """
+    if ctx.historical_tool_efficiency <= 0:
+        return 0.5  # no data, neutral
+    # efficiency > 1.0 means more iterations per tool call (bad)
+    # efficiency < 1.0 means more tool calls per iteration (good)
+    # Map: 0.2 → 0.9, 0.5 → 0.7, 1.0 → 0.5, 2.0 → 0.3, 5.0 → 0.1
+    return max(0.0, min(1.0, 0.6 - (ctx.historical_tool_efficiency - 0.5) * 0.4))
+
+
+def score_user_preference(model: ModelInfo, ctx: ScoringContext) -> float:
+    """Score bonus for user-selected model.
+
+    Returns 0.0–1.0. 0.5 = no preference (neutral).
+    """
+    if ctx.user_selected_model and model.id == ctx.user_selected_model:
+        return 1.0  # user explicitly selected this model
+    return 0.5  # neutral
+
+
 def compute_model_score(
     model: ModelInfo,
     ctx: ScoringContext,
     weights: ScoringWeights | None = None,
 ) -> float:
-    """Compute the total weighted score for a model.
+    """Compute the total weighted score for a model using 14 dimensions.
 
     Returns a value in [0.0, 1.0] where 1.0 is the best fit.
     """
@@ -205,6 +373,7 @@ def compute_model_score(
     w = weights.normalized()
 
     scores = {
+        # Original 8 dimensions
         "capability": score_capability(model, ctx),
         "task_fit": score_task_fit(model, ctx),
         "tool_support": score_tool_support(model, ctx),
@@ -213,6 +382,13 @@ def compute_model_score(
         "reliability": score_reliability(model, ctx),
         "latency": score_latency(model, ctx),
         "free_bonus": score_free_bonus(model, ctx),
+        # New 6 dimensions
+        "task_type_fit": score_task_type_fit(model, ctx),
+        "capability_fit": score_capability_fit(model, ctx),
+        "history_success": score_history_success(model, ctx),
+        "history_latency": score_history_latency(model, ctx),
+        "tool_efficiency": score_tool_efficiency(model, ctx),
+        "user_preference": score_user_preference(model, ctx),
     }
 
     total = (
@@ -224,6 +400,12 @@ def compute_model_score(
         + w.reliability * scores["reliability"]
         + w.latency * scores["latency"]
         + w.free_bonus * scores["free_bonus"]
+        + w.task_type_fit * scores["task_type_fit"]
+        + w.capability_fit * scores["capability_fit"]
+        + w.history_success * scores["history_success"]
+        + w.history_latency * scores["history_latency"]
+        + w.tool_efficiency * scores["tool_efficiency"]
+        + w.user_preference * scores["user_preference"]
     )
 
     return max(0.0, min(1.0, total))

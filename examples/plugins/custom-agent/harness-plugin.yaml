@@ -1,0 +1,12 @@
+name: security-reviewer
+version: 0.1.0
+description: "Security-focused code reviewer agent plugin."
+author: "Harness Team"
+entrypoint: plugin.py
+type: AGENT
+capabilities:
+  - security_analysis
+  - code_review
+permissions:
+  - filesystem.read
+dependencies: []

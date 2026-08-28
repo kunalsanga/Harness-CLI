@@ -1,0 +1,11 @@
+name: code-quality
+version: 0.1.0
+description: "Code quality analysis plugin for Harness."
+author: "Harness Team"
+entrypoint: plugin.py
+type: TOOL
+capabilities:
+  - code_analysis
+permissions:
+  - filesystem.read
+dependencies: []
