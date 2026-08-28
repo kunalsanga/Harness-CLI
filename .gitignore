@@ -1,0 +1,82 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# uv
+.uv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Harness local state
+.harness/local/
+.harness/cache/
+.harness/runtime/
+.harness/logs/
+
+# Local model/cache artifacts
+models/
+model-cache/
+embeddings/
+*.sqlite-wal
+*.sqlite-shm
+
+# Benchmark generated artifacts
+benchmarks/output/
+benchmark-results/
+performance-results/
+
+# Node
+node_modules/
+
+# Rust
+target/
+
+# C++
+build/

@@ -1,0 +1,15 @@
+routing:
+  strategy: auto
+  prefer_free: true
+  fallback: true
+
+budgets:
+  max_cost_per_task: 1.0
+  max_tool_calls: 100
+  max_iterations: 30
+
+permissions:
+  bash: ask
+  edit: allow
+  network: ask
+  git_push: ask
