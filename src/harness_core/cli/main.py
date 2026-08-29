@@ -28,9 +28,18 @@ if sys.platform == "win32":
 app = typer.Typer(
     name="harness",
     help="Harness Engineering CLI — A model-agnostic, autonomous software-engineering harness.",
-    no_args_is_help=True,
+    no_args_is_help=False,
+    invoke_without_command=True,
 )
 console = Console()
+
+
+@app.callback(invoke_without_command=True)
+def _main_callback(ctx: typer.Context) -> None:
+    """Start interactive shell when no subcommand is given."""
+    if ctx.invoked_subcommand is None:
+        from harness_core.cli.interactive import run_interactive
+        run_interactive()
 
 # Sub-commands
 config_app = typer.Typer(help="Configuration commands")
@@ -381,6 +390,29 @@ def run(
             raise typer.Exit(code=1)
 
     asyncio.run(_run())
+
+
+@app.command(name="shell")
+def shell(
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model to use"),
+    mode: str = typer.Option("auto", "--mode", help="Execution mode"),
+    free: bool = typer.Option(False, "--free", help="Use free models only"),
+    local: bool = typer.Option(False, "--local", help="Use local Ollama models"),
+    plain: bool = typer.Option(False, "--plain", help="Plain terminal mode"),
+    max_iterations: int = typer.Option(30, "--max-iterations", help="Max iterations"),
+    max_cost: Optional[float] = typer.Option(None, "--max-cost", help="Max cost"),
+) -> None:
+    """Start an interactive coding session."""
+    from harness_core.cli.interactive import run_interactive
+    run_interactive(
+        model=model,
+        mode=mode,
+        free=free,
+        local=local,
+        plain=plain,
+        max_iterations=max_iterations,
+        max_cost=max_cost,
+    )
 
 
 @app.command()
