@@ -316,6 +316,25 @@ class InteractiveShell:
                 routing_mode=effective_mode,
             )
 
+            # Interactive approval callback
+            def _approval_callback(tool_name: str, description: str) -> bool:
+                cmd_display = _tool_display_name(tool_name, {})
+                self.console.print(
+                    f"\n  [yellow]⚠ Permission required:[/] [bold]{cmd_display}[/]",
+                    highlight=False,
+                )
+                if description:
+                    self.console.print(f"  [dim]{description}[/]", highlight=False)
+                try:
+                    from rich.prompt import Confirm
+                    approved = Confirm.ask(
+                        "  [bold]Allow?[/]",
+                        default=False,
+                    )
+                    return approved
+                except (EOFError, KeyboardInterrupt):
+                    return False
+
             # Agent loop
             self._agent_loop = AgentLoop(
                 provider=self._provider,
@@ -326,6 +345,8 @@ class InteractiveShell:
                 router=self._router,
                 task_aware=self._task_aware,
             )
+            # Wire interactive approval into permission manager
+            self._agent_loop.permission_manager.approval_callback = _approval_callback
 
             return True
 

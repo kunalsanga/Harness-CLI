@@ -53,6 +53,8 @@ class AgentLoop:
         self.context_engine = ContextEngine(self.workspace_root)
         self.permission_manager = PermissionManager(self.workspace_root)
         self.verification_engine = VerificationEngine(self.workspace_root)
+        self._recent_denials: list[tuple[str, str]] = []  # (tool_name, args_key)
+        self._consecutive_denials: int = 0
 
     def _system_prompt(self) -> str:
         """Build the system prompt."""
@@ -67,7 +69,15 @@ Your goal is to complete engineering tasks reliably. You must:
 
 You have access to tools. Use them to read, edit, write, search, and run commands.
 
+IMPORTANT: If a tool call returns "permission denied", do NOT retry the same command.
+Instead:
+- Try a different approach that does not require the blocked operation
+- If verification is blocked, skip verification and report what was completed
+- Never retry a denied command more than once
+- Accept the permission constraint and work within it
+
 Always verify your work before claiming success. Do not claim success without evidence.
+However, if verification itself is blocked by permissions, report that clearly.
 
 When you are done, summarize what you did and provide evidence of success."""
 
@@ -124,31 +134,77 @@ When you are done, summarize what you did and provide evidence of success."""
         """Get LLM-compatible tool schemas."""
         return [t.to_llm_schema() for t in self.tools.values()]
 
+    def _check_repeated_deny(self, call: ToolCall) -> bool:
+        """Check if this exact tool call has already been denied.
+
+        Returns True if we should block the repeated denied call.
+        """
+        args_key = json.dumps(call.arguments, sort_keys=True)
+        for prev in self._recent_denials:
+            if prev[0] == call.tool_name and prev[1] == args_key:
+                return True
+        return False
+
+    def _record_denial(self, tool_name: str, arguments: dict[str, Any]) -> None:
+        """Record a permission denial for loop guard tracking."""
+        args_key = json.dumps(arguments, sort_keys=True)
+        self._recent_denials.append((tool_name, args_key))
+        if len(self._recent_denials) > 50:
+            self._recent_denials = self._recent_denials[-50:]
+        self._consecutive_denials += 1
+
+    def _reset_denial_tracking(self) -> None:
+        """Reset consecutive denial counter after a successful tool call."""
+        self._consecutive_denials = 0
+
     async def _execute_tool(self, call: ToolCall) -> ToolResult:
         """Execute a tool call with permission checking."""
         tool = self.tools.get(call.tool_name)
         if not tool:
+            self._reset_denial_tracking()
             return ToolResult(
                 status=ToolResultStatus.ERROR,
                 output="",
                 error=f"Unknown tool: {call.tool_name}",
+                retryable=False,
+            )
+
+        # Check if this exact call was already denied
+        if self._check_repeated_deny(call):
+            self._consecutive_denials += 1
+            return ToolResult(
+                status=ToolResultStatus.PERMISSION_DENIED,
+                output="",
+                error=(
+                    "Permission denied (already rejected). "
+                    "This command cannot be retried under the current policy. "
+                    "Ask for user approval or choose a different approach."
+                ),
+                retryable=False,
             )
 
         # Check permission
         permission = self.permission_manager.check_permission(call.tool_name, call.arguments)
         if permission == "deny":
+            self._record_denial(call.tool_name, call.arguments)
             return ToolResult(
                 status=ToolResultStatus.PERMISSION_DENIED,
                 output="",
-                error="Permission denied",
+                error="Permission denied by policy",
+                retryable=False,
             )
         if permission == "ask" and not self.permission_manager.request_approval(
             call.tool_name, str(call.arguments)
         ):
+            self._record_denial(call.tool_name, call.arguments)
             return ToolResult(
                 status=ToolResultStatus.PERMISSION_DENIED,
                 output="",
-                error="Permission denied by user",
+                error=(
+                    "Permission denied. This command requires approval. "
+                    "Ask the user for permission or use a different approach."
+                ),
+                retryable=False,
             )
 
         # Execute
@@ -157,11 +213,14 @@ When you are done, summarize what you did and provide evidence of success."""
             result = await tool.execute(call.arguments)
             call.duration_ms = (time.time() - start) * 1000
             call.result = result
+            self._reset_denial_tracking()
             return result
         except Exception as e:
             call.duration_ms = (time.time() - start) * 1000
+            self._reset_denial_tracking()
             error_result = ToolResult(
-                status=ToolResultStatus.ERROR, output="", error=str(e)
+                status=ToolResultStatus.ERROR, output="", error=str(e),
+                retryable=True,
             )
             call.result = error_result
             return error_result
@@ -283,20 +342,35 @@ When you are done, summarize what you did and provide evidence of success."""
                         )
                     )
 
-                # Check if we've hit limits
-                if len(task.tool_calls) >= self.config.max_tool_calls:
-                    task.status = TaskStatus.FAILED
-                    task.error = "Tool call limit reached"
-                    break
+                    # Check if we've hit tool call limit
+                    if len(task.tool_calls) >= self.config.max_tool_calls:
+                        task.status = TaskStatus.FAILED
+                        task.error = "Tool call limit reached"
+                        break
             else:
                 # No tool calls — model is done
                 task.result = response.content
                 task.status = TaskStatus.COMPLETED
                 break
 
+            # Safety valve: check AFTER processing tool calls (works for both
+            # tool-call and text-response iterations)
+            if self._consecutive_denials >= 3:
+                task.status = TaskStatus.FAILED
+                task.error = (
+                    "Task blocked: too many consecutive permission denials. "
+                    "The current permission policy prevents required operations. "
+                    "Configure permissions or run with interactive approval enabled."
+                )
+                break
+
         if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-            task.status = TaskStatus.FAILED
-            task.error = "Max iterations reached"
+            if self._consecutive_denials >= 3:
+                task.status = TaskStatus.FAILED
+                task.error = task.error or "Task blocked by permission policy"
+            else:
+                task.status = TaskStatus.FAILED
+                task.error = task.error or "Max iterations reached"
 
         # Record performance if task_aware is available
         if self.task_aware is not None and self.router is not None:

@@ -17,10 +17,8 @@ def multiply(a: float, b: float) -> float:
 
 
 def divide(a: float, b: float) -> float:
-    """Divide a by b. Raises ValueError if b is zero."""
-    if b == 0:
-        raise ValueError("Cannot divide by zero")
-    return a / b  # noqa: RUF100
+    """Divide a by b."""
+    return a / b
 
 
 def power(a: float, b: float) -> float:

@@ -53,6 +53,20 @@ class ToolResult:
     output: str
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    retryable: bool = True
+
+    @property
+    def is_perm_denied(self) -> bool:
+        return self.status == ToolResultStatus.PERMISSION_DENIED
+
+    @property
+    def is_transient(self) -> bool:
+        return self.status in (ToolResultStatus.TIMEOUT, ToolResultStatus.ERROR) and self.retryable
+    @property
+    def is_final(self) -> bool:
+        return self.status == ToolResultStatus.PERMISSION_DENIED or (
+            self.status == ToolResultStatus.ERROR and not self.retryable
+        )
 
 
 @dataclass
