@@ -177,17 +177,24 @@ class InteractiveShell:
             ws_display = "..." + ws_display[-57:]
         self.console.print(f"  {ws_display}")
 
-        # Agent status
+        # Agent status — show AFTER provider setup is complete
         self.console.print("\n  [bold]Agent[/]")
-        if self.current_provider:
-            self.console.print(f"  [green]✓[/] {self.current_provider} connected")
+        if self._provider:
+            self.console.print("  [green]✓[/] OpenRouter connected")
         else:
             self.console.print("  [yellow]✗[/] No provider connected")
-        if self.current_model:
-            self.console.print(f"  [green]✓[/] {self.current_model}")
+        if self._router:
+            self.console.print("  [green]✓[/] Model routing ready")
         else:
-            self.console.print("  [yellow]○[/] Models not yet discovered")
+            self.console.print("  [yellow]○[/] Model routing not initialized")
         self.console.print("  [green]✓[/] Workspace ready")
+
+        # Model routing info
+        if self.current_model:
+            self.console.print("\n  [bold]Model[/]")
+            self.console.print(f"  {self.current_model}")
+            if self.current_provider:
+                self.console.print(f"  [dim]{self.current_provider}[/]")
 
         # Capabilities
         self.console.print("\n  [bold]Capabilities[/]")
@@ -251,9 +258,10 @@ class InteractiveShell:
             openrouter = OpenRouterProvider()
             if await openrouter.health_check():
                 providers.append(openrouter)
-                self.console.print("  [green]✓[/] OpenRouter available", highlight=False)
+                # Status printed by welcome screen after setup
             else:
-                self.console.print("  [yellow]✗[/] OpenRouter not available", highlight=False)
+                # Status printed by welcome screen after setup
+                pass
 
             # Ollama (if local mode or available)
             try:
@@ -261,7 +269,6 @@ class InteractiveShell:
                 ollama = OllamaProvider()
                 if await ollama.health_check():
                     providers.append(ollama)
-                    self.console.print("  [green]✓[/] Ollama available", highlight=False)
             except Exception:
                 pass
 
@@ -482,7 +489,18 @@ class InteractiveShell:
 
         async def on_model_error(event: Any) -> None:
             error = event.data.get("error", "")
-            self.console.print(f"  [red]✗ Model error: {_safe_str(error)}[/]", highlight=False)
+            error_lower = error.lower()
+            if "403" in error_lower or "forbidden" in error_lower:
+                self.console.print(f"  [red]✗ AI provider request failed (403 Forbidden)[/]", highlight=False)
+                self.console.print(f"  [dim]  Check your OPENROUTER_API_KEY and provider permissions.[/]", highlight=False)
+            elif "401" in error_lower or "unauthorized" in error_lower:
+                self.console.print(f"  [red]✗ AI provider authentication failed (401 Unauthorized)[/]", highlight=False)
+                self.console.print(f"  [dim]  Your API key may be invalid or expired.[/]", highlight=False)
+            elif "all" in error_lower and "failed" in error_lower:
+                self.console.print(f"  [red]✗ All available models failed[/]", highlight=False)
+                self.console.print(f"  [dim]  {_safe_str(error)}[/]", highlight=False)
+            else:
+                self.console.print(f"  [red]✗ Model error: {_safe_str(error)}[/]", highlight=False)
 
         async def on_task_phase(event: Any) -> None:
             phase = event.data.get("phase", "")
@@ -1073,19 +1091,22 @@ class InteractiveShell:
         """Run the interactive shell."""
         self.session_start = time.time()
 
-        # Setup provider first
-        self.console.print("  [dim]Initializing...[/]")
+        # Show loading indicator during provider setup
+        self.console.print("  [dim]Initializing...[/]", end="")
 
         if not await self._setup_provider():
+            self.console.print("")
             self.console.print("")
             self.console.print("  [red]Cannot start interactive session.[/]")
             self.console.print("  [dim]Set OPENROUTER_API_KEY or start Ollama.[/]")
             return
 
+        self.console.print("")  # End the initializing line
+
         self._setup_event_handlers()
         self._setup_session()
 
-        # Print welcome screen
+        # Print welcome screen AFTER provider setup is complete
         self._print_welcome()
 
         self.console.print("  [dim]Ctrl+C to cancel, /exit to quit.[/]")
