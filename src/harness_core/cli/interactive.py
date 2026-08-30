@@ -491,8 +491,13 @@ class InteractiveShell:
             error = event.data.get("error", "")
             error_lower = error.lower()
             if "403" in error_lower or "forbidden" in error_lower:
-                self.console.print(f"  [red]✗ AI provider request failed (403 Forbidden)[/]", highlight=False)
-                self.console.print(f"  [dim]  Check your OPENROUTER_API_KEY and provider permissions.[/]", highlight=False)
+                # Distinguish model-specific vs provider-level
+                if "model(s) returned 401/403" in error_lower or "unavailable" in error_lower:
+                    self.console.print(f"  [red]✗ Model unavailable (403 Forbidden)[/]", highlight=False)
+                    self.console.print(f"  [dim]  This model is not available. Harness will try other models.[/]", highlight=False)
+                else:
+                    self.console.print(f"  [red]✗ AI provider request failed (403 Forbidden)[/]", highlight=False)
+                    self.console.print(f"  [dim]  Check your OPENROUTER_API_KEY and provider permissions.[/]", highlight=False)
             elif "401" in error_lower or "unauthorized" in error_lower:
                 self.console.print(f"  [red]✗ AI provider authentication failed (401 Unauthorized)[/]", highlight=False)
                 self.console.print(f"  [dim]  Your API key may be invalid or expired.[/]", highlight=False)

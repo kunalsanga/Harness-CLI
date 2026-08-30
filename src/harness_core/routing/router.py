@@ -146,7 +146,11 @@ class ModelRouter:
         models: list[ModelInfo],
         ctx: ScoringContext,
     ) -> list[ModelInfo]:
-        """Filter models based on hard requirements."""
+        """Filter models based on hard requirements.
+
+        Availability/health is a hard constraint — unavailable models
+        are excluded before scoring, not merely scored lower.
+        """
         filtered = []
         for m in models:
             # Must support tools if required
@@ -155,8 +159,11 @@ class ModelRouter:
             # Must support vision if required
             if ctx.requires_vision and not m.supports_vision:
                 continue
-            # Must be healthy
-            if not self.health.get_state(m.id).is_healthy:
+            # Health is a hard constraint — skip unavailable models entirely
+            health_state = self.health.get_state(m.id)
+            if health_state.is_unavailable:
+                continue
+            if not health_state.is_healthy:
                 continue
             # Free-only mode
             if self.config.routing_mode == "free" and not m.is_free:

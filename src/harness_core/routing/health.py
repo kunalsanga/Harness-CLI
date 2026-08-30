@@ -24,6 +24,17 @@ class HealthEvent(Enum):
     TOOL_CALL_FAILURE = "tool_call_failure"
     INVALID_RESPONSE = "invalid_response"
     NETWORK_ERROR = "network_error"
+    AUTH_FAILED = "auth_failed"  # 401/403 — model-specific, not provider-wide
+
+
+class ModelHealthStatus(Enum):
+    """Health status for a model."""
+
+    UNKNOWN = "unknown"       # No data yet
+    HEALTHY = "healthy"       # Working normally
+    UNAVAILABLE = "unavailable" # Returned 401/403 — not available to this user
+    RATE_LIMITED = "rate_limited" # 429 — temporarily unavailable
+    ERROR = "error"           # Server errors, timeouts, etc.
 
 
 @dataclass
@@ -60,6 +71,10 @@ class ModelHealthState:
     # Cooldown: if a model is rate-limited, don't use it for this many seconds
     cooldown_seconds: float = 0.0
 
+    # Explicit health status (model-level, not provider-level)
+    health_status: ModelHealthStatus = ModelHealthStatus.UNKNOWN
+    last_auth_failure_time: float = 0.0
+
     @property
     def reliability(self) -> float:
         """Reliability score: 0.0 = unreliable, 1.0 = always succeeds."""
@@ -84,11 +99,23 @@ class ModelHealthState:
     @property
     def is_healthy(self) -> bool:
         """Whether the model is considered usable right now."""
+        # Explicit status overrides all other checks
+        if self.health_status == ModelHealthStatus.UNAVAILABLE:
+            return False
+        if self.health_status == ModelHealthStatus.RATE_LIMITED:
+            return self.is_rate_limited  # may have recovered
+        if self.health_status == ModelHealthStatus.ERROR:
+            return self.consecutive_failures < 3  # recover after some time
         if self.is_rate_limited:
             return False
         if self.consecutive_failures >= 5:
             return False
         return True
+
+    @property
+    def is_unavailable(self) -> bool:
+        """Whether this model is permanently unavailable (auth failure)."""
+        return self.health_status == ModelHealthStatus.UNAVAILABLE
 
     def record_latency(self, latency_ms: float) -> None:
         """Record a latency measurement."""
@@ -150,6 +177,8 @@ class ModelHealthTracker:
         state.estimated_cost += cost
         if latency_ms > 0:
             state.record_latency(latency_ms)
+        # Mark as healthy on success (recovers from previous errors)
+        state.health_status = ModelHealthStatus.HEALTHY
 
     def record_failure(
         self,
@@ -186,6 +215,10 @@ class ModelHealthTracker:
             state.invalid_responses += 1
         elif event == HealthEvent.NETWORK_ERROR:
             state.network_errors += 1
+        elif event == HealthEvent.AUTH_FAILED:
+            state.client_errors += 1
+            state.health_status = ModelHealthStatus.UNAVAILABLE
+            state.last_auth_failure_time = time.time()
 
     def record_tool_call_failure(self, model_id: str) -> None:
         """Record a tool call failure (model called wrong tool / bad args)."""

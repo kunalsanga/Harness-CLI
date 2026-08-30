@@ -133,7 +133,7 @@ class FallbackEngine:
         1. Try primary model
         2. If retryable error → retry with backoff (up to max_retries)
         3. If rate-limited or retries exhausted → try next fallback model
-        4. If same provider fails auth → skip all models from that provider
+        4. Model-specific auth failure → mark that model unavailable
         5. If all models fail → return final error
     """
 
@@ -144,16 +144,6 @@ class FallbackEngine:
     ) -> None:
         self.health = health_tracker or ModelHealthTracker()
         self.config = fallback_config or FallbackConfig()
-        # Track providers that have auth failures to avoid retrying all their models
-        self._provider_auth_failures: dict[str, int] = {}  # provider_name → status_code
-
-    def reset_provider_failures(self) -> None:
-        """Reset provider auth failure tracking (for new sessions or manual retry)."""
-        self._provider_auth_failures.clear()
-
-    def is_provider_failed(self, provider_name: str) -> bool:
-        """Check if a provider has a known auth failure."""
-        return provider_name in self._provider_auth_failures
 
     async def execute(
         self,
@@ -177,20 +167,16 @@ class FallbackEngine:
                 result.final_error = "Total timeout exceeded across all fallback models"
                 break
 
-            provider_name = provider.name
-
-            # Skip all models from a provider that has already failed auth
-            if provider_name in self._provider_auth_failures:
-                status_code = self._provider_auth_failures[provider_name]
+            # Check if model is healthy before trying
+            health_state = self.health.get_state(model_id)
+            if health_state.is_unavailable:
+                # Skip models that are known to be unavailable (auth failure)
                 result.attempts.append({
                     "model": model_id,
                     "status": "skipped",
-                    "reason": f"provider auth failure ({status_code})",
+                    "reason": "model unavailable (auth failed)",
                 })
                 continue
-
-            # Check if model is healthy before trying
-            health_state = self.health.get_state(model_id)
             if not health_state.is_healthy and model_idx > 0:
                 # Skip unhealthy fallback models (but always try the primary)
                 result.attempts.append({
@@ -264,15 +250,15 @@ class FallbackEngine:
                         break
 
                     elif classification == ErrorClassification.PERMANENT:
-                        self.health.record_failure(model_id, HealthEvent.CLIENT_ERROR_4XX, latency_ms)
-                        # Detect provider-level auth failure (401/403)
-                        # If this is an auth error, record it so we skip all models from this provider
+                        # Detect auth errors (401/403) — mark THIS MODEL as unavailable
+                        # Do NOT disable the entire provider
                         error_str = str(e).lower()
                         is_auth_error = any(code in error_str for code in ["401", "403"])
                         is_auth_keyword = any(kw in error_str for kw in ["unauthorized", "forbidden"])
                         if is_auth_error or is_auth_keyword:
-                            status_code = 401 if "401" in error_str else 403
-                            self._provider_auth_failures[provider_name] = status_code
+                            self.health.record_failure(model_id, HealthEvent.AUTH_FAILED, latency_ms)
+                        else:
+                            self.health.record_failure(model_id, HealthEvent.CLIENT_ERROR_4XX, latency_ms)
                         # Don't retry permanent errors
                         break
 
@@ -295,21 +281,28 @@ class FallbackEngine:
         result.total_latency_ms = (time.time() - overall_start) * 1000
         if not result.final_error:
             # Build a more informative error message
-            failed_providers = set()
             auth_failures = []
+            other_failures = []
             for attempt in result.attempts:
                 if attempt.get("status") == "error":
                     error_str = attempt.get("error", "")
                     if "401" in error_str or "403" in error_str or "forbidden" in error_str.lower():
                         auth_failures.append(attempt.get("model", "unknown"))
                     else:
-                        failed_providers.add(attempt.get("model", "unknown"))
+                        other_failures.append(attempt.get("model", "unknown"))
 
-            if auth_failures:
+            if auth_failures and not other_failures:
+                # All failures were auth errors on specific models
                 result.final_error = (
-                    f"Provider authentication failed. {len(auth_failures)} model(s) returned 401/403. "
-                    f"Check your API key and provider permissions. "
-                    f"Models: {', '.join(auth_failures[:3])}"
+                    f"{len(auth_failures)} model(s) returned 401/403 and are unavailable. "
+                    f"Models: {', '.join(auth_failures[:3])}. "
+                    f"Try other models or check your provider access."
+                )
+            elif auth_failures:
+                result.final_error = (
+                    f"{len(auth_failures)} model(s) unavailable (401/403), "
+                    f"{len(other_failures)} model(s) failed for other reasons. "
+                    f"Last error: {result.attempts[-1].get('error', 'unknown')}"
                 )
             else:
                 result.final_error = (
