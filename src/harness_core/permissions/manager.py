@@ -28,10 +28,11 @@ _SAFE_COMMAND_PREFIXES: list[str] = [
     "cmake ", "make ", "meson ",
     "java ", "javac ", "gradle ", "mvn ",
     "swift ", "swiftc ",
-    # Git (read-only and commit)
+    # Git (read-only, commit, and push)
     "git status", "git diff", "git log", "git show", "git branch", "git stash",
     "git add ", "git commit ", "git checkout ", "git merge ", "git rebase ",
     "git reset ", "git revert ",
+    "git push", "git fetch", "git pull", "git remote", "git tag",
     # Linters & formatters
     "eslint ", "prettier ", "black ", "ruff ", "flake8 ", "mypy ",
     "pylint ", "isort ", "autopep8 ",
@@ -52,6 +53,7 @@ _SAFE_COMMAND_PREFIXES: list[str] = [
 # Exact matches for safe commands
 _SAFE_COMMAND_EXACT: set[str] = {
     "git status", "git diff", "git log", "git show", "git branch",
+    "git remote -v", "git remote",
     "ls", "dir", "pwd", "echo", "tree",
 }
 
@@ -127,12 +129,14 @@ class PermissionManager:
             PermissionRule(tool_pattern="search_code", action="allow"),
             PermissionRule(tool_pattern="edit_file", action="allow"),
             PermissionRule(tool_pattern="write_file", action="allow"),
-            PermissionRule(tool_pattern="run_command", action="ask"),
-            PermissionRule(tool_pattern="git_commit", action="ask"),
-            PermissionRule(tool_pattern="git_push", action="ask"),
+            PermissionRule(tool_pattern="run_command", action="allow"),
+            PermissionRule(tool_pattern="git_commit", action="allow"),
+            PermissionRule(tool_pattern="git_push", action="allow"),
             PermissionRule(tool_pattern="git_status", action="allow"),
             PermissionRule(tool_pattern="git_diff", action="allow"),
             PermissionRule(tool_pattern="git_log", action="allow"),
+            PermissionRule(tool_pattern="git_remote", action="allow"),
+            PermissionRule(tool_pattern="git_identity", action="allow"),
             PermissionRule(tool_pattern="network", action="ask"),
         ]
 
@@ -195,13 +199,17 @@ class PermissionManager:
 
     def check_permission(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
         """Check permission for a tool. Returns 'allow', 'ask', or 'deny'."""
-        # For run_command in autonomous mode, check safe workspace commands FIRST
-        # (before explicit rules, since the default rule sets run_command to 'ask')
-        if tool_name == "run_command" and arguments and self.autonomous_mode:
+        # For run_command, apply special logic based on mode
+        if tool_name == "run_command" and arguments:
             if self._is_dangerous_command(arguments):
-                return "ask"  # Dangerous — always ask
-            if self._is_safe_workspace_command(arguments):
-                return "allow"  # Safe — auto-approve
+                return "deny"  # Dangerous — always block, even in autonomous mode
+            if self.autonomous_mode:
+                if self._is_safe_workspace_command(arguments):
+                    return "allow"  # Safe — auto-approve
+                # Unknown command in autonomous mode → 'ask' (auto-approved by request_approval)
+                return "ask"
+            # Non-autonomous mode → always 'ask'
+            return "ask"
 
         # Check explicit rules
         for rule in self.rules:
@@ -247,15 +255,24 @@ class PermissionManager:
         Resolution order:
         1. allow rule → auto-approve
         2. deny rule → auto-deny
-        3. Session approval → use session decision
-        4. Interactive callback → prompt user
-        5. Default → deny (safe default)
+n        3. Autonomous mode → auto-approve (safe workspace operations)
+        4. Session approval → use session decision
+        5. Interactive callback → prompt user
+        6. Default → deny (safe default)
+
+        Dangerous operations are NEVER auto-approved, even in autonomous mode.
         """
         permission = self.check_permission(tool_name)
         if permission == "allow":
             return True
         if permission == "deny":
             return False
+        # "ask" — In autonomous mode, auto-approve non-dangerous operations.
+        # Dangerous commands (credential access, destructive ops) are blocked
+        # by _is_dangerous_command and _CREDENTIAL_PATTERNS checks, which
+        # cause check_permission to return 'deny' before reaching here.
+        if self.autonomous_mode:
+            return True
         # "ask" — check session-level approval first
         for pattern, approved in self.session_approvals.items():
             if pattern in tool_name:

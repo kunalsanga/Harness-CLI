@@ -13,7 +13,8 @@ class TestPermissionManager:
         pm = PermissionManager()
         assert pm.check_permission("read_file") == "allow"
         assert pm.check_permission("write_file") == "allow"
-        assert pm.check_permission("run_command") == "ask"
+        # In autonomous mode (default), safe commands are auto-approved
+        assert pm.check_permission("run_command", {"command": "node test.js"}) == "allow"
 
     def test_custom_rules(self):
         rules = [
@@ -38,3 +39,8 @@ class TestPermissionManager:
     def test_unknown_tool_defaults_to_ask(self):
         pm = PermissionManager()
         assert pm.check_permission("unknown_tool_xyz") == "ask"
+        # In autonomous mode, 'ask' tools are auto-approved via request_approval
+        assert pm.request_approval("unknown_tool_xyz") is True
+        # Without autonomous mode, 'ask' tools are denied by default
+        pm2 = PermissionManager(autonomous_mode=False)
+        assert pm2.request_approval("unknown_tool_xyz") is False

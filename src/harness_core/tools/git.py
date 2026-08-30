@@ -206,7 +206,7 @@ class GitCommitTool(Tool):
                 },
                 "required": ["message"],
             },
-            permission_required="ask",
+            permission_required="allow",
             timeout_seconds=10.0,
         )
 
@@ -216,7 +216,6 @@ class GitCommitTool(Tool):
 
         # BLOCK: Never allow git config user.name/email to be set by the agent
         forbidden_patterns = ["git config user.name", "git config user.email"]
-        full_command = f"git commit -m {message}"
         for pattern in forbidden_patterns:
             if pattern in message.lower():
                 return ToolResult(
@@ -260,6 +259,163 @@ class GitCommitTool(Tool):
                 status=ToolResultStatus.SUCCESS if process.returncode == 0 else ToolResultStatus.ERROR,
                 output=output,
                 error=stderr.decode("utf-8", errors="replace") if process.returncode != 0 else None,
+            )
+        except Exception as e:
+            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+
+
+class GitPushTool(Tool):
+    """Push commits to a remote repository."""
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="git_push",
+            description="Push commits to a remote repository",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name (default: auto-detect)",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name (default: current branch)",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Force push (use with caution)",
+                    },
+                },
+            },
+            permission_required="allow",
+            timeout_seconds=30.0,
+        )
+
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        try:
+            # Auto-detect remote if not specified
+            remote = arguments.get("remote", "")
+            branch = arguments.get("branch", "")
+            force = arguments.get("force", False)
+
+            if not remote:
+                # Find the origin remote
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "remote",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                remotes = stdout.decode("utf-8", errors="replace").strip().split("\n")
+                remotes = [r.strip() for r in remotes if r.strip()]
+                if not remotes:
+                    return ToolResult(
+                        status=ToolResultStatus.ERROR,
+                        output="",
+                        error=(
+                            "No git remote configured.\n"
+                            "Add a remote with: git remote add origin <url>"
+                        ),
+                    )
+                remote = "origin" if "origin" in remotes else remotes[0]
+
+            if not branch:
+                # Get current branch
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "branch", "--show-current",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                branch = stdout.decode("utf-8", errors="replace").strip()
+                if not branch:
+                    return ToolResult(
+                        status=ToolResultStatus.ERROR,
+                        output="",
+                        error="Not on any branch (detached HEAD). Switch to a branch first.",
+                    )
+
+            # Build push command
+            args = ["push", "-u", remote, branch]
+            if force:
+                args = ["push", "--force-with-lease", "-u", remote, branch]
+
+            process = await asyncio.create_subprocess_exec(
+                "git", *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=30
+            )
+            output = stdout.decode("utf-8", errors="replace")
+            stderr_str = stderr.decode("utf-8", errors="replace")
+
+            if process.returncode == 0:
+                return ToolResult(
+                    status=ToolResultStatus.SUCCESS,
+                    output=output or f"Pushed to {remote}/{branch}",
+                    exit_code=0,
+                )
+            else:
+                error_msg = stderr_str or output
+                # Provide helpful error messages
+                if "Authentication" in error_msg or "401" in error_msg or "403" in error_msg:
+                    error_msg += (
+                        "\n\nGitHub authentication required.\n"
+                        "Git credentials are not configured on this machine.\n"
+                        "Options:\n"
+                        "  - Use GitHub CLI: gh auth login\n"
+                        "  - Set up SSH keys\n"
+                        "  - Configure Git credential manager"
+                    )
+                return ToolResult(
+                    status=ToolResultStatus.ERROR,
+                    output=output,
+                    error=error_msg,
+                    exit_code=process.returncode,
+                    stderr=stderr_str if stderr_str else None,
+                )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                status=ToolResultStatus.TIMEOUT,
+                output="",
+                error="Push timed out after 30s",
+            )
+        except Exception as e:
+            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+
+
+class GitRemoteTool(Tool):
+    """Get git remote information."""
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="git_remote",
+            description="Show git remote configuration",
+            parameters={"type": "object", "properties": {}},
+            permission_required="allow",
+            timeout_seconds=10.0,
+        )
+
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        return await self._run_git(["remote", "-v"])
+
+    async def _run_git(self, args: list[str]) -> ToolResult:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "git", *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+            output = stdout.decode("utf-8", errors="replace")
+            return ToolResult(
+                status=ToolResultStatus.SUCCESS if process.returncode == 0 else ToolResultStatus.ERROR,
+                output=output or "(no remotes)",
             )
         except Exception as e:
             return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))

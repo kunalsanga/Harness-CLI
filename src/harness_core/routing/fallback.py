@@ -276,7 +276,7 @@ class FallbackEngine:
                             self.health.record_failure(model_id, HealthEvent.AUTH_FAILED, latency_ms)
                         else:
                             self.health.record_failure(model_id, HealthEvent.CLIENT_ERROR_4XX, latency_ms)
-                        # Don't retry permanent errors
+                        # Fast-skip: no delay for permanent errors — move immediately
                         break
 
                     elif classification == ErrorClassification.RETRYABLE:

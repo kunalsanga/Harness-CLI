@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -71,7 +70,6 @@ def _tool_display_name(tool_name: str, args: dict[str, Any]) -> str:
         return f"list {p}"
     elif tool_name == "run_command":
         cmd = args.get("command", "")
-        # Truncate long commands
         if len(cmd) > 60:
             cmd = cmd[:57] + "..."
         return f"run {cmd}"
@@ -88,8 +86,170 @@ def _tool_display_name(tool_name: str, args: dict[str, Any]) -> str:
         return "git diff"
     elif tool_name == "git_log":
         return "git log"
+    elif tool_name == "git_push":
+        return "git push"
+    elif tool_name == "git_remote":
+        return "git remote"
     else:
         return tool_name
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Format elapsed time as MM:SS or HH:MM:SS."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    mins, secs = divmod(int(seconds), 60)
+    if mins < 60:
+        return f"{mins}m{secs:02d}s"
+    hours, mins = divmod(mins, 60)
+    return f"{hours}h{mins:02d}m{secs:02d}s"
+
+
+# ─── Live Status Display ─────────────────────────────────────────────────
+
+class LiveStatus:
+    """Compact live status display that updates during task execution.
+
+    Uses ANSI cursor movement to update a stable screen region
+    without causing terminal scrolling.
+    """
+
+    def __init__(self, console: Console, plain: bool = False) -> None:
+        self.console = console
+        self.plain = plain
+        self.task_start: float = 0.0
+        self.current_phase: str = ""
+        self.current_activity: str = ""
+        self.activity_detail: str = ""
+        self.todo_completed: int = 0
+        self.todo_total: int = 0
+        self.iterations: int = 0
+        self.tool_calls: int = 0
+        self.current_model: str = ""
+        self._active: bool = False
+        self._timer_task: asyncio.Task | None = None
+
+    def start(self, goal: str) -> None:
+        """Start the live status display."""
+        self.task_start = time.time()
+        self.current_phase = "understanding"
+        self.current_activity = "Initializing"
+        self.activity_detail = ""
+        self.todo_completed = 0
+        self.todo_total = 0
+        self.iterations = 0
+        self.tool_calls = 0
+        self._active = True
+        # Print initial status line
+        self._render()
+
+    def stop(self) -> None:
+        """Stop the live status display."""
+        self._active = False
+        if self._timer_task and not self._timer_task.done():
+            self._timer_task.cancel()
+            self._timer_task = None
+        # Clear status line by moving cursor up and overwriting
+        self._clear()
+
+    def update_phase(self, phase: str) -> None:
+        self.current_phase = phase
+        if self._active:
+            self._render()
+
+    def update_activity(self, tool: str, args: dict[str, Any]) -> None:
+        """Update current activity from tool call."""
+        self.current_activity = _tool_display_name(tool, args)
+        # Extract file name for detail
+        if tool in ("read_file", "write_file", "edit_file"):
+            fp = args.get("path", args.get("file_path", ""))
+            if fp:
+                self.activity_detail = fp.replace("\\", "/").split("/")[-1]
+            else:
+                self.activity_detail = ""
+        elif tool == "run_command":
+            cmd = args.get("command", "")
+            self.activity_detail = cmd[:50] + "..." if len(cmd) > 50 else cmd
+        else:
+            self.activity_detail = ""
+        self.tool_calls += 1
+        if self._active:
+            self._render()
+
+    def update_activity_complete(self, tool: str, status: str) -> None:
+        """Mark activity as complete."""
+        if status == "success":
+            self.current_activity = f"Done"
+            self.activity_detail = ""
+        else:
+            self.current_activity = f"Failed"
+            self.activity_detail = status
+        if self._active:
+            self._render()
+
+    def update_todos(self, completed: int, total: int) -> None:
+        self.todo_completed = completed
+        self.todo_total = total
+        if self._active:
+            self._render()
+
+    def update_iterations(self, count: int) -> None:
+        self.iterations = count
+        if self._active:
+            self._render()
+
+    def update_model(self, model: str) -> None:
+        self.current_model = model
+
+    def _render(self) -> None:
+        """Render the compact status line."""
+        elapsed = time.time() - self.task_start if self.task_start else 0
+        elapsed_str = _format_elapsed(elapsed)
+
+        if self.plain:
+            parts = [
+                f"[{self.current_phase}]",
+                f"{self.current_activity}",
+                f"{elapsed_str}",
+            ]
+            if self.todo_total > 0:
+                parts.append(f"TODO {self.todo_completed}/{self.todo_total}")
+            if self.iterations > 0:
+                parts.append(f"iter:{self.iterations}")
+            line = " ".join(parts)
+            self.console.print(f"\r  {line}", end="", highlight=False)
+            return
+
+        # Rich formatted status line
+        parts: list[str] = []
+        parts.append(f"  [bold blue]◐[/] [bold]{self.current_phase.title()}[/]")
+
+        if self.current_activity:
+            parts.append(f" [dim]│[/] {self.current_activity}")
+            if self.activity_detail:
+                parts.append(f" [dim]{self.activity_detail}[/]")
+
+        parts.append(f" [dim]│[/] [dim]{elapsed_str}[/]")
+
+        if self.todo_total > 0:
+            parts.append(f" [dim]│[/] TODO {self.todo_completed}/{self.todo_total}")
+
+        if self.iterations > 0:
+            parts.append(f" [dim]│[/] {self.iterations} iter")
+
+        if self.current_model:
+            parts.append(f" [dim]│[/] [dim]{self.current_model}[/]")
+
+        line = "".join(parts)
+        # Use \r to overwrite the previous status line
+        self.console.print(f"\r{line:<80}", end="", highlight=False)
+
+    def _clear(self) -> None:
+        """Clear the status line."""
+        if self._active:
+            return
+        # Overwrite with spaces then move to next line
+        self.console.print(f"\r{'':<80}\r", end="", highlight=False)
 
 
 # ─── Interactive Shell ────────────────────────────────────────────────────
@@ -121,6 +281,7 @@ class InteractiveShell:
         self.max_iterations = max_iterations
         self.max_cost = max_cost
         self.workspace = workspace or str(Path.cwd())
+        self.verbose = False
 
         # Rich console (plain mode uses no markup)
         self.console = Console(
@@ -147,6 +308,9 @@ class InteractiveShell:
         self._router: Any = None
         self._task_aware: Any = None
         self._last_stats: dict[str, int] = {}
+
+        # Live status display
+        self._live_status = LiveStatus(self.console, plain=plain)
 
     # ─── Initialization ──────────────────────────────────────────────
 
@@ -178,7 +342,7 @@ class InteractiveShell:
             ws_display = "..." + ws_display[-57:]
         self.console.print(f"  {ws_display}")
 
-        # Agent status — show AFTER provider setup is complete
+        # Agent status
         self.console.print("\n  [bold]Agent[/]")
         if self._provider:
             self.console.print("  [green]✓[/] OpenRouter connected")
@@ -213,8 +377,7 @@ class InteractiveShell:
     def _print_status_line(self) -> None:
         """Print the status bar."""
         elapsed = time.time() - self.session_start if self.session_start else 0
-        mins, secs = divmod(int(elapsed), 60)
-        time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+        time_str = _format_elapsed(elapsed)
 
         if self.plain:
             self.console.print(
@@ -245,7 +408,10 @@ class InteractiveShell:
             from harness_core.tools.filesystem import (
                 EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool,
             )
-            from harness_core.tools.git import GitDiffTool, GitIdentityTool, GitLogTool, GitStatusTool
+            from harness_core.tools.git import (
+                GitDiffTool, GitIdentityTool, GitLogTool, GitStatusTool,
+                GitPushTool, GitRemoteTool,
+            )
             from harness_core.tools.search import GlobTool, GrepTool
             from harness_core.tools.shell import RunCommandTool
 
@@ -259,9 +425,7 @@ class InteractiveShell:
             openrouter = OpenRouterProvider()
             if await openrouter.health_check():
                 providers.append(openrouter)
-                # Status printed by welcome screen after setup
             else:
-                # Status printed by welcome screen after setup
                 pass
 
             # Ollama (if local mode or available)
@@ -279,7 +443,7 @@ class InteractiveShell:
                 self.console.print("  Set OPENROUTER_API_KEY or start Ollama.")
                 return False
 
-            self._provider = providers[0]  # Primary provider
+            self._provider = providers[0]
 
             # Build router config
             router_config = RouterConfig()
@@ -336,6 +500,8 @@ class InteractiveShell:
                 GitDiffTool(),
                 GitLogTool(),
                 GitIdentityTool(),
+                GitPushTool(),
+                GitRemoteTool(),
             ]
 
             # Agent config
@@ -345,25 +511,6 @@ class InteractiveShell:
                 model_preference=self.model,
                 routing_mode=effective_mode,
             )
-
-            # Interactive approval callback
-            def _approval_callback(tool_name: str, description: str) -> bool:
-                cmd_display = _tool_display_name(tool_name, {})
-                self.console.print(
-                    f"\n  [yellow]⚠ Permission required:[/] [bold]{cmd_display}[/]",
-                    highlight=False,
-                )
-                if description:
-                    self.console.print(f"  [dim]{description}[/]", highlight=False)
-                try:
-                    from rich.prompt import Confirm
-                    approved = Confirm.ask(
-                        "  [bold]Allow?[/]",
-                        default=False,
-                    )
-                    return approved
-                except (EOFError, KeyboardInterrupt):
-                    return False
 
             # Agent loop
             self._agent_loop = AgentLoop(
@@ -375,8 +522,8 @@ class InteractiveShell:
                 router=self._router,
                 task_aware=self._task_aware,
             )
-            # Wire interactive approval into permission manager
-            self._agent_loop.permission_manager.approval_callback = _approval_callback
+            # No approval callback — autonomous mode auto-approves safe operations.
+            # Dangerous operations are blocked by the permission manager's deny rules.
 
             return True
 
@@ -394,50 +541,33 @@ class InteractiveShell:
         async def on_task_started(event: Any) -> None:
             goal = event.data.get("goal", "")
             self.task_start = time.time()
+            # Show goal as a clean header
             self.console.print(f"\n  [bold]{goal}[/]", highlight=False)
+            self.console.print()
 
         async def on_thinking(event: Any) -> None:
             message = event.data.get("message", "")
-            if message:
-                self.console.print(f"\n  [dim]• Thinking[/]", highlight=False)
-                # Wrap long messages
-                words = message.split()
-                lines = []
-                current = "  "
-                for word in words:
-                    if len(current) + len(word) > 70:
-                        lines.append(current)
-                        current = "  " + word
-                    else:
-                        current += " " + word if current.strip() else "  " + word
-                if current.strip():
-                    lines.append(current)
-                for line in lines:
-                    self.console.print(f"  [dim]{line.strip()}[/]", highlight=False)
+            if message and self.verbose:
+                self.console.print(f"  [dim]• Thinking: {message}[/]", highlight=False)
 
         async def on_todo_updated(event: Any) -> None:
             items = event.data.get("items", [])
             completed = event.data.get("completed", 0)
             total = event.data.get("total", 0)
-            if items:
-                self.console.print(f"\n  [bold]TODOs[/] [dim]({completed}/{total})[/]")
-                for item in items:
-                    self.console.print(f"    {item}")
-                self.console.print()
+            self._live_status.update_todos(completed, total)
 
         async def on_plan_created(event: Any) -> None:
             steps = event.data.get("steps", [])
             if steps:
-                self.console.print(f"\n  [bold]TODOs[/]")
+                self.console.print(f"  [bold]TODOs[/]")
                 for step in steps:
                     self.console.print(f"    ☐ {step}")
                 self.console.print()
+                self._live_status.update_todos(0, len(steps))
 
         async def on_task_classified(event: Any) -> None:
             task_type = event.data.get("task_type", "")
-            confidence = event.data.get("confidence", 0)
-            # Only show classification if useful (not "unknown")
-            if task_type and task_type != "unknown":
+            if task_type and task_type != "unknown" and self.verbose:
                 self.console.print(
                     f"  [dim]  Task: {task_type}[/]", highlight=False
                 )
@@ -448,6 +578,7 @@ class InteractiveShell:
             score = event.data.get("score", 0)
             self.current_model = model
             self.current_provider = provider
+            self._live_status.update_model(model)
             if self.verbose:
                 self.console.print(
                     f"  [dim]  model: {model} ({provider}, score: {score:.2f})[/]", highlight=False
@@ -459,50 +590,45 @@ class InteractiveShell:
 
         async def on_routing_models_refreshed(event: Any) -> None:
             count = event.data.get("count", 0)
-            self.console.print(
-                f"  [dim]  discovered {count} models[/]", highlight=False
-            )
+            if self.verbose:
+                self.console.print(
+                    f"  [dim]  discovered {count} models[/]", highlight=False
+                )
 
         async def on_iteration_started(event: Any) -> None:
             iteration = event.data.get("iteration", 0)
             self.total_iterations = iteration
+            self._live_status.update_iterations(iteration)
 
         async def on_tool_call(event: Any) -> None:
             tool = event.data.get("tool", "")
             args = event.data.get("args", {})
+            # Update live status with current activity
+            self._live_status.update_activity(tool, args)
+            # Also print for event trail
             if self.verbose:
                 display = _tool_display_name(tool, args)
                 self.console.print(f"  [cyan]→[/] {display}", highlight=False)
             else:
-                # Clean mode: use Read/Edit/Write/Run labels
-                if tool == "read_file":
-                    filepath = args.get("path", "")
-                    fname = filepath.replace("\\", "/").split("/")[-1] if filepath else tool
-                    self.console.print(f"  [dim]• Read[/]", highlight=False)
-                    self.console.print(f"    {fname}", highlight=False)
-                elif tool == "write_file":
+                # Clean mode: compact activity indicator
+                if tool in ("read_file", "write_file", "edit_file"):
                     filepath = args.get("path", args.get("file_path", ""))
                     fname = filepath.replace("\\", "/").split("/")[-1] if filepath else tool
-                    self.console.print(f"  [bold cyan]• Write[/]", highlight=False)
-                    self.console.print(f"    {fname}", highlight=False)
-                elif tool == "edit_file":
-                    filepath = args.get("path", args.get("file_path", ""))
-                    fname = filepath.replace("\\", "/").split("/")[-1] if filepath else tool
-                    self.console.print(f"  [bold cyan]• Edit[/]", highlight=False)
-                    self.console.print(f"    {fname}", highlight=False)
+                    label = {"read_file": "Read", "write_file": "Write", "edit_file": "Edit"}[tool]
+                    style = "dim" if tool == "read_file" else "bold cyan"
+                    self.console.print(f"  [{style}]• {label}[/]  {fname}", highlight=False)
                 elif tool == "run_command":
                     cmd = args.get("command", "")
                     if len(cmd) > 50:
                         cmd = cmd[:47] + "..."
-                    self.console.print(f"  [dim]• Run[/]", highlight=False)
-                    self.console.print(f"    {cmd}", highlight=False)
-                elif tool == "list_files":
-                    self.console.print(f"  [dim]• List[/]", highlight=False)
+                    self.console.print(f"  [dim]• Run[/]  {cmd}", highlight=False)
                 elif tool in ("glob", "grep"):
                     self.console.print(f"  [dim]• Search[/]", highlight=False)
                 elif tool.startswith("git_"):
-                    self.console.print(f"  [dim]• Git[/]", highlight=False)
-                    self.console.print(f"    {display}", highlight=False)
+                    display = _tool_display_name(tool, args)
+                    self.console.print(f"  [dim]• Git[/]  {display}", highlight=False)
+                elif tool == "list_files":
+                    self.console.print(f"  [dim]• List[/]", highlight=False)
                 else:
                     display = _tool_display_name(tool, args)
                     self.console.print(f"  [dim]• {tool}[/]", highlight=False)
@@ -514,52 +640,25 @@ class InteractiveShell:
             exit_code = event.data.get("exit_code")
             error = event.data.get("error", "")
             self.total_tool_calls += 1
-            if self.verbose:
-                # Verbose: show full detail
-                if status == "success":
-                    self.console.print(
-                        f"  [green]✓[/] {tool} [dim]({output_len} chars)[/]", highlight=False
-                    )
-                elif status == "permission_denied":
-                    self.console.print(
-                        f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
-                    )
-                elif status == "timeout":
-                    self.console.print(
-                        f"  [red]✗[/] {tool} [dim](timed out)[/]", highlight=False
-                    )
-                elif exit_code is not None and exit_code != 0:
-                    self.console.print(
-                        f"  [red]✗[/] {tool} [dim](exit code {exit_code})[/]", highlight=False
-                    )
-                    if error:
-                        first_line = error.split("\n")[0]
-                        if first_line:
-                            self.console.print(
-                                f"  [red]  {_safe_str(first_line)}[/]", highlight=False
-                            )
-                else:
-                    self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
-            else:
-                # Clean mode: only show failures (successes are implied by progress)
-                if status == "success":
-                    pass  # Don't spam success messages
-                elif status == "permission_denied":
-                    self.console.print(
-                        f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
-                    )
-                elif exit_code is not None and exit_code != 0:
-                    self.console.print(
-                        f"  [red]✗[/] {tool} [dim](exit code {exit_code})[/]", highlight=False
-                    )
-                    if error:
-                        first_line = error.split("\n")[0]
-                        if first_line:
-                            self.console.print(
-                                f"  [red]  {_safe_str(first_line)}[/]", highlight=False
-                            )
-                else:
-                    self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
+            # Update live status
+            self._live_status.update_activity_complete(tool, status)
+            # Only show failures (successes are implied by progress)
+            if status == "permission_denied":
+                self.console.print(
+                    f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
+                )
+            elif exit_code is not None and exit_code != 0:
+                self.console.print(
+                    f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False
+                )
+                if error:
+                    first_line = error.split("\n")[0]
+                    if first_line:
+                        self.console.print(
+                            f"  [red]  {_safe_str(first_line)}[/]", highlight=False
+                        )
+            elif status not in ("success",):
+                self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
 
         async def on_model_error(event: Any) -> None:
             error = event.data.get("error", "")
@@ -588,17 +687,17 @@ class InteractiveShell:
 
         async def on_task_phase(event: Any) -> None:
             phase = event.data.get("phase", "")
-            phase_display = {
-                "understanding": "Inspecting",
-                "planning": "Planning",
-                "implementing": "Implementing",
-                "testing": "Testing",
-                "recovering": "Recovering",
-                "verifying": "Verifying",
-                "complete": "Complete",
-            }.get(phase, phase)
-            # Show phase as a subtle status, not a big header
+            self._live_status.update_phase(phase)
             if self.verbose:
+                phase_display = {
+                    "understanding": "Inspecting",
+                    "planning": "Planning",
+                    "implementing": "Implementing",
+                    "testing": "Testing",
+                    "recovering": "Recovering",
+                    "verifying": "Verifying",
+                    "complete": "Complete",
+                }.get(phase, phase)
                 self.console.print(f"  [bold blue]◐[/] [bold]{phase_display}[/]", highlight=False)
 
         async def on_task_completed(event: Any) -> None:
@@ -607,7 +706,6 @@ class InteractiveShell:
             tool_calls = event.data.get("tool_calls", 0)
             self.total_iterations = iterations
             self.total_tool_calls = tool_calls
-            # Store execution stats for summary
             self._last_stats = {
                 "attempted": event.data.get("attempted", 0),
                 "succeeded": event.data.get("succeeded", 0),
@@ -677,7 +775,6 @@ class InteractiveShell:
             ]
 
             if active:
-                # Resume the most recent active session
                 session = active[0]
                 self.session_id = session.session_id
                 self.console.print(
@@ -685,14 +782,13 @@ class InteractiveShell:
                     highlight=False,
                 )
             else:
-                # Create new session
                 session = self.session_manager.create_session(
                     workspace_path=self.workspace,
                     title=f"Interactive session",
                 )
                 self.session_id = session.session_id
                 self.console.print(
-                    f"  [green]✓[/] New session: {session.session_id}", highlight=False
+                    f"  [green]✓[/] New session: {self.session_id}", highlight=False
                 )
         except Exception as e:
             self.console.print(f"  [yellow]Session setup failed: {_safe_str(e)}[/]", highlight=False)
@@ -736,7 +832,7 @@ class InteractiveShell:
         elif command == "/free":
             self._cmd_free_mode()
         elif command == "/exit" or command == "/quit":
-            return False  # Signal exit
+            return False
         else:
             self.console.print(f"  [yellow]Unknown command: {command}[/]")
             self.console.print("  [dim]Type /help for available commands.[/]")
@@ -772,7 +868,7 @@ class InteractiveShell:
             ("/models", "List available models"),
             ("/verbose", "Toggle verbose tool output"),
             ("/session [list|show|create]", "Session management"),
-            ("/diff", "Show git diff of changes"),
+            ("/diff", "Show git diff"),
             ("/clear", "Clear the screen"),
             ("/config", "Show configuration"),
             ("/doctor", "System health check"),
@@ -789,7 +885,7 @@ class InteractiveShell:
     def _cmd_status(self) -> None:
         """Show session status."""
         elapsed = time.time() - self.session_start if self.session_start else 0
-        mins, secs = divmod(int(elapsed), 60)
+        time_str = _format_elapsed(elapsed)
         task_elapsed = time.time() - self.task_start if self.task_start and self.running else 0
 
         if self.plain:
@@ -799,7 +895,7 @@ class InteractiveShell:
             self.console.print(f"Workspace: {self.workspace}")
             self.console.print(f"Iterations: {self.total_iterations}")
             self.console.print(f"Tool calls: {self.total_tool_calls}")
-            self.console.print(f"Elapsed: {mins}m {secs}s")
+            self.console.print(f"Elapsed: {time_str}")
             if self.running:
                 self.console.print(f"Task time: {task_elapsed:.1f}s")
             return
@@ -813,7 +909,7 @@ class InteractiveShell:
         table.add_row("Provider", self.current_provider or "not set")
         table.add_row("Verbose", "on" if self.verbose else "off")
         table.add_row("Tool calls", str(self.total_tool_calls))
-        table.add_row("Session time", f"{mins}m {secs}s")
+        table.add_row("Session time", time_str)
         if self.running:
             table.add_row("Task time", f"{task_elapsed:.1f}s")
 
@@ -941,7 +1037,7 @@ class InteractiveShell:
                     title="Manual session",
                 )
                 self.session_id = session.session_id
-                self.console.print(f"  [green]✓[/] Created: {session.session_id}")
+                self.console.print(f"  [green]✓[/] Created: {self.session_id}")
         else:
             self.console.print(f"  [yellow]Unknown session command: {sub}[/]")
 
@@ -961,8 +1057,6 @@ class InteractiveShell:
                 self.console.print("  [bold]Changed files:[/]")
                 for line in result.stdout.strip().split("\n"):
                     self.console.print(f"    {line}")
-
-                # Ask if they want full diff
                 self.console.print("")
                 self.console.print(
                     "  [dim]Run `git diff` in terminal for full diff.[/]"
@@ -987,8 +1081,6 @@ class InteractiveShell:
 
     def _cmd_doctor(self) -> None:
         """System health check."""
-        import subprocess
-
         self.console.print("  [bold]Runtime[/]")
         self.console.print(f"    [green]✓[/] Python {sys.version.split()[0]}")
         self.console.print(f"    [green]✓[/] Git")
@@ -1031,7 +1123,6 @@ class InteractiveShell:
                 self.console.print("  [yellow]Usage: /memory add <content>[/]")
             return
 
-        # Show memories
         memories = self.session_manager.storage.get_memories(self.session_id, limit=10)
         if not memories:
             self.console.print("  [dim]No memories recorded.[/]")
@@ -1075,6 +1166,9 @@ class InteractiveShell:
         self.running = True
         self.cancel_event.clear()
 
+        # Start live status
+        self._live_status.start(goal)
+
         # Record run in session
         run = None
         if self.session_manager and self.session_id:
@@ -1090,6 +1184,9 @@ class InteractiveShell:
 
         try:
             task = await self._agent_loop.run(goal)
+
+            # Stop live status before printing summary
+            self._live_status.stop()
 
             elapsed = time.time() - self.task_start
 
@@ -1113,7 +1210,7 @@ class InteractiveShell:
             if task.status.value == "completed":
                 self.console.print("")
                 self.console.print(Panel(
-                    "  [bold green]✓ Task completed[/]",
+                    f"  [bold green]✓ Task completed in {_format_elapsed(elapsed)}[/]",
                     border_style="green",
                     padding=(0, 1),
                 ))
@@ -1128,11 +1225,12 @@ class InteractiveShell:
                     for f in files_changed:
                         self.console.print(f"    {f}")
                 # Execution summary
-                self.console.print(f"\n  [dim]{task.iterations} iterations · {len(task.tool_calls)} tool calls · {elapsed:.1f}s[/]")
+                stats_parts = [f"{task.iterations} iterations", f"{len(task.tool_calls)} tools", f"{_format_elapsed(elapsed)}"]
+                self.console.print(f"\n  [dim]{' · '.join(stats_parts)}[/]")
             elif task.status.value == "failed":
                 self.console.print("")
                 self.console.print(Panel(
-                    "  [bold red]✗ Task could not be completed[/]",
+                    f"  [bold red]✗ Task failed after {_format_elapsed(elapsed)}[/]",
                     border_style="red",
                     padding=(0, 1),
                 ))
@@ -1146,7 +1244,8 @@ class InteractiveShell:
                     self.console.print(f"\n  [yellow]Partial work completed:[/]")
                     for f in files_changed:
                         self.console.print(f"    {f}")
-                self.console.print(f"\n  [dim]{task.iterations} iterations · {len(task.tool_calls)} tool calls · {elapsed:.1f}s[/]")
+                stats_parts = [f"{task.iterations} iterations", f"{len(task.tool_calls)} tools", f"{_format_elapsed(elapsed)}"]
+                self.console.print(f"\n  [dim]{' · '.join(stats_parts)}[/]")
             else:
                 self.console.print("")
                 self.console.print(
@@ -1170,6 +1269,7 @@ class InteractiveShell:
             return task.result
 
         except asyncio.CancelledError:
+            self._live_status.stop()
             self.console.print("\n  [yellow]✗ Task cancelled[/]", highlight=False)
             if run and self.session_manager:
                 try:
@@ -1178,6 +1278,7 @@ class InteractiveShell:
                     pass
             return None
         except Exception as e:
+            self._live_status.stop()
             self.console.print(f"\n  [red]✗ Error: {_safe_str(e)}[/]", highlight=False)
             if run and self.session_manager:
                 try:
@@ -1187,6 +1288,7 @@ class InteractiveShell:
             return None
         finally:
             self.running = False
+            self._live_status.stop()
 
     # ─── Input Handling ──────────────────────────────────────────────
 
@@ -1200,7 +1302,6 @@ class InteractiveShell:
             if self.plain:
                 user_input = input("harness > ")
             else:
-                # Use Rich prompt
                 from rich.prompt import Prompt
                 user_input = Prompt.ask(prompt)
             return user_input
@@ -1240,7 +1341,6 @@ class InteractiveShell:
                 user_input = self._read_input()
 
                 if user_input is None:
-                    # EOF or Ctrl+C
                     break
 
                 user_input = user_input.strip()

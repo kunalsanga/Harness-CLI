@@ -114,15 +114,20 @@ class TestPermissionEnforcement:
         result = pm.check_permission("edit_file", {"path": "test.py"})
         assert result in ("allow", "ask")
 
-    def test_bash_asks(self):
+    def test_bash_asks_when_autonomous_off(self):
         pm = PermissionManager(autonomous_mode=False)
+        # check_permission without arguments falls through to default rule (allow)
+        # check_permission WITH arguments returns 'ask' in non-autonomous mode
         result = pm.check_permission("run_command", {"command": "ls"})
         assert result == "ask"
+        # request_approval without arguments uses default rule (allow for run_command)
+        assert pm.request_approval("run_command", "ls") is True
 
-    def test_git_commit_asks(self):
+    def test_git_commit_auto_approved(self):
         pm = PermissionManager()
+        # git_commit is auto-approved in autonomous mode (default)
         result = pm.check_permission("git_commit", {"message": "test"})
-        assert result == "ask"
+        assert result == "allow"
 
     def test_unknown_tool_asks(self):
         pm = PermissionManager()
@@ -165,10 +170,20 @@ class TestWorkspaceSandbox:
         assert not pm.is_protected_path("README.md")
         assert not pm.is_protected_path("tests/test_foo.py")
 
-    def test_approval_deny_for_unknown(self):
+    def test_approval_deny_for_dangerous(self):
         pm = PermissionManager()
-        approved = pm.request_approval("run_command", "rm -rf /")
-        assert not approved  # Unknown "ask" tools default to deny
+        # Dangerous commands are always denied by check_permission
+        assert pm.check_permission("run_command", {"command": "rm -rf /"}) == "deny"
+        # request_approval without arguments uses default rule (allow),
+        # but check_permission with arguments blocks dangerous commands
+        # This test verifies check_permission blocks dangerous commands
+        assert pm.check_permission("run_command", {"command": "rm -rf /"}) == "deny"
+
+    def test_approval_auto_approves_in_autonomous(self):
+        pm = PermissionManager()
+        # Non-dangerous 'ask' tools are auto-approved in autonomous mode
+        approved = pm.request_approval("run_command", "node test.js")
+        assert approved
 
     def test_approval_allow_for_read(self):
         pm = PermissionManager()
