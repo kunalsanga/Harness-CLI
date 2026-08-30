@@ -10,7 +10,7 @@ from typing import Any, TYPE_CHECKING
 
 from harness_core.agent.types import (
     AgentConfig,
-    AgentRole,
+    FailureReason,
     Task,
     TaskStatus,
     TodoItem,
@@ -37,6 +37,7 @@ from harness_core.agent.todos import (
     select_todo,
 )
 from harness_core.agent.report import build_execution_report, files_from_task
+from harness_core.agent.completion import can_complete_task, completion_blockers
 from harness_core.tools.diagnosis import (
     classify_command_failure,
     normalize_shell_command,
@@ -57,6 +58,51 @@ STAGNATION_WARN_AT = 2
 STAGNATION_STOP_AT = 3
 # How many times we may re-prompt a model that produced zero tool calls.
 MAX_NO_TOOL_NUDGES = 2
+
+# Phase 10: typed failure messages. Keys match FailureReason values.
+_FAILURE_MESSAGES: dict[str, str] = {
+    "model_unavailable": "⚠ Model temporarily unavailable",
+    "model_rate_limited": "⚠ All free models rate limited (429)",
+    "provider_auth_failure": "✗ Provider authentication failed",
+    "payment_required": "✗ Model requires payment (402)",
+    "tool_failure": "✗ Tool operation failed",
+    "test_failure": "✗ Tests failed",
+    "verification_failure": "✗ Verification failed",
+    "user_cancelled": "⚠ Task cancelled",
+    "task_stagnation": "✗ Task stagnation — no progress",
+    "completion_invariant": "✗ Completion invariant violated",
+    "permission_denied": "⚠ Permission denied",
+    "budget_exceeded": "⚠ Budget exceeded",
+    "unknown": "✗ Unknown error",
+}
+
+# Phase 11: pause-specific messaging
+_PAUSED_MESSAGES: dict[str, str] = {
+    "model_unavailable": "⚠ Model temporarily unavailable — task paused, state preserved",
+    "model_rate_limited": "⚠ Free models temporarily unavailable (429) — task paused, state preserved",
+    "provider_auth_failure": "⚠ Provider authentication failed — task paused, state preserved",
+    "payment_required": "⚠ All viable models require payment — task paused, state preserved",
+}
+
+
+def _classify_model_failure(err: str) -> str:
+    """Map a model error string to a typed FailureReason value."""
+    low = (err or "").lower()
+    if "429" in low or "rate limit" in low or "too many requests" in low:
+        return "model_rate_limited"
+    if "402" in low or "payment required" in low:
+        return "payment_required"
+    if "401" in low or "unauthorized" in low:
+        return "provider_auth_failure"
+    if "403" in low or "forbidden" in low:
+        return "provider_auth_failure"
+    if "all" in low and "failed" in low:
+        return "model_unavailable"
+    if "network" in low or "connection" in low or "timeout" in low:
+        return "model_unavailable"
+    return "model_unavailable"
+
+
 # How many iterations may be spent in diagnosis mode before stopping.
 MAX_DIAGNOSIS_ITERATIONS = 5
 # History compaction: keep recent tool calls verbatim, summarize older.
@@ -116,6 +162,8 @@ class AgentLoop:
         self._had_test_failure: bool = False
         self._last_model_used: str = ""  # for model rotation on no-tool responses
         self._active_task: Task | None = None  # currently running task (cancellation reporting)
+        self._completed_operations: set[str] = set()  # successful operation keys (Phase 8)
+        self._pending_workflow_events: list = []  # deferred events from workflows
 
     def _workspace_snapshot_text(self) -> str:
         """Compact workspace snapshot for model context.
@@ -460,6 +508,88 @@ When you are done, summarize what you did and provide evidence of success."""
                 return True
         return False
 
+    # ── Failure reason classification ─────────────────────────────────
+
+    def _classify_failure_reason(self, err: str) -> str:
+        """Map an error string to a typed FailureReason value."""
+        low = (err or "").lower()
+        if "429" in low or "rate limit" in low or "too many requests" in low:
+            return "model_rate_limited"
+        if "402" in low or "payment required" in low:
+            return "payment_required"
+        if "401" in low or "unauthorized" in low:
+            return "provider_auth_failure"
+        if "403" in low or "forbidden" in low:
+            return "provider_auth_failure"
+        if "all" in low and "failed" in low:
+            return "model_unavailable"
+        if "network" in low or "connection" in low or "timeout" in low:
+            return "model_unavailable"
+        return "unknown"
+
+    # ── Workflow helpers ──────────────────────────────────────────────
+
+    def _workflow_context(self) -> Any:
+        """Build a WorkflowContext for the currently-running task."""
+        from harness_core.agent.workflows import WorkflowContext
+        return WorkflowContext(
+            workspace=self.workspace_root,
+            tools=self.tools,
+            event_bus=self.event_bus,
+            modified_files=self._modified_files,
+            git_commit=getattr(self._active_task, "git_commit", None) if self._active_task else None,
+            git_push=getattr(self._active_task, "git_push", None) if self._active_task else None,
+        )
+
+    def _apply_workflow_result(self, task: Task, result: Any) -> None:
+        """Copy workflow outputs onto the task and emit per-step events.
+
+        Emits the structured todo lifecycle events that the UX layer
+        listens for. Called once per workflow run.
+        """
+        from harness_core.observability.events import Event
+        data = result.data or {}
+        if data.get("commit"):
+            task.git_commit = data["commit"]
+        if data.get("push"):
+            task.git_push = data["push"]
+        for op in result.completed_operations:
+            self._completed_operations.add(op)
+            task.completed_operations.append(op)
+        # Stash TODO events for emission by an async wrapper
+        for item in task.task_plan.items:
+            if not getattr(item, "_workflow_emitted", False):
+                item._workflow_emitted = True
+                ev_type = (
+                    "todo.completed"
+                    if item.status == TodoStatus.COMPLETED
+                    else "todo.failed" if item.status == TodoStatus.FAILED
+                    else "todo.started" if item.status == TodoStatus.IN_PROGRESS
+                    else None
+                )
+                if ev_type:
+                    # Defer to the loop's event loop via the existing bus
+                    # by storing pending events for an async emit pass.
+                    self._pending_workflow_events.append(Event(
+                        type=ev_type,
+                        source="workflow",
+                        data={
+                            "todo_id": item.id,
+                            "title": item.description,
+                            "status": item.status.value,
+                            "evidence": item.evidence,
+                            "error": item.error,
+                        },
+                    ))
+
+    async def _flush_workflow_events(self) -> None:
+        """Emit any deferred workflow events on the bus."""
+        pending = self._pending_workflow_events
+        self._pending_workflow_events = []
+        for ev in pending:
+            await self.event_bus.emit(ev)
+        await self._emit_todo_update(self._active_task) if self._active_task else None
+
     # ── Plan validation ────────────────────────────────────────────────
 
     def _validate_plan_steps(self, steps: list[str]) -> list[str]:
@@ -792,6 +922,7 @@ When you are done, summarize what you did and provide evidence of success."""
         If files were changed, the last test run (if any) succeeded, and
         verification passes, the work is done even though the model kept
         issuing no-progress actions. Otherwise the task genuinely failed.
+        The completion invariant is the gate: can_complete_task() must pass.
         """
         if not self._modified_files:
             return False
@@ -806,6 +937,17 @@ When you are done, summarize what you did and provide evidence of success."""
         if task.status == TaskStatus.FAILED:
             return False
         await self._reconcile_todos(task)
+
+        # Completion invariant: runtime truth, not stagnation mercy
+        if not can_complete_task(task):
+            blockers = completion_blockers(task)
+            task.status = TaskStatus.FAILED
+            task.error = (
+                "Stopped repeating no-progress iterations but "
+                + "; ".join(blockers)
+            )
+            return False
+
         task.status = TaskStatus.COMPLETED
         task.error = None
         task.result = (
@@ -983,6 +1125,25 @@ When you are done, summarize what you did and provide evidence of success."""
                 retryable=False,
             )
 
+        # Phase 8: skip operations that already succeeded (duplicate prevention).
+        # Tools whose results are idempotent: git_status, git_remote, git_log,
+        # git_diff, read_file, list_files, glob. Other tools always run.
+        op_key = self._action_key(call.tool_name, call.arguments)
+        if (
+            call.tool_name
+            in {
+                "git_status", "git_remote", "git_log", "git_diff",
+                "read_file", "list_files", "glob",
+            }
+            and op_key in self._completed_operations
+        ):
+            # Return the cached "already done" result without re-executing.
+            return ToolResult(
+                status=ToolResultStatus.SUCCESS,
+                output="(already executed — cached)",
+                metadata={"cached": True, "operation": op_key},
+            )
+
         # Execute with a bounded timeout so a hung tool can't freeze the CLI.
         call_timeout = float(call.arguments.get("timeout") or tool.schema.timeout_seconds or 30.0)
         call_timeout = min(max(call_timeout, 1.0), 300.0)
@@ -997,6 +1158,8 @@ When you are done, summarize what you did and provide evidence of success."""
                     call.tool_name, call.arguments, result.exit_code or -1
                 )
             else:
+                # Record successful operation for Phase 8 duplicate prevention
+                self._completed_operations.add(op_key)
                 self._reset_failure_tracking()
             await self._record_execution_outcome(call, result)
             return result
@@ -1046,12 +1209,99 @@ When you are done, summarize what you did and provide evidence of success."""
         self._consecutive_denials = 0
         self._recent_failures = []
         self._consecutive_failures = 0
+        self._completed_operations = set()
+        self._pending_workflow_events = []
         self.budget.reset()
 
         await self.event_bus.emit(
             Event(type="task.started", source="agent_loop", data={"goal": goal})
         )
         await self._emit_phase("understanding")
+
+        # Phase 16: intent fast paths — deterministic workflows run without
+        # unbounded LLM iteration when the intent matches.
+        from harness_core.agent.workflows import (
+            classify_workflow,
+            run_git_push_workflow,
+            run_explain_workflow,
+        )
+        workflow_name = classify_workflow(goal)
+        if workflow_name in ("git_push", "explain", "test"):
+            await self._emit_phase("workflow")
+            if workflow_name == "git_push":
+                wf_result = await run_git_push_workflow(
+                    ctx=self._workflow_context(),
+                    plan=task.task_plan,
+                )
+            elif workflow_name == "test":
+                from harness_core.agent.workflows import run_test_workflow
+                wf_result = await run_test_workflow(
+                    ctx=self._workflow_context(),
+                    plan=task.task_plan,
+                )
+            else:  # explain
+                wf_result = await run_explain_workflow(
+                    ctx=self._workflow_context(),
+                    plan=task.task_plan,
+                )
+            self._apply_workflow_result(task, wf_result)
+            await self._flush_workflow_events()
+            if wf_result.success:
+                # Completion invariant: workflow success ≠ task COMPLETED.
+                # Every workflow must pass can_complete_task before finishing.
+                await self._reconcile_todos(task)
+                if can_complete_task(task):
+                    await self._emit_phase("complete")
+                    task.status = TaskStatus.COMPLETED
+                else:
+                    blockers = completion_blockers(task)
+                    await self._emit_phase("complete")
+                    task.status = TaskStatus.FAILED
+                    task.error = (
+                        "Workflow completed but task cannot be marked done: "
+                        + "; ".join(blockers)
+                    )
+            else:
+                await self._emit_phase("complete")
+                task.status = TaskStatus.FAILED
+                task.error = wf_result.failure_reason
+                task.failure_reason = wf_result.failure_reason
+            # Emit final event
+            await self.event_bus.emit(
+                Event(
+                    type="task.completed",
+                    source="agent_loop",
+                    data={
+                        "task_id": task.id,
+                        "status": task.status.value,
+                        "failure_reason": task.failure_reason,
+                        "iterations": task.iterations,
+                        "tool_calls": len(task.tool_calls),
+                        "stats": task.execution_stats.summary(),
+                        "attempted": task.execution_stats.attempted,
+                        "succeeded": task.execution_stats.succeeded,
+                        "failed": task.execution_stats.failed,
+                        "recovered": task.execution_stats.recovered,
+                        "unresolved": task.execution_stats.unresolved,
+                        "verification_passed": task.verification_passed,
+                        "verification_summary": task.verification_summary,
+                        "files_changed": list(self._modified_files),
+                        "completed_operations": list(self._completed_operations),
+                        "todos": task.task_plan.to_event_items(),
+                        "todos_completed": task.task_plan.completed_count,
+                        "todos_failed": task.task_plan.failed_count,
+                        "todos_total": task.task_plan.total_count,
+                        "tests_run": task.tests_run,
+                        "tests_passed": task.tests_passed,
+                        "models_used": list(task.models_used),
+                        "model_fallbacks": task.model_fallbacks,
+                        "git_commit": task.git_commit,
+                        "git_push": task.git_push,
+                        "paused_reason": task.paused_reason,
+                    },
+                )
+            )
+            return task
 
         # Classify task if task_aware router is available
         task_type = None
@@ -1230,11 +1480,17 @@ When you are done, summarize what you did and provide evidence of success."""
                 else:
                     response = await self.provider.generate(request)
             except Exception as e:
+                err_str = str(e)
+                failure_reason = self._classify_failure_reason(err_str)
+                task.failure_reason = failure_reason
                 await self.event_bus.emit(
                     Event(
                         type="model.error",
                         source="agent_loop",
-                        data={"error": str(e)},
+                        data={
+                            "error": err_str,
+                            "reason": failure_reason,
+                        },
                     )
                 )
                 # MODEL FAILURE ≠ TASK FAILURE. If real work already happened,
@@ -1245,7 +1501,8 @@ When you are done, summarize what you did and provide evidence of success."""
                 if did_work:
                     task.status = TaskStatus.PAUSED
                     task.paused_reason = (
-                        "No usable model is currently available (rate limited or unreachable). "
+                        _PAUSED_MESSAGES.get(failure_reason, failure_reason)
+                        or "No usable model is currently available. "
                         "Execution state preserved."
                     )
                     task.error = None
@@ -1256,6 +1513,7 @@ When you are done, summarize what you did and provide evidence of success."""
                             source="agent_loop",
                             data={
                                 "task_id": task.id,
+                                "reason": failure_reason,
                                 "reason": "model_unavailable",
                                 "error": str(e),
                                 "completed_todos": task.task_plan.completed_count,
@@ -1372,6 +1630,17 @@ When you are done, summarize what you did and provide evidence of success."""
                     )
                     continue
 
+                # When the model finishes with text only (no tool calls in this
+                # iteration) and the nudge budget is exhausted, skip all pending
+                # TODOs — the model chose to complete without further tool use.
+                if not iter_calls:
+                    for item in task.task_plan.items:
+                        if item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
+                            task.task_plan.skip_id(
+                                item.id,
+                                "Model completed with text response; no tool evidence",
+                            )
+
                 # HARD INVARIANT: TOOL FAILURE ≠ TASK SUCCESS
                 # The runtime execution results are the source of truth.
                 # A model text response claiming success does NOT override
@@ -1420,6 +1689,31 @@ When you are done, summarize what you did and provide evidence of success."""
 
                 # Reconcile remaining TODOs against real execution evidence
                 await self._reconcile_todos(task)
+
+                # COMPLETION INVARIANT
+                # No code path sets COMPLETED without passing through
+                # can_complete_task. 4/5 is not completion; the runtime
+                # is the source of truth, not the model's text.
+                if not can_complete_task(task):
+                    blockers = completion_blockers(task)
+                    task.status = TaskStatus.FAILED
+                    task.error = (
+                        "Task cannot be marked complete: " + "; ".join(blockers)
+                    )
+                    await self.event_bus.emit(
+                        Event(
+                            type="task.failed",
+                            source="agent_loop",
+                            data={
+                                "task_id": task.id,
+                                "reason": "completion_invariant_violated",
+                                "blockers": blockers,
+                                "completed_todos": task.task_plan.completed_count,
+                                "total_todos": task.task_plan.total_count,
+                            },
+                        )
+                    )
+                    break
 
                 await self._emit_phase("complete")
                 task.status = TaskStatus.COMPLETED
@@ -1532,6 +1826,7 @@ When you are done, summarize what you did and provide evidence of success."""
                 data={
                     "task_id": task.id,
                     "status": task.status.value,
+                    "failure_reason": task.failure_reason,
                     "iterations": task.iterations,
                     "tool_calls": len(task.tool_calls),
                     "stats": task.execution_stats.summary(),
@@ -1543,6 +1838,7 @@ When you are done, summarize what you did and provide evidence of success."""
                     "verification_passed": task.verification_passed,
                     "verification_summary": task.verification_summary,
                     "files_changed": list(self._modified_files),
+                    "completed_operations": list(self._completed_operations),
                     "todos": task.task_plan.to_event_items(),
                     "todos_completed": task.task_plan.completed_count,
                     "todos_failed": task.task_plan.failed_count,

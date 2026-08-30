@@ -1,8 +1,22 @@
-"""Runtime-owned TODO sanitization and evidence-based status updates."""
+"""Runtime-owned TODO sanitization and evidence-based status updates.
+
+The TODO system is owned by the runtime, not the model. Each TODO has:
+  - description       — what the agent said it would do
+  - status            — PENDING / IN_PROGRESS / COMPLETED / FAILED / SKIPPED
+  - required          — if True, completion invariant requires resolution
+  - category          — inspect | implement | test | verify | commit | push | stage | other
+  - expected_operations — tool names that would evidence this TODO
+  - dependencies      — IDs of TODOs that must complete before this one
+  - evidence          — the structured result that resolved this TODO
+
+Tools emit structured operation identifiers. The runtime maps tool -> TODO.
+The model does NOT control TODO completion.
+"""
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from harness_core.agent.types import TaskPlan, TodoItem, TodoStatus, ToolCall, ToolResult
@@ -42,6 +56,17 @@ _COMMIT = ("commit",)
 _PUSH = ("push",)
 _STAGE = ("stage",)
 
+# Category → tool names that produce evidence for that category
+_CATEGORY_TOOLS: dict[str, tuple[str, ...]] = {
+    "inspect": ("read_file", "list_files", "glob", "grep", "git_status", "git_diff", "git_log"),
+    "implement": ("write_file", "edit_file"),
+    "test": ("run_command",),
+    "verify": ("run_command",),
+    "stage": ("git_add", "git_stage"),
+    "commit": ("git_commit",),
+    "push": ("git_push",),
+}
+
 
 def _has(low: str, words: tuple[str, ...]) -> bool:
     """Whole-word match allowing only plural/verb suffixes (s, es, ing, ed)."""
@@ -72,6 +97,23 @@ def is_actionable_todo(title: str) -> bool:
         return False
     first = re.split(r"[\s/:-]+", low, maxsplit=1)[0]
     return first in ACTION_VERBS
+
+
+@dataclass
+class TodoSpec:
+    """Structured metadata for a TODO step added from the plan."""
+    description: str
+    category: str
+    expected_operations: tuple[str, ...]
+    required: bool = True
+    dependencies: tuple[str, ...] = ()
+
+
+def _todo_spec(title: str) -> TodoSpec:
+    """Build a structured TodoSpec from a raw title."""
+    cat = todo_category(title)
+    ops = _CATEGORY_TOOLS.get(cat, ())
+    return TodoSpec(description=title, category=cat, expected_operations=ops)
 
 
 def fallback_todo_plan(goal: str, project_info: dict[str, Any] | None = None) -> list[str]:
@@ -113,6 +155,12 @@ def fallback_todo_plan(goal: str, project_info: dict[str, Any] | None = None) ->
             seen.add(s.lower())
             out.append(s)
     return out[:8]
+
+
+def fallback_todo_specs(goal: str, project_info: dict[str, Any] | None = None) -> list[TodoSpec]:
+    """Structured version of fallback_todo_plan — use this when building plans."""
+    titles = fallback_todo_plan(goal, project_info)
+    return [_todo_spec(t) for t in titles]
 
 
 def _clean_step(step: str) -> str:

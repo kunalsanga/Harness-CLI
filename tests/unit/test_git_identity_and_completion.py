@@ -122,10 +122,10 @@ class TestTaskExecutionStats:
     def test_permission_denied_not_counted_as_failure(self):
         stats = TaskExecutionStats()
         stats.record_permission_denied("tool_a")
-        # record_permission_denied increments attempted but NOT failed/unresolved
+        # record_permission_denied does NOT count as failure or attempted
         assert stats.failed == 0
         assert stats.unresolved == 0
-        assert stats.attempted == 1
+        assert stats.attempted == 0
 
     def test_summary(self):
         stats = TaskExecutionStats()

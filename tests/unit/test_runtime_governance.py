@@ -259,7 +259,7 @@ class TestZeroToolCallGuard:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, tools=[], collector=collector)
 
-        task = await loop.run("Explain this project")
+        task = await loop.run("Tell me about this project")
 
         assert collector.of_type("execution.nudge") == []
         assert task.status == TaskStatus.COMPLETED
@@ -276,7 +276,7 @@ class TestZeroToolCallGuard:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector=collector)
 
-        task = await loop.run("Explain this project")
+        task = await loop.run("Tell me about this project")
 
         assert collector.of_type("execution.nudge") == []
         assert len(task.tool_calls) == 1
@@ -300,7 +300,7 @@ class TestRepeatedFailureGovernor:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector=collector)
 
-        await loop.run("Run the tests")
+        await loop.run("Execute the test suite")
 
         triggered = collector.of_type("diagnosis.triggered")
         assert len(triggered) == 1
@@ -322,7 +322,7 @@ class TestRepeatedFailureGovernor:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector=collector)
 
-        task = await loop.run("Run the tests")
+        task = await loop.run("Execute the test suite")
 
         # The third identical attempt must be blocked without executing
         results = [tc.result for tc in task.tool_calls if tc.result]
@@ -349,7 +349,7 @@ class TestRepeatedFailureGovernor:
         ])
         loop = make_loop(provider, tmp_path)
 
-        task = await loop.run("Fix and rerun")
+        task = await loop.run("Fix issues and rerun")
 
         # After the edit, the retry is allowed (not BLOCKED)
         last = task.tool_calls[-1]
@@ -393,7 +393,7 @@ class TestStagnationDetection:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector=collector)
 
-        task = await loop.run("Explain this project")
+        task = await loop.run("Tell me about this project")
 
         assert task.status == TaskStatus.COMPLETED
         assert collector.of_type("progress.stalled") == []
@@ -541,7 +541,7 @@ class TestVerificationOnComplete:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector=collector)
 
-        task = await loop.run("Explain this project")
+        task = await loop.run("Tell me about this project")
 
         assert task.status == TaskStatus.COMPLETED
         assert task.verification_passed is None  # never verified — nothing changed
@@ -622,7 +622,7 @@ class TestPhaseTracking:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector=collector)
 
-        await loop.run("Run tests")
+        await loop.run("Execute the test suite")
 
         phases = [e.data["phase"] for e in collector.of_type("task.phase")]
         assert "diagnosing" in phases

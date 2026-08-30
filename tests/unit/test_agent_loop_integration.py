@@ -226,7 +226,7 @@ class TestAgentLoopEndToEnd:
             workspace_root=Path.cwd(),
         )
 
-        task = await loop.run("Explain this project")
+        task = await loop.run("Tell me about this project")
         assert task.status == TaskStatus.COMPLETED
         assert task.result is not None
         assert "Python" in task.result
@@ -275,7 +275,7 @@ class TestAgentLoopEndToEnd:
             workspace_root=Path.cwd(),
         )
 
-        task = await loop.run("Read pyproject.toml and explain the project")
+        task = await loop.run("Read pyproject.toml and tell me about it")
         assert task.status == TaskStatus.COMPLETED
         assert len(task.tool_calls) == 1
         assert task.tool_calls[0].tool_name == "read_file"

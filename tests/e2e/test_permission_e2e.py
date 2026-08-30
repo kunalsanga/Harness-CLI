@@ -91,7 +91,7 @@ class TestPermissionDenialE2E:
         )
 
         # Run the task
-        task = await agent.run("Run the tests and fix any failures")
+        task = await agent.run("Execute tests and repair failures")
 
         # The agent should NOT have used 30 iterations
         # It should have stopped early due to consecutive denials
@@ -149,7 +149,7 @@ class TestPermissionDenialE2E:
             autonomous_mode=False,
         )
 
-        task = await agent.run("Run tests")
+        task = await agent.run("Execute test suite")
 
         # Should stop quickly (safety valve at 3 consecutive denials)
         assert task.iterations <= 6, f"Agent used {task.iterations} iterations"
@@ -205,7 +205,7 @@ class TestPermissionDenialE2E:
             rules=[PermissionRule(tool_pattern="run_command", action="allow")],
         )
 
-        task = await agent.run("Run tests")
+        task = await agent.run("Execute test suite")
 
         assert task.status == TaskStatus.COMPLETED
         assert task.result == "Tests passed successfully."

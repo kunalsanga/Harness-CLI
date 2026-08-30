@@ -140,7 +140,7 @@ class TestRuntimeTodoState:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector)
 
-        task = await loop.run("Explain this project")
+        task = await loop.run("Tell me about this project")
 
         statuses = {i.description: i.status for i in task.task_plan.items}
         assert statuses["Inspect project files"] == TodoStatus.COMPLETED
@@ -160,7 +160,7 @@ class TestRuntimeTodoState:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector)
 
-        task = await loop.run("Run the tests")
+        task = await loop.run("Execute the test suite")
 
         run_item = next(i for i in task.task_plan.items if i.description == "Run tests")
         assert run_item.status == TodoStatus.FAILED

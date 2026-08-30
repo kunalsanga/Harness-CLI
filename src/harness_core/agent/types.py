@@ -12,6 +12,7 @@ from typing import Any
 class TaskStatus(Enum):
     """Status of an engineering task."""
 
+    IDLE = "idle"
     PENDING = "pending"
     PLANNING = "planning"
     EXECUTING = "executing"
@@ -35,6 +36,23 @@ class AgentRole(Enum):
     REVIEW = "review"
     ARCHITECT = "architect"
     EXPERIMENT = "experiment"
+
+
+class FailureReason(Enum):
+    """Typed failure reasons for clean terminal UX."""
+    MODEL_UNAVAILABLE = "model_unavailable"
+    MODEL_RATE_LIMITED = "model_rate_limited"
+    PROVIDER_AUTH_FAILURE = "provider_auth_failure"
+    PAYMENT_REQUIRED = "payment_required"
+    TOOL_FAILURE = "tool_failure"
+    TEST_FAILURE = "test_failure"
+    VERIFICATION_FAILURE = "verification_failure"
+    USER_CANCELLED = "user_cancelled"
+    TASK_STAGNATION = "task_stagnation"
+    COMPLETION_INVARIANT = "completion_invariant"
+    PERMISSION_DENIED = "permission_denied"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    UNKNOWN = "unknown"
 
 
 class ToolResultStatus(Enum):
@@ -149,9 +167,11 @@ class TaskExecutionStats:
         self.unresolved += 1
         self._failed_tools[tool_name] = self._failed_tools.get(tool_name, 0) + 1
 
-    def record_permission_denied(self, tool_name: str) -> None:
+    def record_permission_denied(self, tool_name: str = "") -> None:
         """Permission denied is not a failure per se, but blocks progress."""
-        self.attempted += 1  # already counted in record_attempt
+        # tool_name is accepted for interface symmetry with record_success
+        # / record_failure so callers can swap recorders in one place.
+        del tool_name
         # Don't count as failed or unresolved — it's a constraint
 
     @property
@@ -188,7 +208,13 @@ class TodoStatus(Enum):
 
 @dataclass
 class TodoItem:
-    """A single TODO item in the task plan."""
+    """A single TODO item in the task plan.
+
+    `required=True` means the completion invariant refuses to mark the
+    task COMPLETED until this TODO is resolved. The default is True so
+    every TODO in the runtime plan is a hard requirement unless the
+    planner explicitly opts it out.
+    """
 
     description: str = ""
     status: TodoStatus = TodoStatus.PENDING
@@ -198,6 +224,11 @@ class TodoItem:
     completed_at: float | None = None
     evidence: dict[str, Any] | None = None
     error: str | None = None
+    # Runtime-owned fields
+    required: bool = True
+    category: str = "other"
+    expected_operations: tuple[str, ...] = field(default_factory=tuple)
+    dependencies: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def title(self) -> str:
@@ -228,9 +259,35 @@ class TaskPlan:
         self.items.append(item)
         return item
 
+    def add_spec(
+        self,
+        description: str,
+        *,
+        category: str = "other",
+        expected_operations: tuple[str, ...] = (),
+        dependencies: tuple[str, ...] = (),
+        required: bool = True,
+    ) -> TodoItem:
+        """Add a TODO with structured metadata (preferred over raw .add)."""
+        item = TodoItem(
+            description=description,
+            category=category,
+            expected_operations=expected_operations,
+            dependencies=dependencies,
+            required=required,
+        )
+        self.items.append(item)
+        return item
+
     def get(self, todo_id: str) -> TodoItem | None:
         for item in self.items:
             if item.id == todo_id:
+                return item
+        return None
+
+    def by_title(self, title: str) -> TodoItem | None:
+        for item in self.items:
+            if item.description == title:
                 return item
         return None
 
@@ -273,6 +330,89 @@ class TaskPlan:
             return item
         return None
 
+    def skip_id(self, todo_id: str, reason: str = "") -> TodoItem | None:
+        item = self.get(todo_id)
+        if item and item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
+            item.status = TodoStatus.SKIPPED
+            item.completed_at = time.time()
+            if reason:
+                item.error = reason
+            return item
+        return None
+
+    def skip_dependents(self, todo_id: str, reason: str = "dependency failed") -> list[TodoItem]:
+        """Mark every TODO whose dependency chain includes `todo_id` as SKIPPED.
+
+        Used when a required step fails: blind execution of later steps
+        is forbidden, so dependents are explicitly skipped with a clear
+        reason rather than left dangling.
+        """
+        skipped: list[TodoItem] = []
+        # BFS through the dependency graph
+        affected = {todo_id}
+        frontier = [todo_id]
+        while frontier:
+            current = frontier.pop()
+            for item in self.items:
+                if (
+                    item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS)
+                    and current in item.dependencies
+                    and item.id not in affected
+                ):
+                    affected.add(item.id)
+                    frontier.append(item.id)
+        for item_id in affected:
+            if item_id == todo_id:
+                continue
+            s = self.skip_id(item_id, reason)
+            if s is not None:
+                skipped.append(s)
+        return skipped
+
+    def ready(self) -> list[TodoItem]:
+        """Return TODOs that are runnable right now: pending with no
+        pending or failed dependencies.
+        """
+        ids = {i.id for i in self.items}
+        out: list[TodoItem] = []
+        for item in self.items:
+            if item.status != TodoStatus.PENDING:
+                continue
+            ok = True
+            for dep_id in item.dependencies:
+                if dep_id not in ids:
+                    continue  # unknown id treated as satisfied
+                dep = self.get(dep_id)
+                if dep is None:
+                    continue
+                if dep.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS, TodoStatus.FAILED):
+                    ok = False
+                    break
+            if ok:
+                out.append(item)
+        return out
+
+    def first_unresolved(self) -> TodoItem | None:
+        """Return the first PENDING/IN_PROGRESS TODO whose deps are satisfied.
+
+        Used by resume to pick up from the right place.
+        """
+        for item in self.items:
+            if item.status not in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
+                continue
+            if self._deps_satisfied(item):
+                return item
+        return None
+
+    def _deps_satisfied(self, item: TodoItem) -> bool:
+        for dep_id in item.dependencies:
+            dep = self.get(dep_id)
+            if dep is None:
+                continue
+            if dep.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS, TodoStatus.FAILED):
+                return False
+        return True
+
     @staticmethod
     def _mark_started(item: TodoItem) -> None:
         item.status = TodoStatus.IN_PROGRESS
@@ -307,6 +447,9 @@ class TaskPlan:
                 "status": i.status.value,
                 "evidence": i.evidence,
                 "error": i.error,
+                "required": i.required,
+                "category": i.category,
+                "expected_operations": list(i.expected_operations),
             }
             for i in self.items
         ]
@@ -355,6 +498,10 @@ class Task:
     git_commit: str | None = None
     git_push: str | None = None
     paused_reason: str | None = None
+    # Typed failure category for clean UX (see FailureReason enum)
+    failure_reason: str | None = None
+    # Operations that produced real evidence (for the duplicate-op guard)
+    completed_operations: list[str] = field(default_factory=list)
 
 
 class TaskPhase(Enum):

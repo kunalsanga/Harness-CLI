@@ -227,7 +227,7 @@ class TestAgentLoopFalseCompletionPrevention:
                 )
 
         agent = make_agent(mock_generate)
-        task = await agent.run("Run the tests")
+        task = await agent.run("Execute the test suite")
 
         # Task must NOT be completed — the command failed
         assert task.status == TaskStatus.FAILED
@@ -266,7 +266,7 @@ class TestAgentLoopFalseCompletionPrevention:
                 )
 
         agent = make_agent(mock_generate)
-        task = await agent.run("Run the tests")
+        task = await agent.run("Execute the test suite")
 
         assert task.status == TaskStatus.COMPLETED
         assert task.result == "All tests pass."
@@ -320,7 +320,7 @@ class TestAgentLoopFalseCompletionPrevention:
                 )
 
         agent = make_agent(mock_generate)
-        task = await agent.run("Fix and run tests")
+        task = await agent.run("Repair issues and run suite")
 
         # The second run succeeded, so completion is allowed
         assert task.status == TaskStatus.COMPLETED
@@ -335,7 +335,7 @@ class TestAgentLoopFalseCompletionPrevention:
             )
 
         agent = make_agent(mock_generate)
-        task = await agent.run("Analyze the project structure")
+        task = await agent.run("Survey the project layout")
 
         assert task.status == TaskStatus.COMPLETED
         assert task.result == "Here is my analysis of the project."
@@ -384,7 +384,7 @@ class TestAgentLoopFalseCompletionPrevention:
                 )
 
         agent.provider.generate = AsyncMock(side_effect=mock_generate)
-        task = await agent.run("Write and test code")
+        task = await agent.run("Write code and verify")
 
         # Permission denied is NOT an execution failure, so completion is allowed
         assert task.status == TaskStatus.COMPLETED
@@ -549,7 +549,7 @@ class TestFullFailFixSucceedPipeline:
         )
         agent.provider.generate = AsyncMock(side_effect=mock_generate)
 
-        task = await agent.run("Fix and run the test")
+        task = await agent.run("Repair and retest")
 
         # Task should complete because the second run succeeded
         assert task.status == TaskStatus.COMPLETED

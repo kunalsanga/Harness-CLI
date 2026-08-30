@@ -988,6 +988,10 @@ class InteractiveShell:
             self._cmd_verbose()
         elif command == "/free":
             self._cmd_free_mode()
+        elif command == "/cancel":
+            await self._cmd_cancel()
+        elif command == "/resume":
+            await self._cmd_resume()
         elif command == "/exit" or command == "/quit":
             return False
         else:
@@ -1011,6 +1015,8 @@ class InteractiveShell:
             self.console.print("  /history  Command history")
             self.console.print("  /memory   Session memory")
             self.console.print("  /free     Switch to free model")
+            self.console.print("  /cancel   Cancel running task")
+            self.console.print("  /resume   Resume paused task")
             self.console.print("  /exit     Exit Harness")
             return
 
@@ -1032,6 +1038,8 @@ class InteractiveShell:
             ("/history", "Command history"),
             ("/memory [search]", "Session memory"),
             ("/free", "Switch to free model routing"),
+            ("/cancel", "Cancel running task"),
+            ("/resume", "Resume paused task"),
             ("/exit", "Exit Harness"),
         ]
         for cmd, desc in commands:
@@ -1311,6 +1319,43 @@ class InteractiveShell:
             self._router.config.routing_mode = "free"
             self._router.config.prefer_free = True
         self.console.print("  [green]✓[/] Switched to free model routing")
+
+    async def _cmd_cancel(self) -> None:
+        """Cancel the running task."""
+        if not self.running:
+            self.console.print("  [dim]No task running.[/]")
+            return
+        self.cancel_event.set()
+        if self._agent_loop and self._agent_loop._active_task:
+            from harness_core.agent.types import TaskStatus
+            task = self._agent_loop._active_task
+            task.status = TaskStatus.CANCELLED
+            task.failure_reason = "user_cancelled"
+        self.console.print("  [yellow]⚠ Task cancelled[/]")
+        # Report partial state
+        self._render_cancellation()
+
+    async def _cmd_resume(self) -> None:
+        """Resume a paused task by re-running it."""
+        if not self._agent_loop:
+            self.console.print("  [dim]Agent not initialized.[/]")
+            return
+        task = self._agent_loop._active_task
+        if task is None:
+            self.console.print("  [dim]No paused task to resume.[/]")
+            return
+        from harness_core.agent.types import TaskStatus
+        if task.status != TaskStatus.PAUSED:
+            self.console.print("  [dim]Task is not paused. Current status: {task.status.value}[/]")
+            return
+        # Find the first unresolved TODO and re-run
+        first_todo = task.task_plan.first_unresolved()
+        if first_todo:
+            self.console.print(f"  [green]✓[/] Resuming from: {first_todo.description}")
+        else:
+            self.console.print("  [green]✓[/] Resuming task")
+        # Re-execute the task with the original goal
+        await self._execute_task(task.goal)
 
     # ─── Task Execution ──────────────────────────────────────────────
 
