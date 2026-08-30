@@ -403,11 +403,32 @@ class InteractiveShell:
             tool = event.data.get("tool", "")
             status = event.data.get("status", "")
             output_len = event.data.get("output_len", 0)
+            exit_code = event.data.get("exit_code")
+            error = event.data.get("error", "")
             self.total_tool_calls += 1
             if status == "success":
                 self.console.print(
                     f"  [green]✓[/] {tool} [dim]({output_len} chars)[/]", highlight=False
                 )
+            elif status == "permission_denied":
+                self.console.print(
+                    f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
+                )
+            elif status == "timeout":
+                self.console.print(
+                    f"  [red]✗[/] {tool} [dim](timed out)[/]", highlight=False
+                )
+            elif exit_code is not None and exit_code != 0:
+                self.console.print(
+                    f"  [red]✗[/] {tool} [dim](exit code {exit_code})[/]", highlight=False
+                )
+                if error:
+                    # Show first line of error for UX clarity
+                    first_line = error.split("\n")[0]
+                    if first_line:
+                        self.console.print(
+                            f"  [red]  {_safe_str(first_line)}[/]", highlight=False
+                        )
             else:
                 self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
 
@@ -433,6 +454,15 @@ class InteractiveShell:
                 else:
                     self.console.print("  [red]✗[/] [bold]Verification failed[/]", highlight=False)
 
+        async def on_task_failed(event: Any) -> None:
+            reason = event.data.get("reason", "")
+            failed_tools = event.data.get("failed_tools", 0)
+            if reason == "tool_failures_not_recovered":
+                self.console.print(
+                    f"  [red]✗[/] [bold]Task blocked: {failed_tools} tool operation(s) failed without recovery[/]",
+                    highlight=False,
+                )
+
         async def on_error(event: Any) -> None:
             error = event.data.get("error", "")
             self.console.print(f"  [red]✗ Error: {_safe_str(error)}[/]", highlight=False)
@@ -447,6 +477,7 @@ class InteractiveShell:
         bus.on("tool.result", on_tool_result)
         bus.on("model.error", on_model_error)
         bus.on("task.completed", on_task_completed)
+        bus.on("task.failed", on_task_failed)
         bus.on("verification.started", on_verification)
         bus.on("verification.completed", on_verification)
         bus.on("error.occurred", on_error)

@@ -47,13 +47,19 @@ class ToolResultStatus(Enum):
 
 @dataclass
 class ToolResult:
-    """Result of a tool execution."""
+    """Result of a tool execution.
+
+    The runtime is the source of truth for execution results. Never override
+    these fields based on model text responses.
+    """
 
     status: ToolResultStatus
     output: str
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     retryable: bool = True
+    exit_code: int | None = None
+    stderr: str | None = None
 
     @property
     def is_perm_denied(self) -> bool:
@@ -62,11 +68,45 @@ class ToolResult:
     @property
     def is_transient(self) -> bool:
         return self.status in (ToolResultStatus.TIMEOUT, ToolResultStatus.ERROR) and self.retryable
+
     @property
     def is_final(self) -> bool:
         return self.status == ToolResultStatus.PERMISSION_DENIED or (
             self.status == ToolResultStatus.ERROR and not self.retryable
         )
+
+    @property
+    def execution_failed(self) -> bool:
+        """True when a shell command exited non-zero or the tool errored.
+
+        This is the definitive signal that the operation did not succeed.
+        The agent loop must treat this as a failure regardless of what the
+        model's text response says.
+        """
+        if self.status == ToolResultStatus.SUCCESS:
+            return False
+        if self.status == ToolResultStatus.PERMISSION_DENIED:
+            return False  # blocked, not a failed execution
+        if self.status == ToolResultStatus.TIMEOUT:
+            return True
+        # ERROR: check exit_code for shell commands
+        if self.exit_code is not None and self.exit_code != 0:
+            return True
+        # ERROR without exit_code is a tool-level failure
+        return True
+
+    @property
+    def failure_category(self) -> str:
+        """Classify the failure for retry/recovery decisions."""
+        if self.status == ToolResultStatus.SUCCESS:
+            return "success"
+        if self.status == ToolResultStatus.PERMISSION_DENIED:
+            return "permission_denied"
+        if self.status == ToolResultStatus.TIMEOUT:
+            return "timeout"
+        if self.exit_code is not None and self.exit_code != 0:
+            return "execution_error"
+        return "tool_error"
 
 
 @dataclass

@@ -241,8 +241,20 @@ def run(
                     console.print(f"  [cyan]Tool:[/] {tool}")
                 elif event.type == "tool.result":
                     status = event.data.get("status", "")
-                    color = "green" if status == "success" else "red"
-                    console.print(f"  [{color}]Result:[/] {status}")
+                    exit_code = event.data.get("exit_code")
+                    error = event.data.get("error", "")
+                    if status == "success":
+                        console.print(f"  [green]Result:[/] {status}")
+                    elif status == "permission_denied":
+                        console.print(f"  [yellow]Result:[/] permission denied")
+                    elif exit_code is not None and exit_code != 0:
+                        console.print(f"  [red]Result:[/] failed (exit code {exit_code})")
+                        if error:
+                            first_line = error.split("\n")[0]
+                            if first_line:
+                                console.print(f"  [red]  {first_line}[/]")
+                    else:
+                        console.print(f"  [red]Result:[/] {status}")
                 elif event.type == "task.classified":
                     tt = event.data.get("task_type", "")
                     conf = event.data.get("confidence", 0)

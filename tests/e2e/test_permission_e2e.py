@@ -173,7 +173,7 @@ class TestPermissionDenialE2E:
                             "type": "function",
                             "function": {
                                 "name": "run_command",
-                                "arguments": json.dumps({"command": "node test.js"}),
+                                "arguments": json.dumps({"command": "node test.js", "cwd": str(tmp_path)}),
                             },
                         }
                     ],

@@ -55,6 +55,9 @@ class AgentLoop:
         self.verification_engine = VerificationEngine(self.workspace_root)
         self._recent_denials: list[tuple[str, str]] = []  # (tool_name, args_key)
         self._consecutive_denials: int = 0
+        self._recent_failures: list[tuple[str, str, int]] = []  # (tool_name, args_key, exit_code)
+        self._consecutive_failures: int = 0
+        self._last_command_hash: str | None = None
 
     def _system_prompt(self) -> str:
         """Build the system prompt."""
@@ -68,6 +71,18 @@ Your goal is to complete engineering tasks reliably. You must:
 5. Report results with evidence
 
 You have access to tools. Use them to read, edit, write, search, and run commands.
+
+CRITICAL RULE: NEVER claim a task is complete when a required tool call failed.
+The runtime execution results (exit codes, stderr) are the source of truth.
+If a command exits with a non-zero exit code, the task is NOT complete.
+Your text response cannot override actual tool failures.
+
+If a command fails:
+- Read the error output carefully
+- Diagnose the root cause
+- Fix the code
+- Run the command again
+- Only claim success when the command passes
 
 IMPORTANT: If a tool call returns "permission denied", do NOT retry the same command.
 Instead:
@@ -157,6 +172,95 @@ When you are done, summarize what you did and provide evidence of success."""
         """Reset consecutive denial counter after a successful tool call."""
         self._consecutive_denials = 0
 
+    def _record_failure(self, tool_name: str, arguments: dict[str, Any], exit_code: int = -1) -> None:
+        """Record a tool execution failure for repetition detection."""
+        args_key = json.dumps(arguments, sort_keys=True)
+        self._recent_failures.append((tool_name, args_key, exit_code))
+        if len(self._recent_failures) > 50:
+            self._recent_failures = self._recent_failures[-50:]
+        self._consecutive_failures += 1
+
+    def _reset_failure_tracking(self) -> None:
+        """Reset consecutive failure counter after a successful tool call."""
+        self._consecutive_failures = 0
+
+    def _is_repeating_failure(self, call: ToolCall) -> bool:
+        """Check if this exact command has failed repeatedly without code changes.
+
+        Detects: node test.js → fail → node test.js → fail → node test.js → fail
+        without any intervening file edits.
+        """
+        args_key = json.dumps(call.arguments, sort_keys=True)
+        command = call.arguments.get("command", "")
+        if not command:
+            return False
+        # Count how many times the same command failed recently
+        same_cmd_failures = sum(
+            1 for (tn, ak, _) in self._recent_failures[-10:]
+            if tn == call.tool_name and ak == args_key
+        )
+        return same_cmd_failures >= 3
+
+    def _should_block_completion(self, task: Task) -> bool:
+        """Determine if the task should NOT be marked COMPLETED.
+
+        Hard invariant: TOOL FAILURE ≠ TASK SUCCESS
+
+        Returns True when the task must NOT transition to COMPLETED.
+        """
+        if not task.tool_calls:
+            return False  # No tool calls — model can finish freely
+
+        # Check if any tool calls failed (execution failure, not permission denied)
+        failed_executions = [
+            tc for tc in task.tool_calls
+            if tc.result is not None
+            and tc.result.execution_failed
+            and not tc.result.is_perm_denied
+        ]
+
+        if not failed_executions:
+            return False  # All tool calls succeeded
+
+        # There are failed executions. Check if there was any subsequent success
+        # after the last failure (recovery happened).
+        last_failure_idx = -1
+        for i, tc in enumerate(task.tool_calls):
+            if tc.result and tc.result.execution_failed and not tc.result.is_perm_denied:
+                last_failure_idx = i
+
+        # Check if there's a success after the last failure
+        has_recovery = False
+        if last_failure_idx >= 0:
+            for tc in task.tool_calls[last_failure_idx + 1:]:
+                if tc.result and tc.result.status == ToolResultStatus.SUCCESS:
+                    has_recovery = True
+                    break
+
+        if has_recovery:
+            return False  # Agent recovered successfully
+
+        # Failed executions exist with no recovery — block completion
+        return True
+
+    def _get_failure_summary(self, task: Task) -> str:
+        """Build a summary of failed tool calls for the task error message."""
+        failures = []
+        for tc in task.tool_calls:
+            if tc.result and tc.result.execution_failed and not tc.result.is_perm_denied:
+                cmd = tc.arguments.get("command", tc.tool_name)
+                exit_code = tc.result.exit_code
+                stderr = tc.result.stderr
+                parts = [f"Command: {cmd}"]
+                if exit_code is not None:
+                    parts.append(f"Exit code: {exit_code}")
+                if stderr:
+                    # Truncate long stderr
+                    truncated = stderr[:500] + ("..." if len(stderr) > 500 else "")
+                    parts.append(f"stderr: {truncated}")
+                failures.append("\n  ".join(parts))
+        return "\n\nFailed commands:\n" + "\n---\n".join(failures) if failures else ""
+
     async def _execute_tool(self, call: ToolCall) -> ToolResult:
         """Execute a tool call with permission checking."""
         tool = self.tools.get(call.tool_name)
@@ -207,6 +311,18 @@ When you are done, summarize what you did and provide evidence of success."""
                 retryable=False,
             )
 
+        # Check for repeated failures of the same command
+        if self._is_repeating_failure(call):
+            return ToolResult(
+                status=ToolResultStatus.ERROR,
+                output="",
+                error=(
+                    f"This command has already failed {self._consecutive_failures} times "
+                    f"without any changes. Edit the code first, then retry."
+                ),
+                retryable=False,
+            )
+
         # Execute
         start = time.time()
         try:
@@ -214,10 +330,17 @@ When you are done, summarize what you did and provide evidence of success."""
             call.duration_ms = (time.time() - start) * 1000
             call.result = result
             self._reset_denial_tracking()
+            if result.execution_failed:
+                self._record_failure(
+                    call.tool_name, call.arguments, result.exit_code or -1
+                )
+            else:
+                self._reset_failure_tracking()
             return result
         except Exception as e:
             call.duration_ms = (time.time() - start) * 1000
             self._reset_denial_tracking()
+            self._record_failure(call.tool_name, call.arguments, -1)
             error_result = ToolResult(
                 status=ToolResultStatus.ERROR, output="", error=str(e),
                 retryable=True,
@@ -330,15 +453,23 @@ When you are done, summarize what you did and provide evidence of success."""
 
                     result = await self._execute_tool(call)
 
+                    event_data: dict[str, Any] = {
+                        "tool": call.tool_name,
+                        "status": result.status.value,
+                        "output_len": len(result.output),
+                    }
+                    if result.exit_code is not None:
+                        event_data["exit_code"] = result.exit_code
+                    if result.error:
+                        event_data["error"] = result.error
+                    if result.stderr:
+                        event_data["stderr"] = result.stderr
+
                     await self.event_bus.emit(
                         Event(
                             type="tool.result",
                             source="agent_loop",
-                            data={
-                                "tool": call.tool_name,
-                                "status": result.status.value,
-                                "output_len": len(result.output),
-                            },
+                            data=event_data,
                         )
                     )
 
@@ -349,6 +480,35 @@ When you are done, summarize what you did and provide evidence of success."""
                         break
             else:
                 # No tool calls — model is done
+                # HARD INVARIANT: TOOL FAILURE ≠ TASK SUCCESS
+                # The runtime execution results are the source of truth.
+                # A model text response claiming success does NOT override
+                # actual tool failures.
+                if self._should_block_completion(task):
+                    task.status = TaskStatus.FAILED
+                    failure_summary = self._get_failure_summary(task)
+                    task.error = (
+                        "Task cannot be marked complete: required tool operations failed."
+                        f"{failure_summary}\n\n"
+                        "Diagnose the failures and fix the implementation. "
+                        "Do not claim success when commands fail."
+                    )
+                    await self.event_bus.emit(
+                        Event(
+                            type="task.failed",
+                            source="agent_loop",
+                            data={
+                                "task_id": task.id,
+                                "reason": "tool_failures_not_recovered",
+                                "failed_tools": len([
+                                    tc for tc in task.tool_calls
+                                    if tc.result and tc.result.execution_failed
+                                ]),
+                            },
+                        )
+                    )
+                    break
+
                 task.result = response.content
                 task.status = TaskStatus.COMPLETED
                 break

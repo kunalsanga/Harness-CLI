@@ -98,10 +98,35 @@ class RunCommandTool(Tool):
             if stderr_str:
                 output += f"\n[stderr]\n{stderr_str}"
 
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS if process.returncode == 0 else ToolResultStatus.ERROR,
-                output=output,
-                metadata={"return_code": process.returncode or 0},
-            )
+            return_code = process.returncode or 0
+
+            if return_code == 0:
+                return ToolResult(
+                    status=ToolResultStatus.SUCCESS,
+                    output=output,
+                    metadata={"return_code": return_code},
+                    exit_code=return_code,
+                    stderr=stderr_str if stderr_str else None,
+                )
+            else:
+                return ToolResult(
+                    status=ToolResultStatus.ERROR,
+                    output=output,
+                    error=(
+                        f"Command failed with exit code {return_code}.\n"
+                        f"Command: {command}\n"
+                        f"Exit code: {return_code}"
+                        + (f"\nstderr: {stderr_str[:2000]}" if stderr_str else "")
+                    ),
+                    metadata={"return_code": return_code},
+                    retryable=True,
+                    exit_code=return_code,
+                    stderr=stderr_str if stderr_str else None,
+                )
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResult(
+                status=ToolResultStatus.ERROR,
+                output="",
+                error=f"Could not execute command: {e}",
+                retryable=True,
+            )
