@@ -287,7 +287,10 @@ class TestMixedPermissionE2E:
             nonlocal call_count
             call_count += 1
 
-            if call_count == 1:
+            if call_count <= 1:
+                # Planning phase
+                return MagicMock(content="1. Write file\n2. Verify", tool_calls=None)
+            elif call_count == 2:
                 return MagicMock(
                     content=None,
                     tool_calls=[
@@ -304,7 +307,7 @@ class TestMixedPermissionE2E:
                         }
                     ],
                 )
-            elif call_count == 2:
+            elif call_count == 3:
                 return MagicMock(
                     content=None,
                     tool_calls=[

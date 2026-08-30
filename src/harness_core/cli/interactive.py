@@ -393,17 +393,25 @@ class InteractiveShell:
 
         async def on_task_started(event: Any) -> None:
             goal = event.data.get("goal", "")
-            if self.verbose:
-                self.console.print(f"\n  [bold blue]◐[/] [bold]{goal}[/]", highlight=False)
-            else:
-                self.console.print(f"\n  [bold]{goal}[/]", highlight=False)
+            self.task_start = time.time()
+            self.console.print(f"\n  [bold]{goal}[/]", highlight=False)
+
+        async def on_plan_created(event: Any) -> None:
+            steps = event.data.get("steps", [])
+            if steps:
+                # Display plan as a clean checklist
+                self.console.print(f"\n  [bold blue]Plan[/]")
+                for i, step in enumerate(steps, 1):
+                    self.console.print(f"    [dim]{i}.[/] {step}")
+                self.console.print()
 
         async def on_task_classified(event: Any) -> None:
             task_type = event.data.get("task_type", "")
             confidence = event.data.get("confidence", 0)
-            if task_type:
+            # Only show classification if useful (not "unknown")
+            if task_type and task_type != "unknown":
                 self.console.print(
-                    f"  [dim]  classified: {task_type} ({confidence:.0%})[/]", highlight=False
+                    f"  [dim]  Task: {task_type}[/]", highlight=False
                 )
 
         async def on_routing_decision(event: Any) -> None:
@@ -437,7 +445,27 @@ class InteractiveShell:
             display = _tool_display_name(tool, args)
             if self.verbose:
                 self.console.print(f"  [cyan]→[/] {display}", highlight=False)
-            # In clean mode, tool calls are shown on result
+            else:
+                # Clean mode: show compact activity
+                if tool in ("read_file", "list_files", "glob", "grep"):
+                    self.console.print(f"  [dim]  ◐ {display}[/]", highlight=False)
+                elif tool in ("write_file", "edit_file"):
+                    filepath = args.get("path", args.get("file_path", ""))
+                    if filepath:
+                        fname = filepath.replace("\\", "/").split("/")[-1]
+                        self.console.print(f"  [cyan]✎[/] {fname}", highlight=False)
+                    else:
+                        self.console.print(f"  [cyan]✎[/] {tool}", highlight=False)
+                elif tool == "run_command":
+                    cmd = args.get("command", "")
+                    # Show a shortened command
+                    if len(cmd) > 50:
+                        cmd = cmd[:47] + "..."
+                    self.console.print(f"  [dim]  → {cmd}[/]", highlight=False)
+                elif tool.startswith("git_"):
+                    self.console.print(f"  [dim]  ◐ {display}[/]", highlight=False)
+                else:
+                    self.console.print(f"  [dim]  ◐ {display}[/]", highlight=False)
 
         async def on_tool_result(event: Any) -> None:
             tool = event.data.get("tool", "")
@@ -473,11 +501,9 @@ class InteractiveShell:
                 else:
                     self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
             else:
-                # Clean mode: concise output
+                # Clean mode: only show failures (successes are implied by progress)
                 if status == "success":
-                    self.console.print(
-                        f"  [green]✓[/] {tool}", highlight=False
-                    )
+                    pass  # Don't spam success messages
                 elif status == "permission_denied":
                     self.console.print(
                         f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
@@ -486,6 +512,12 @@ class InteractiveShell:
                     self.console.print(
                         f"  [red]✗[/] {tool} [dim](exit code {exit_code})[/]", highlight=False
                     )
+                    if error:
+                        first_line = error.split("\n")[0]
+                        if first_line:
+                            self.console.print(
+                                f"  [red]  {_safe_str(first_line)}[/]", highlight=False
+                            )
                 else:
                     self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
 
@@ -494,32 +526,30 @@ class InteractiveShell:
             error_lower = error.lower()
             if "no usable free model" in error_lower:
                 self.console.print(f"  [red]✗ No usable free model available[/]", highlight=False)
-                self.console.print(f"  [dim]  Harness could not find an available free model.[/]", highlight=False)
-                self.console.print(f"  [dim]  Options: /models, disable free mode, configure another provider, or start Ollama.[/]", highlight=False)
+                self.console.print(f"  [dim]  Free models are temporarily rate limited.[/]", highlight=False)
+                self.console.print(f"  [dim]  Try again shortly or use your own provider/API key.[/]", highlight=False)
+            elif "429" in error_lower or "rate limit" in error_lower or "too many requests" in error_lower:
+                self.console.print(f"  [yellow]⚠ Rate limited — models temporarily unavailable[/]", highlight=False)
             elif "402" in error_lower or "payment required" in error_lower:
                 self.console.print(f"  [red]✗ Model requires payment (402)[/]", highlight=False)
-                self.console.print(f"  [dim]  This model is not free. Harness will try other models.[/]", highlight=False)
+                self.console.print(f"  [dim]  This model is not free. Use /free for free models.[/]", highlight=False)
             elif "403" in error_lower or "forbidden" in error_lower:
-                # Distinguish model-specific vs provider-level
                 if "model(s) returned 401/403" in error_lower or "unavailable" in error_lower:
-                    self.console.print(f"  [red]✗ Model unavailable (403 Forbidden)[/]", highlight=False)
-                    self.console.print(f"  [dim]  This model is not available. Harness will try other models.[/]", highlight=False)
+                    self.console.print(f"  [red]✗ Model unavailable[/]", highlight=False)
                 else:
-                    self.console.print(f"  [red]✗ AI provider request failed (403 Forbidden)[/]", highlight=False)
-                    self.console.print(f"  [dim]  Check your OPENROUTER_API_KEY and provider permissions.[/]", highlight=False)
+                    self.console.print(f"  [red]✗ Provider authentication failed[/]", highlight=False)
+                    self.console.print(f"  [dim]  Check your API key and provider permissions.[/]", highlight=False)
             elif "401" in error_lower or "unauthorized" in error_lower:
-                self.console.print(f"  [red]✗ AI provider authentication failed (401 Unauthorized)[/]", highlight=False)
-                self.console.print(f"  [dim]  Your API key may be invalid or expired.[/]", highlight=False)
+                self.console.print(f"  [red]✗ Provider authentication failed[/]", highlight=False)
             elif "all" in error_lower and "failed" in error_lower:
-                self.console.print(f"  [red]✗ All available models failed[/]", highlight=False)
-                self.console.print(f"  [dim]  {_safe_str(error)}[/]", highlight=False)
+                self.console.print(f"  [yellow]⚠ All models temporarily unavailable[/]", highlight=False)
             else:
-                self.console.print(f"  [red]✗ Model error: {_safe_str(error)}[/]", highlight=False)
+                self.console.print(f"  [red]✗ Model error: {_safe_str(error)[:100]}[/]", highlight=False)
 
         async def on_task_phase(event: Any) -> None:
             phase = event.data.get("phase", "")
             phase_display = {
-                "understanding": "Understanding",
+                "understanding": "Inspecting",
                 "planning": "Planning",
                 "implementing": "Implementing",
                 "testing": "Testing",
@@ -527,8 +557,7 @@ class InteractiveShell:
                 "verifying": "Verifying",
                 "complete": "Complete",
             }.get(phase, phase)
-            if self.verbose:
-                self.console.print(f"  [dim]  phase: {phase_display}[/]", highlight=False)
+            self.console.print(f"  [bold blue]◐[/] [bold]{phase_display}[/]", highlight=False)
 
         async def on_task_completed(event: Any) -> None:
             status = event.data.get("status", "")
@@ -571,6 +600,7 @@ class InteractiveShell:
 
         # Register handlers
         bus.on("task.started", on_task_started)
+        bus.on("plan.created", on_plan_created)
         bus.on("task.classified", on_task_classified)
         bus.on("task.phase", on_task_phase)
         bus.on("routing.decision", on_routing_decision)
@@ -1019,6 +1049,16 @@ class InteractiveShell:
 
             elapsed = time.time() - self.task_start
 
+            # Collect files that were modified
+            files_changed = []
+            for tc in task.tool_calls:
+                if tc.tool_name in ("write_file", "edit_file") and tc.arguments:
+                    fp = tc.arguments.get("path", tc.arguments.get("file_path", ""))
+                    if fp:
+                        fname = fp.replace("\\", "/").split("/")[-1]
+                        if fname not in files_changed:
+                            files_changed.append(fname)
+
             # Print result summary
             if task.status.value == "completed":
                 self.console.print("")
@@ -1029,26 +1069,36 @@ class InteractiveShell:
                 ))
                 if task.result:
                     result = task.result
-                    if len(result) > 500:
-                        result = result[:470] + "..."
+                    if len(result) > 300:
+                        result = result[:270] + "..."
                     self.console.print(f"  {result}", highlight=False)
-                # Use execution stats for truthful accounting
+                # Files changed
+                if files_changed:
+                    self.console.print(f"\n  [bold]Files changed[/]")
+                    for f in files_changed:
+                        self.console.print(f"    {f}")
+                # Execution summary
                 stats = task.execution_stats
-                self.console.print(f"\n  [bold]Execution[/]")
-                self.console.print(f"  Operations: {stats.attempted}")
-                if stats.recovered > 0:
-                    self.console.print(f"  [yellow]Recovered failures: {stats.recovered}[/]")
-                if stats.unresolved > 0:
-                    self.console.print(f"  [red]Unresolved failures: {stats.unresolved}[/]")
-                else:
-                    self.console.print(f"  [green]Unresolved failures: 0[/]")
-                self.console.print(f"  [dim]Completed in {elapsed:.1f}s ({task.iterations} iterations, {len(task.tool_calls)} tool calls)[/]")
+                self.console.print(f"\n  [dim]{task.iterations} iterations · {len(task.tool_calls)} tool calls · {elapsed:.1f}s[/]")
             elif task.status.value == "failed":
                 self.console.print("")
-                self.console.print("  [bold red]✗ Task failed[/]", highlight=False)
+                self.console.print(Panel(
+                    "  [bold red]✗ Task could not be completed[/]",
+                    border_style="red",
+                    padding=(0, 1),
+                ))
                 if task.error:
-                    self.console.print(f"  [red]{_safe_str(task.error)}[/]", highlight=False)
-                self.console.print(f"  [dim]Failed after {elapsed:.1f}s ({task.iterations} iterations)[/]")
+                    # Clean up the error message
+                    error_msg = _safe_str(task.error)
+                    if len(error_msg) > 200:
+                        error_msg = error_msg[:200] + "..."
+                    self.console.print(f"  {error_msg}", highlight=False)
+                # Partial work
+                if files_changed:
+                    self.console.print(f"\n  [yellow]Partial work completed:[/]")
+                    for f in files_changed:
+                        self.console.print(f"    {f}")
+                self.console.print(f"\n  [dim]{task.iterations} iterations · {len(task.tool_calls)} tool calls · {elapsed:.1f}s[/]")
             else:
                 self.console.print("")
                 self.console.print(

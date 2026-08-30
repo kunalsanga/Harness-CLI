@@ -203,7 +203,10 @@ class TestAgentLoopFalseCompletionPrevention:
         async def mock_generate(request):
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
+            if call_count <= 1:
+                # call_count 1 = planning phase (return a plan)
+                return MagicMock(content="1. Run tests\n2. Fix issues", tool_calls=None)
+            elif call_count == 2:
                 # Run the failing test
                 return MagicMock(
                     content=None,
@@ -241,7 +244,10 @@ class TestAgentLoopFalseCompletionPrevention:
         async def mock_generate(request):
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
+            if call_count <= 1:
+                # Planning phase
+                return MagicMock(content="1. Run tests\n2. Verify", tool_calls=None)
+            elif call_count == 2:
                 return MagicMock(
                     content=None,
                     tool_calls=[{
@@ -275,7 +281,10 @@ class TestAgentLoopFalseCompletionPrevention:
         async def mock_generate(request):
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
+            if call_count <= 1:
+                # Planning phase
+                return MagicMock(content="1. Run tests\n2. Fix if needed\n3. Verify", tool_calls=None)
+            elif call_count == 2:
                 # First run: failing test
                 test_file.write_text("process.exit(1);")
                 return MagicMock(
@@ -289,7 +298,7 @@ class TestAgentLoopFalseCompletionPrevention:
                         },
                     }],
                 )
-            elif call_count == 2:
+            elif call_count == 3:
                 # Agent "fixes" the code
                 test_file.write_text("process.exit(0);")
                 return MagicMock(
@@ -488,7 +497,10 @@ class TestFullFailFixSucceedPipeline:
                     last_tool_result = msg.get("content", "")
                     break
 
-            if call_count == 1:
+            if call_count <= 1:
+                # Planning phase
+                return MagicMock(content="1. Run test\n2. Fix if needed\n3. Verify", tool_calls=None)
+            elif call_count == 2:
                 # First: run the test (will fail)
                 test_file.write_text("process.exit(1);")
                 return MagicMock(
@@ -502,7 +514,7 @@ class TestFullFailFixSucceedPipeline:
                         },
                     }],
                 )
-            elif call_count == 2:
+            elif call_count == 3:
                 # Agent sees failure, fixes the code
                 test_file.write_text("process.exit(0);")
                 return MagicMock(

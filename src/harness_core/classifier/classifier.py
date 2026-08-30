@@ -56,6 +56,10 @@ _TASK_PATTERNS: dict[TaskType, list[str]] = {
         r"\bbuild\b.*\b(component|service|system|module)\b",
         r"\bwrite\b.*\b(code|function|class|module)\b",
         r"\bnew\b.*\b(function|class|module|file)\b",
+        r"\b(enhance|improve|upgrade|upgrade|redesign)\b.*\b(this|the|my|a|an)\b",
+        r"\badd\s+(dark\s*mode|light\s*mode|theme|responsive|animation)\b",
+        r"\bmake\b.*\b(better|faster|nicer|responsive|modern)\b",
+        r"\b(push|deploy|upload)\b.*\b(to|this)\b.*\b(git|github|repo)\b",
     ],
     TaskType.REFACTORING: [
         r"\brefactor\b",

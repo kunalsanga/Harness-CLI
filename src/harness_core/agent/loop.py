@@ -403,6 +403,56 @@ When you are done, summarize what you did and provide evidence of success."""
 
         # Assemble context
         context = await self.context_engine.assemble_context(goal, project_info)
+
+        # Planning phase: ask model to create a concise plan
+        await self._emit_phase("planning")
+        try:
+            plan_messages = [
+                {"role": "system", "content": (
+                    "You are planning an engineering task. Respond with a numbered list of steps.\n"
+                    "Be concise: 3-6 steps maximum. Each step should be one short line.\n"
+                    "Do NOT include explanation. ONLY the numbered list.\n"
+                    "Example:\n"
+                    "1. Inspect current code\n"
+                    "2. Implement changes\n"
+                    "3. Run tests\n"
+                    "4. Verify results"
+                )},
+                {"role": "user", "content": goal},
+            ]
+            plan_request = CompletionRequest(messages=plan_messages)
+            if self.router is not None:
+                plan_result = await self.router.execute(plan_request)
+                if plan_result.succeeded and plan_result.response:
+                    plan_text = plan_result.response.content or ""
+                else:
+                    plan_text = ""
+            else:
+                plan_response = await self.provider.generate(plan_request)
+                plan_text = plan_response.content or ""
+            # Parse plan steps from response
+            plan_steps = []
+            for line in plan_text.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # Remove numbering prefixes like "1.", "1)", "- "
+                import re
+                cleaned = re.sub(r"^[\d]+[.)\s]+[-•*]?\s*", "", line).strip()
+                if cleaned:
+                    plan_steps.append(cleaned)
+            if plan_steps:
+                task.plan = plan_steps
+                await self.event_bus.emit(
+                    Event(
+                        type="plan.created",
+                        source="agent_loop",
+                        data={"steps": plan_steps, "task_id": task.id},
+                    )
+                )
+        except Exception:
+            pass  # Planning is best-effort; don't fail the task
+
         await self._emit_phase("implementing")
 
         while task.iterations < task.max_iterations:

@@ -165,6 +165,7 @@ class FallbackEngine:
         """
         overall_start = time.time()
         result = FallbackResult()
+        rate_limited_count = 0  # Track consecutive rate-limited models
 
         for model_idx, (model_id, provider) in enumerate(model_chain):
             if time.time() - overall_start > self.config.total_timeout_seconds:
@@ -250,6 +251,16 @@ class FallbackEngine:
 
                     if classification == ErrorClassification.RATE_LIMITED:
                         self.health.record_failure(model_id, HealthEvent.RATE_LIMIT_429, latency_ms)
+                        rate_limited_count += 1
+                        # Fast failure: if 3+ models are rate-limited, all candidates are likely rate-limited
+                        if rate_limited_count >= 3:
+                            result.final_error = (
+                                f"All {rate_limited_count} models are rate limited (429). "
+                                f"Free models are temporarily unavailable. "
+                                f"Try again shortly or use your own provider/API key."
+                            )
+                            result.total_latency_ms = (time.time() - overall_start) * 1000
+                            return result
                         # Don't retry rate-limited models; move to next fallback
                         break
 
