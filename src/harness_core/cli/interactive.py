@@ -733,6 +733,51 @@ class InteractiveShell:
                     f"  [red]✗[/] [bold]Task blocked: {failed_tools} tool operation(s) failed without recovery[/]",
                     highlight=False,
                 )
+            elif reason == "stagnation":
+                self.console.print(
+                    "  [red]✗[/] [bold]Stopped: no meaningful progress[/]", highlight=False
+                )
+            elif reason == "diagnosis_exhausted":
+                self.console.print(
+                    "  [red]✗[/] [bold]Unable to diagnose failure safely — stopped[/]",
+                    highlight=False,
+                )
+            elif reason == "verification_failed":
+                self.console.print(
+                    "  [red]✗[/] [bold]Verification failed — task not complete[/]",
+                    highlight=False,
+                )
+
+        async def on_diagnosis_triggered(event: Any) -> None:
+            command = event.data.get("command", "")
+            attempts = event.data.get("attempts", 0)
+            self.console.print(
+                f"  [yellow]⚠[/] [bold]Repeated failure detected[/] "
+                f"[dim]({command[:50]}, {attempts} attempts)[/]",
+                highlight=False,
+            )
+            self.console.print(
+                "  [dim]  Switching to diagnosis...[/]", highlight=False
+            )
+
+        async def on_progress_stalled(event: Any) -> None:
+            self.console.print(
+                "  [yellow]⚠[/] No meaningful progress detected — changing approach",
+                highlight=False,
+            )
+
+        async def on_execution_nudge(event: Any) -> None:
+            self.console.print(
+                "  [dim]  → model prompted to use workspace tools[/]", highlight=False
+            )
+
+        async def on_test_integrity(event: Any) -> None:
+            warning = event.data.get("warning", "")
+            self.console.print(
+                "  [yellow]⚠[/] [bold]Test modifications detected[/]", highlight=False
+            )
+            if warning:
+                self.console.print(f"  [dim]  {_safe_str(warning)[:120]}[/]", highlight=False)
 
         async def on_error(event: Any) -> None:
             error = event.data.get("error", "")
@@ -753,6 +798,10 @@ class InteractiveShell:
         bus.on("model.error", on_model_error)
         bus.on("task.completed", on_task_completed)
         bus.on("task.failed", on_task_failed)
+        bus.on("diagnosis.triggered", on_diagnosis_triggered)
+        bus.on("progress.stalled", on_progress_stalled)
+        bus.on("execution.nudge", on_execution_nudge)
+        bus.on("test_integrity.warning", on_test_integrity)
         bus.on("verification.started", on_verification)
         bus.on("verification.completed", on_verification)
         bus.on("error.occurred", on_error)
@@ -1227,6 +1276,10 @@ class InteractiveShell:
                 # Execution summary
                 stats_parts = [f"{task.iterations} iterations", f"{len(task.tool_calls)} tools", f"{_format_elapsed(elapsed)}"]
                 self.console.print(f"\n  [dim]{' · '.join(stats_parts)}[/]")
+                if task.verification_passed is True:
+                    self.console.print("  [green]✓[/] [dim]Changes verified[/]", highlight=False)
+                elif task.verification_passed is False:
+                    self.console.print("  [red]✗[/] [dim]Verification failed[/]", highlight=False)
             elif task.status.value == "failed":
                 self.console.print("")
                 self.console.print(Panel(
@@ -1258,7 +1311,11 @@ class InteractiveShell:
                     self.session_manager.complete_run(
                         run.run_id,
                         outcome="success" if task.status.value == "completed" else "failure",
-                        verification_passed=task.status.value == "completed",
+                        verification_passed=(
+                            task.verification_passed
+                            if task.verification_passed is not None
+                            else task.status.value == "completed"
+                        ),
                         result_summary=(task.result or "")[:500],
                         iterations=task.iterations,
                         tool_calls=len(task.tool_calls),

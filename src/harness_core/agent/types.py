@@ -268,6 +268,8 @@ class Task:
     result: str | None = None
     error: str | None = None
     execution_stats: TaskExecutionStats = field(default_factory=TaskExecutionStats)
+    verification_passed: bool | None = None  # None = not verified, True/False = outcome
+    verification_summary: str = ""
 
 
 class TaskPhase(Enum):
@@ -277,6 +279,8 @@ class TaskPhase(Enum):
     PLANNING = "planning"
     IMPLEMENTING = "implementing"
     TESTING = "testing"
+    DIAGNOSING = "diagnosing"
+    FIXING = "fixing"
     RECOVERING = "recovering"
     VERIFYING = "verifying"
     COMPLETE = "complete"
@@ -295,3 +299,4 @@ class AgentConfig:
     permissions: dict[str, str] = field(default_factory=dict)
     autonomous_mode: bool = True
     verbose: bool = False
+    verify_on_complete: bool = True

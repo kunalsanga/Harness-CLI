@@ -9,7 +9,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from harness_core.agent.loop import AgentLoop
+from harness_core.agent.loop import AgentLoop, MAX_NO_TOOL_NUDGES
 from harness_core.agent.types import AgentConfig, AgentRole, TaskStatus
 from harness_core.classifier.classifier import TaskClassifier, TaskType
 from harness_core.classifier.types import TaskRequirementProfile
@@ -474,4 +474,7 @@ class TestEndToEndPipeline:
         # Verify pipeline completed
         assert result.status == TaskStatus.COMPLETED
         assert result.result is not None
-        assert result.iterations == 1
+        # The mock model never emits tool calls. The zero-tool-call governor
+        # nudges it MAX_NO_TOOL_NUDGES times before accepting the text answer,
+        # so the loop completes in nudges + 1 iterations (bounded, not 1).
+        assert result.iterations == MAX_NO_TOOL_NUDGES + 1

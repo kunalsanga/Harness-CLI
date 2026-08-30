@@ -285,43 +285,75 @@ class ModelRouter:
 
         # Build chain
         chain: list[tuple[str, ModelProvider]] = []
-        for model, score in ranked[: self.config.max_fallback_chain]:
+        chain_models: list[ModelInfo] = []
+        chain_ids: set[str] = set()
+        primary_recorded = False
+
+        def _record_primary(model: ModelInfo, score: float) -> None:
+            decision = RoutingDecision(
+                task_description=ctx.task_description[:200],
+                selected_model=model.id,
+                selected_provider=model.provider,
+                score=score,
+                routing_mode=self.config.routing_mode,
+            )
+            self._routing_decisions.append(decision)
+
+        async def _emit_primary(model: ModelInfo, score: float) -> None:
+            await self.event_bus.emit(Event(
+                type="routing.decision",
+                source="model_router",
+                data={
+                    "model": model.id,
+                    "provider": model.provider,
+                    "score": round(score, 3),
+                    "mode": self.config.routing_mode,
+                    "alternatives": [
+                        {"model": m.id, "score": round(s, 3)}
+                        for m, s in ranked[1:5]
+                    ],
+                },
+            ))
+
+        async def _try_add(model: ModelInfo, score: float) -> bool:
+            nonlocal primary_recorded
+            if model.id in chain_ids:
+                return False
             provider = self.providers.get(model.provider)
             if provider is None:
-                continue
-
+                return False
             # Check per-model budget
             ok, _ = self.budget.check_model_limit(model.id)
             if not ok:
-                continue
-
+                return False
+            chain_ids.add(model.id)
             chain.append((model.id, provider))
+            chain_models.append(model)
+            if not primary_recorded:
+                primary_recorded = True
+                _record_primary(model, score)
+                await _emit_primary(model, score)
+            return True
 
-            # Record decision
-            if len(chain) == 1:
-                decision = RoutingDecision(
-                    task_description=ctx.task_description[:200],
-                    selected_model=model.id,
-                    selected_provider=model.provider,
-                    score=score,
-                    routing_mode=self.config.routing_mode,
-                )
-                self._routing_decisions.append(decision)
+        limit = self.config.max_fallback_chain
+        for model, score in ranked[:limit]:
+            await _try_add(model, score)
 
-                await self.event_bus.emit(Event(
-                    type="routing.decision",
-                    source="model_router",
-                    data={
-                        "model": model.id,
-                        "provider": model.provider,
-                        "score": round(score, 3),
-                        "mode": self.config.routing_mode,
-                        "alternatives": [
-                            {"model": m.id, "score": round(s, 3)}
-                            for m, s in ranked[1:5]
-                        ],
-                    },
-                ))
+        # Free-model safety net (non-free modes): paid models may require
+        # credits this account does not have (402 Payment Required). Ensure
+        # top-ranked free models are reachable in the chain so fallback can
+        # land on a usable model instead of failing the whole task.
+        if self.config.routing_mode != "free" and ranked:
+            min_free_slots = max(2, limit // 2)
+            free_in_chain = sum(1 for m in chain_models if m.is_free)
+            if free_in_chain < min_free_slots:
+                for model, score in ranked:
+                    if free_in_chain >= min_free_slots:
+                        break
+                    if not model.is_free:
+                        continue
+                    if await _try_add(model, score):
+                        free_in_chain += 1
 
         if not chain:
             if self.config.routing_mode == "free":

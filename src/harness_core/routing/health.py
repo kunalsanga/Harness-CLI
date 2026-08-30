@@ -37,6 +37,7 @@ class ModelHealthStatus(Enum):
     PAYMENT_REQUIRED = "payment_required" # 402 — model requires payment
     RATE_LIMITED = "rate_limited" # 429 — temporarily unavailable
     ERROR = "error"           # Server errors, timeouts, etc.
+    NO_TOOL_USE = "no_tool_use"  # Responded without using required tools — rotate away
 
 
 @dataclass
@@ -76,6 +77,8 @@ class ModelHealthState:
     # Explicit health status (model-level, not provider-level)
     health_status: ModelHealthStatus = ModelHealthStatus.UNKNOWN
     last_auth_failure_time: float = 0.0
+    # When set, the model is rotated away from until this unix time passes
+    no_tool_cooldown_until: float = 0.0
 
     @property
     def reliability(self) -> float:
@@ -108,6 +111,9 @@ class ModelHealthState:
             return False  # requires payment, not usable in free mode
         if self.health_status == ModelHealthStatus.RATE_LIMITED:
             return self.is_rate_limited  # may have recovered
+        if self.health_status == ModelHealthStatus.NO_TOOL_USE:
+            # Rotate away until the cooldown timestamp passes, then recover
+            return time.time() >= self.no_tool_cooldown_until
         if self.health_status == ModelHealthStatus.ERROR:
             return self.consecutive_failures < 3  # recover after some time
         if self.is_rate_limited:
@@ -233,6 +239,18 @@ class ModelHealthTracker:
     def record_tool_call_failure(self, model_id: str) -> None:
         """Record a tool call failure (model called wrong tool / bad args)."""
         self.record_failure(model_id, HealthEvent.TOOL_CALL_FAILURE)
+
+    def record_no_tool_usage(self, model_id: str, cooldown_seconds: float = 300.0) -> None:
+        """Record that a model responded without using required tools.
+
+        Marks the model so routing rotates to a different model for the
+        cooldown window. Recovers automatically once the window passes or
+        the model next succeeds.
+        """
+        state = self.get_state(model_id)
+        state.tool_call_failures += 1
+        state.health_status = ModelHealthStatus.NO_TOOL_USE
+        state.no_tool_cooldown_until = time.time() + cooldown_seconds
 
     def get_healthy_models(
         self, model_ids: list[str] | None = None
