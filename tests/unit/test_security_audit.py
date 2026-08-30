@@ -115,7 +115,7 @@ class TestPermissionEnforcement:
         assert result in ("allow", "ask")
 
     def test_bash_asks(self):
-        pm = PermissionManager()
+        pm = PermissionManager(autonomous_mode=False)
         result = pm.check_permission("run_command", {"command": "ls"})
         assert result == "ask"
 

@@ -149,8 +149,8 @@ class InteractiveShell:
 
     # ─── Initialization ──────────────────────────────────────────────
 
-    def _print_header(self) -> None:
-        """Print the Harness header."""
+    def _print_welcome(self) -> None:
+        """Print the polished welcome screen."""
         if self.plain:
             self.console.print(f"Harness v{__version__}")
             self.console.print(f"Workspace: {self.workspace}")
@@ -158,27 +158,48 @@ class InteractiveShell:
             self.console.print("")
             return
 
-        header = Text()
-        header.append("Harness ", style="bold blue")
-        header.append(f"v{__version__}", style="dim")
-
-        model_line = Text()
-        model_line.append("  Model: ", style="dim")
-        model_line.append(self.current_model or "not set", style="cyan")
-        model_line.append("  Provider: ", style="dim")
-        model_line.append(self.current_provider or "not set", style="green")
-
-        ws_line = Text()
-        ws_line.append("  Workspace: ", style="dim")
-        ws_line.append(self.workspace, style="white")
+        # Box title
+        title = Text()
+        title.append("\n  HARNESS", style="bold white")
+        subtitle = Text()
+        subtitle.append("  Autonomous AI Engineering Agent", style="dim")
 
         self.console.print(Panel(
-            header,
-            subtitle=model_line,
+            title + subtitle,
             border_style="blue",
             padding=(0, 1),
         ))
-        self.console.print(ws_line)
+
+        # Workspace
+        self.console.print("\n  [bold]Workspace[/]")
+        ws_display = self.workspace
+        if len(ws_display) > 60:
+            ws_display = "..." + ws_display[-57:]
+        self.console.print(f"  {ws_display}")
+
+        # Agent status
+        self.console.print("\n  [bold]Agent[/]")
+        if self.current_provider:
+            self.console.print(f"  [green]✓[/] {self.current_provider} connected")
+        else:
+            self.console.print("  [yellow]✗[/] No provider connected")
+        if self.current_model:
+            self.console.print(f"  [green]✓[/] {self.current_model}")
+        else:
+            self.console.print("  [yellow]○[/] Models not yet discovered")
+        self.console.print("  [green]✓[/] Workspace ready")
+
+        # Capabilities
+        self.console.print("\n  [bold]Capabilities[/]")
+        self.console.print("  • Understand existing projects")
+        self.console.print("  • Write and edit code")
+        self.console.print("  • Run tests")
+        self.console.print("  • Diagnose failures")
+        self.console.print("  • Automatically fix errors")
+        self.console.print("  • Verify results")
+
+        self.console.print("")
+        self.console.print("  [dim]Type /help for commands.[/]")
         self.console.print("")
 
     def _print_status_line(self) -> None:
@@ -363,7 +384,10 @@ class InteractiveShell:
 
         async def on_task_started(event: Any) -> None:
             goal = event.data.get("goal", "")
-            self.console.print(f"\n  [bold blue]◐[/] [bold]{goal}[/]", highlight=False)
+            if self.verbose:
+                self.console.print(f"\n  [bold blue]◐[/] [bold]{goal}[/]", highlight=False)
+            else:
+                self.console.print(f"\n  [bold]{goal}[/]", highlight=False)
 
         async def on_task_classified(event: Any) -> None:
             task_type = event.data.get("task_type", "")
@@ -379,9 +403,14 @@ class InteractiveShell:
             score = event.data.get("score", 0)
             self.current_model = model
             self.current_provider = provider
-            self.console.print(
-                f"  [dim]  model: {model} ({provider}, score: {score:.2f})[/]", highlight=False
-            )
+            if self.verbose:
+                self.console.print(
+                    f"  [dim]  model: {model} ({provider}, score: {score:.2f})[/]", highlight=False
+                )
+            else:
+                self.console.print(
+                    f"  [dim]  → {model}[/]", highlight=False
+                )
 
         async def on_routing_models_refreshed(event: Any) -> None:
             count = event.data.get("count", 0)
@@ -397,7 +426,9 @@ class InteractiveShell:
             tool = event.data.get("tool", "")
             args = event.data.get("args", {})
             display = _tool_display_name(tool, args)
-            self.console.print(f"  [cyan]→[/] {display}", highlight=False)
+            if self.verbose:
+                self.console.print(f"  [cyan]→[/] {display}", highlight=False)
+            # In clean mode, tool calls are shown on result
 
         async def on_tool_result(event: Any) -> None:
             tool = event.data.get("tool", "")
@@ -406,35 +437,66 @@ class InteractiveShell:
             exit_code = event.data.get("exit_code")
             error = event.data.get("error", "")
             self.total_tool_calls += 1
-            if status == "success":
-                self.console.print(
-                    f"  [green]✓[/] {tool} [dim]({output_len} chars)[/]", highlight=False
-                )
-            elif status == "permission_denied":
-                self.console.print(
-                    f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
-                )
-            elif status == "timeout":
-                self.console.print(
-                    f"  [red]✗[/] {tool} [dim](timed out)[/]", highlight=False
-                )
-            elif exit_code is not None and exit_code != 0:
-                self.console.print(
-                    f"  [red]✗[/] {tool} [dim](exit code {exit_code})[/]", highlight=False
-                )
-                if error:
-                    # Show first line of error for UX clarity
-                    first_line = error.split("\n")[0]
-                    if first_line:
-                        self.console.print(
-                            f"  [red]  {_safe_str(first_line)}[/]", highlight=False
-                        )
+            if self.verbose:
+                # Verbose: show full detail
+                if status == "success":
+                    self.console.print(
+                        f"  [green]✓[/] {tool} [dim]({output_len} chars)[/]", highlight=False
+                    )
+                elif status == "permission_denied":
+                    self.console.print(
+                        f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
+                    )
+                elif status == "timeout":
+                    self.console.print(
+                        f"  [red]✗[/] {tool} [dim](timed out)[/]", highlight=False
+                    )
+                elif exit_code is not None and exit_code != 0:
+                    self.console.print(
+                        f"  [red]✗[/] {tool} [dim](exit code {exit_code})[/]", highlight=False
+                    )
+                    if error:
+                        first_line = error.split("\n")[0]
+                        if first_line:
+                            self.console.print(
+                                f"  [red]  {_safe_str(first_line)}[/]", highlight=False
+                            )
+                else:
+                    self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
             else:
-                self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
+                # Clean mode: concise output
+                if status == "success":
+                    self.console.print(
+                        f"  [green]✓[/] {tool}", highlight=False
+                    )
+                elif status == "permission_denied":
+                    self.console.print(
+                        f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
+                    )
+                elif exit_code is not None and exit_code != 0:
+                    self.console.print(
+                        f"  [red]✗[/] {tool} [dim](exit code {exit_code})[/]", highlight=False
+                    )
+                else:
+                    self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
 
         async def on_model_error(event: Any) -> None:
             error = event.data.get("error", "")
             self.console.print(f"  [red]✗ Model error: {_safe_str(error)}[/]", highlight=False)
+
+        async def on_task_phase(event: Any) -> None:
+            phase = event.data.get("phase", "")
+            phase_display = {
+                "understanding": "Understanding",
+                "planning": "Planning",
+                "implementing": "Implementing",
+                "testing": "Testing",
+                "recovering": "Recovering",
+                "verifying": "Verifying",
+                "complete": "Complete",
+            }.get(phase, phase)
+            if self.verbose:
+                self.console.print(f"  [dim]  phase: {phase_display}[/]", highlight=False)
 
         async def on_task_completed(event: Any) -> None:
             status = event.data.get("status", "")
@@ -470,6 +532,7 @@ class InteractiveShell:
         # Register handlers
         bus.on("task.started", on_task_started)
         bus.on("task.classified", on_task_classified)
+        bus.on("task.phase", on_task_phase)
         bus.on("routing.decision", on_routing_decision)
         bus.on("router.models_refreshed", on_routing_models_refreshed)
         bus.on("iteration.started", on_iteration_started)
@@ -554,6 +617,8 @@ class InteractiveShell:
             self._cmd_history()
         elif command == "/memory":
             self._cmd_memory(args)
+        elif command == "/verbose":
+            self._cmd_verbose()
         elif command == "/free":
             self._cmd_free_mode()
         elif command == "/exit" or command == "/quit":
@@ -591,6 +656,7 @@ class InteractiveShell:
             ("/status", "Show session status and stats"),
             ("/model", "Show current model information"),
             ("/models", "List available models"),
+            ("/verbose", "Toggle verbose tool output"),
             ("/session [list|show|create]", "Session management"),
             ("/diff", "Show git diff of changes"),
             ("/clear", "Clear the screen"),
@@ -610,6 +676,7 @@ class InteractiveShell:
         """Show session status."""
         elapsed = time.time() - self.session_start if self.session_start else 0
         mins, secs = divmod(int(elapsed), 60)
+        task_elapsed = time.time() - self.task_start if self.task_start and self.running else 0
 
         if self.plain:
             self.console.print(f"Session: {self.session_id or 'none'}")
@@ -619,19 +686,22 @@ class InteractiveShell:
             self.console.print(f"Iterations: {self.total_iterations}")
             self.console.print(f"Tool calls: {self.total_tool_calls}")
             self.console.print(f"Elapsed: {mins}m {secs}s")
+            if self.running:
+                self.console.print(f"Task time: {task_elapsed:.1f}s")
             return
 
         table = Table(title="Status", border_style="blue", show_header=False)
         table.add_column("Key", style="bold")
         table.add_column("Value")
 
-        table.add_row("Session", self.session_id or "none")
+        table.add_row("Workspace", self.workspace)
         table.add_row("Model", self.current_model or "not set")
         table.add_row("Provider", self.current_provider or "not set")
-        table.add_row("Workspace", self.workspace)
-        table.add_row("Iterations", str(self.total_iterations))
+        table.add_row("Verbose", "on" if self.verbose else "off")
         table.add_row("Tool calls", str(self.total_tool_calls))
-        table.add_row("Elapsed", f"{mins}m {secs}s")
+        table.add_row("Session time", f"{mins}m {secs}s")
+        if self.running:
+            table.add_row("Task time", f"{task_elapsed:.1f}s")
 
         self.console.print(table)
 
@@ -863,6 +933,14 @@ class InteractiveShell:
 
         self.console.print(table)
 
+    def _cmd_verbose(self) -> None:
+        """Toggle verbose mode."""
+        self.verbose = not self.verbose
+        if self.verbose:
+            self.console.print("  [green]✓[/] Verbose mode ON — showing full tool traces")
+        else:
+            self.console.print("  [green]✓[/] Verbose mode OFF — clean output")
+
     def _cmd_free_mode(self) -> None:
         """Switch to free model routing."""
         self.free = True
@@ -904,22 +982,31 @@ class InteractiveShell:
             # Print result summary
             if task.status.value == "completed":
                 self.console.print("")
-                self.console.print("  [bold green]✓ Task completed[/]", highlight=False)
+                self.console.print(Panel(
+                    "  [bold green]✓ Task completed[/]",
+                    border_style="green",
+                    padding=(0, 1),
+                ))
                 if task.result:
-                    # Show result, truncated if long
                     result = task.result
                     if len(result) > 500:
                         result = result[:470] + "..."
                     self.console.print(f"  {result}", highlight=False)
-                self.console.print(
-                    f"  [dim]({task.iterations} iterations, {len(task.tool_calls)} tool calls, {elapsed:.1f}s)[/]",
-                    highlight=False,
-                )
+                # Count successes vs failures
+                successes = sum(1 for tc in task.tool_calls if tc.result and tc.result.status.value == "success")
+                failures = sum(1 for tc in task.tool_calls if tc.result and tc.result.execution_failed)
+                self.console.print(f"\n  [bold]Summary[/]")
+                if successes > 0:
+                    self.console.print(f"  [green]✓[/] {successes} tool operations succeeded")
+                if failures > 0:
+                    self.console.print(f"  [red]✗[/] {failures} tool operations failed")
+                self.console.print(f"  [dim]Completed in {elapsed:.1f}s ({task.iterations} iterations, {len(task.tool_calls)} tool calls)[/]")
             elif task.status.value == "failed":
                 self.console.print("")
                 self.console.print("  [bold red]✗ Task failed[/]", highlight=False)
                 if task.error:
                     self.console.print(f"  [red]{_safe_str(task.error)}[/]", highlight=False)
+                self.console.print(f"  [dim]Failed after {elapsed:.1f}s ({task.iterations} iterations)[/]")
             else:
                 self.console.print("")
                 self.console.print(
@@ -986,10 +1073,7 @@ class InteractiveShell:
         """Run the interactive shell."""
         self.session_start = time.time()
 
-        # Print header
-        self._print_header()
-
-        # Setup
+        # Setup provider first
         self.console.print("  [dim]Initializing...[/]")
 
         if not await self._setup_provider():
@@ -1001,11 +1085,9 @@ class InteractiveShell:
         self._setup_event_handlers()
         self._setup_session()
 
-        # Reprint header with model info
-        self.console.print("")
-        self._print_header()
+        # Print welcome screen
+        self._print_welcome()
 
-        self.console.print("  [dim]Type /help for commands, or describe your task.[/]")
         self.console.print("  [dim]Ctrl+C to cancel, /exit to quit.[/]")
         self.console.print("")
 

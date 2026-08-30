@@ -85,7 +85,10 @@ class TestPermissionManagerApproval:
         assert pm.request_approval("run_command", "run something") is False
 
     def test_ask_without_callback_denies(self):
-        pm = PermissionManager(rules=[PermissionRule(tool_pattern="run_command", action="ask")])
+        pm = PermissionManager(
+            rules=[PermissionRule(tool_pattern="run_command", action="ask")],
+            autonomous_mode=False,
+        )
         assert pm.request_approval("run_command", "run something") is False
 
     def test_session_approval_overrides(self):
@@ -149,6 +152,7 @@ class TestAgentLoopLoopGuard:
             workspace_root=Path("/tmp/test"),
             rules=[PermissionRule(tool_pattern="run_command", action="ask")],
             approval_callback=approval_callback,
+            autonomous_mode=False,
         )
         return loop
 

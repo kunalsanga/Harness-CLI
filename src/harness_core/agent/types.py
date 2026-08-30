@@ -138,6 +138,18 @@ class Task:
     error: str | None = None
 
 
+class TaskPhase(Enum):
+    """Phases of a task lifecycle for progress tracking."""
+
+    UNDERSTANDING = "understanding"
+    PLANNING = "planning"
+    IMPLEMENTING = "implementing"
+    TESTING = "testing"
+    RECOVERING = "recovering"
+    VERIFYING = "verifying"
+    COMPLETE = "complete"
+
+
 @dataclass
 class AgentConfig:
     """Configuration for an agent."""
@@ -149,3 +161,5 @@ class AgentConfig:
     model_preference: str | None = None
     routing_mode: str = "auto"
     permissions: dict[str, str] = field(default_factory=dict)
+    autonomous_mode: bool = True
+    verbose: bool = False

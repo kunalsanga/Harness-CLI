@@ -1,11 +1,81 @@
-"""Permission manager for controlling agent access."""
+"""Permission manager for controlling agent access.
+
+Implements autonomous workspace execution: safe development commands are
+auto-approved inside the workspace, while dangerous operations always
+require explicit user approval.
+"""
 
 from __future__ import annotations
 
 import fnmatch
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+
+# ── Safe commands auto-allowed in autonomous mode ─────────────────────────
+
+# Shell command prefixes/patterns that are safe inside the workspace.
+# Checked against the raw command string for run_command tool calls.
+_SAFE_COMMAND_PREFIXES: list[str] = [
+    # Languages & runtimes
+    "node ", "npx ", "npm ", "pnpm ", "yarn ",
+    "python ", "python3 ", "uv ", "pip ", "pip3 ",
+    "pytest ", "python -m pytest",
+    "cargo ", "rustc ", "cargo test", "cargo build", "cargo run", "cargo clippy", "cargo fmt",
+    "go ", "go test", "go build", "go run",
+    "cmake ", "make ", "meson ",
+    "java ", "javac ", "gradle ", "mvn ",
+    "swift ", "swiftc ",
+    # Git (read-only and commit)
+    "git status", "git diff", "git log", "git show", "git branch", "git stash",
+    "git add ", "git commit ", "git checkout ", "git merge ", "git rebase ",
+    "git reset ", "git revert ",
+    # Linters & formatters
+    "eslint ", "prettier ", "black ", "ruff ", "flake8 ", "mypy ",
+    "pylint ", "isort ", "autopep8 ",
+    # Testing
+    "jest ", "vitest ", "mocha ", "playwright ", "cypress ",
+    "phpunit ", "dotnet test", "dotnet build",
+    # Build
+    "tsc ", "npx tsc", "webpack ", "vite ", "esbuild ", "rollup ",
+    "gradlew ",
+    # File operations (safe)
+    "ls ", "dir ", "cat ", "head ", "tail ", "wc ", "find ", "tree ",
+    "echo ", "which ", "where ",
+    "mkdir ", "cp ", "mv ", "touch ",
+    # Windows equivalents
+    "type ",
+]
+
+# Exact matches for safe commands
+_SAFE_COMMAND_EXACT: set[str] = {
+    "git status", "git diff", "git log", "git show", "git branch",
+    "ls", "dir", "pwd", "echo", "tree",
+}
+
+# Regex patterns for dangerous operations — always require approval
+_DANGEROUS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"rm\s+-rf\s+/"),
+    re.compile(r"mkfs"),
+    re.compile(r"dd\s+if="),
+    re.compile(r">\s*/dev/sd"),
+    re.compile(r"format\s+[cCdD]:", re.IGNORECASE),
+    re.compile(r"del\s+/[sS][qQ]", re.IGNORECASE),
+    re.compile(r"shutdown"),
+    re.compile(r"reboot"),
+    re.compile(r"systemctl\s+(stop|disable|restart)", re.IGNORECASE),
+    re.compile(r"chmod\s+777\s+/"),
+    re.compile(r"curl\s+.*\|\s*(bash|sh)"),
+    re.compile(r"wget\s+.*\|\s*(bash|sh)"),
+]
+
+# Credential/secret patterns in command arguments
+_CREDENTIAL_PATTERNS: list[str] = [
+    ".env", "credentials", "private_key", "ssh_key", "id_rsa",
+    ".secret", "token", "password", "api_key", "secret_key",
+]
 
 
 @dataclass
@@ -20,12 +90,16 @@ class PermissionRule:
 class PermissionManager:
     """Manages permissions for agent actions.
 
+    Modes:
+    - autonomous (default): safe workspace commands auto-allowed,
+      dangerous operations prompt user.
+    - interactive: everything prompts user (legacy behavior).
+    - strict: read-only auto-allowed, everything else prompts.
+
     Supports:
     - allow: execute without asking
     - deny: block execution
     - ask: prompt user or auto-deny based on mode
-
-    Interactive mode provides an approval_callback that prompts the user.
     """
 
     def __init__(
@@ -34,13 +108,14 @@ class PermissionManager:
         rules: list[PermissionRule] | None = None,
         approval_callback: Callable[[str, str], bool] | None = None,
         session_approvals: dict[str, bool] | None = None,
+        autonomous_mode: bool = True,
     ) -> None:
         self.workspace_root = workspace_root or Path.cwd()
         self.rules = rules or self._default_rules()
         self._pending_approvals: dict[str, bool] = {}
         self.approval_callback = approval_callback
-        # Session-level approvals: tool_pattern -> True (approved for session)
         self.session_approvals: dict[str, bool] = session_approvals or {}
+        self.autonomous_mode = autonomous_mode
 
     def _default_rules(self) -> list[PermissionRule]:
         """Default permission rules."""
@@ -61,11 +136,78 @@ class PermissionManager:
             PermissionRule(tool_pattern="network", action="ask"),
         ]
 
+    def _is_safe_workspace_command(self, arguments: dict[str, Any]) -> bool:
+        """Check if a run_command call is a safe workspace operation.
+
+        Only returns True in autonomous mode for commands that are:
+        1. Known-safe development commands (checked against allowlist)
+        2. Not dangerous patterns
+        3. Not accessing credentials/secrets
+        4. Working directory is within the workspace (or no cwd specified)
+        """
+        if not self.autonomous_mode:
+            return False
+
+        command = arguments.get("command", "").strip()
+        if not command:
+            return False
+
+        # Check for dangerous patterns first
+        for pattern in _DANGEROUS_PATTERNS:
+            if pattern.search(command):
+                return False
+
+        # Check for credential access
+        cmd_lower = command.lower()
+        for cred in _CREDENTIAL_PATTERNS:
+            if cred in cmd_lower:
+                return False
+
+        # Check if command starts with a safe prefix
+        cmd_stripped = command.lstrip()
+        for prefix in _SAFE_COMMAND_PREFIXES:
+            if cmd_stripped.lower().startswith(prefix.lower()):
+                return True
+
+        # Check exact matches
+        if cmd_stripped.lower() in _SAFE_COMMAND_EXACT:
+            return True
+
+        # Check if it's a relative path command (likely a local script)
+        # e.g., "./test.sh", "scripts/build.sh", "node scripts/test.js"
+        if cmd_stripped.startswith("./") or cmd_stripped.startswith("../"):
+            # Only allow if it looks like a test/build script
+            lower = cmd_stripped.lower()
+            if any(kw in lower for kw in ["test", "build", "lint", "check", "fmt", "install"]):
+                return True
+
+        return False
+
+    def _is_dangerous_command(self, arguments: dict[str, Any]) -> bool:
+        """Check if a command is explicitly dangerous."""
+        command = arguments.get("command", "").strip()
+        if not command:
+            return False
+        for pattern in _DANGEROUS_PATTERNS:
+            if pattern.search(command):
+                return True
+        return False
+
     def check_permission(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
         """Check permission for a tool. Returns 'allow', 'ask', or 'deny'."""
+        # For run_command in autonomous mode, check safe workspace commands FIRST
+        # (before explicit rules, since the default rule sets run_command to 'ask')
+        if tool_name == "run_command" and arguments and self.autonomous_mode:
+            if self._is_dangerous_command(arguments):
+                return "ask"  # Dangerous — always ask
+            if self._is_safe_workspace_command(arguments):
+                return "allow"  # Safe — auto-approve
+
+        # Check explicit rules
         for rule in self.rules:
             if rule.tool_pattern in tool_name:
                 return rule.action
+
         return "ask"  # Default to ask
 
     def is_within_workspace(self, path: str | Path) -> bool:

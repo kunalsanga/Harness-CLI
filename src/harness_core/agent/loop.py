@@ -51,8 +51,12 @@ class AgentLoop:
         self.task_aware = task_aware
         self.budget = BudgetManager() if router is None else router.budget
         self.context_engine = ContextEngine(self.workspace_root)
-        self.permission_manager = PermissionManager(self.workspace_root)
+        self.permission_manager = PermissionManager(
+            self.workspace_root,
+            autonomous_mode=self.config.autonomous_mode,
+        )
         self.verification_engine = VerificationEngine(self.workspace_root)
+        self._current_phase: str = ""
         self._recent_denials: list[tuple[str, str]] = []  # (tool_name, args_key)
         self._consecutive_denials: int = 0
         self._recent_failures: list[tuple[str, str, int]] = []  # (tool_name, args_key, exit_code)
@@ -243,6 +247,18 @@ When you are done, summarize what you did and provide evidence of success."""
         # Failed executions exist with no recovery — block completion
         return True
 
+    async def _emit_phase(self, phase: str) -> None:
+        """Emit a task phase change event for progress tracking."""
+        if phase != self._current_phase:
+            self._current_phase = phase
+            await self.event_bus.emit(
+                Event(
+                    type="task.phase",
+                    source="agent_loop",
+                    data={"phase": phase, "task_id": ""},
+                )
+            )
+
     def _get_failure_summary(self, task: Task) -> str:
         """Build a summary of failed tool calls for the task error message."""
         failures = []
@@ -355,6 +371,7 @@ When you are done, summarize what you did and provide evidence of success."""
         await self.event_bus.emit(
             Event(type="task.started", source="agent_loop", data={"goal": goal})
         )
+        await self._emit_phase("understanding")
 
         # Classify task if task_aware router is available
         task_type = None
@@ -380,6 +397,7 @@ When you are done, summarize what you did and provide evidence of success."""
 
         # Assemble context
         context = await self.context_engine.assemble_context(goal, project_info)
+        await self._emit_phase("implementing")
 
         while task.iterations < task.max_iterations:
             task.iterations += 1

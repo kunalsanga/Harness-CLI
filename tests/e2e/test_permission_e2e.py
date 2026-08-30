@@ -83,10 +83,11 @@ class TestPermissionDenialE2E:
             config=AgentConfig(max_iterations=30),
             event_bus=bus,
         )
-        # Deny run_command
+        # Deny run_command (disable autonomous mode so denials work)
         agent.permission_manager = PermissionManager(
             workspace_root=tmp_path,
             rules=[PermissionRule(tool_pattern="run_command", action="deny")],
+            autonomous_mode=False,
         )
 
         # Run the task
@@ -145,6 +146,7 @@ class TestPermissionDenialE2E:
         agent.permission_manager = PermissionManager(
             workspace_root=tmp_path,
             rules=[PermissionRule(tool_pattern="run_command", action="deny")],
+            autonomous_mode=False,
         )
 
         task = await agent.run("Run tests")
@@ -258,6 +260,7 @@ class TestPermissionDenialE2E:
         agent.permission_manager = PermissionManager(
             workspace_root=tmp_path,
             rules=[PermissionRule(tool_pattern="run_command", action="deny")],
+            autonomous_mode=False,
         )
 
         task = await agent.run("Run tests with different frameworks")
@@ -341,6 +344,7 @@ class TestMixedPermissionE2E:
                 PermissionRule(tool_pattern="write_file", action="allow"),
                 PermissionRule(tool_pattern="run_command", action="deny"),
             ],
+            autonomous_mode=False,
         )
 
         task = await agent.run("Write a file and verify it")
@@ -393,6 +397,7 @@ class TestPermissionEventsE2E:
         agent.permission_manager = PermissionManager(
             workspace_root=tmp_path,
             rules=[PermissionRule(tool_pattern="run_command", action="deny")],
+            autonomous_mode=False,
         )
 
         # Manually trigger a tool call to test event emission

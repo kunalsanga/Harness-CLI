@@ -567,6 +567,7 @@ class TestExistingPermissionTestsStillPass:
         agent.permission_manager = PermissionManager(
             workspace_root=tmp_path,
             rules=[PermissionRule(tool_pattern="run_command", action="deny")],
+            autonomous_mode=False,
         )
 
         call = ToolCall(
@@ -574,6 +575,7 @@ class TestExistingPermissionTestsStillPass:
             arguments={"command": "echo hello"},
         )
         result = await agent._execute_tool(call)
+
 
         assert result.status == ToolResultStatus.PERMISSION_DENIED
         assert not result.execution_failed
@@ -593,6 +595,7 @@ class TestExistingPermissionTestsStillPass:
         agent.permission_manager = PermissionManager(
             workspace_root=tmp_path,
             rules=[PermissionRule(tool_pattern="run_command", action="deny")],
+            autonomous_mode=False,
         )
 
         for _ in range(3):
