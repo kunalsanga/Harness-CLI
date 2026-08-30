@@ -12,6 +12,8 @@ from harness_core.agent.types import (
     AgentRole,
     Task,
     TaskStatus,
+    TodoItem,
+    TodoStatus,
     ToolCall,
     ToolResult,
     ToolResultStatus,
@@ -265,6 +267,35 @@ When you are done, summarize what you did and provide evidence of success."""
                 )
             )
 
+    async def _emit_thinking(self, message: str, task: Task | None = None) -> None:
+        """Emit a thinking status event (high-level execution intent)."""
+        if task:
+            task.thinking = message
+        await self.event_bus.emit(
+            Event(
+                type="thinking.status",
+                source="agent_loop",
+                data={"message": message},
+            )
+        )
+
+    async def _emit_todo_update(self, task: Task) -> None:
+        """Emit current TODO list state."""
+        items = task.task_plan.display()
+        completed = task.task_plan.completed_count
+        total = task.task_plan.total_count
+        await self.event_bus.emit(
+            Event(
+                type="todo.updated",
+                source="agent_loop",
+                data={
+                    "items": items,
+                    "completed": completed,
+                    "total": total,
+                },
+            )
+        )
+
     def _get_failure_summary(self, task: Task) -> str:
         """Build a summary of failed tool calls for the task error message."""
         failures = []
@@ -443,6 +474,9 @@ When you are done, summarize what you did and provide evidence of success."""
                     plan_steps.append(cleaned)
             if plan_steps:
                 task.plan = plan_steps
+                # Create dynamic task plan
+                for step in plan_steps:
+                    task.task_plan.add(step)
                 await self.event_bus.emit(
                     Event(
                         type="plan.created",
@@ -450,9 +484,12 @@ When you are done, summarize what you did and provide evidence of success."""
                         data={"steps": plan_steps, "task_id": task.id},
                     )
                 )
+                await self._emit_todo_update(task)
         except Exception:
             pass  # Planning is best-effort; don't fail the task
 
+        # Emit initial thinking
+        await self._emit_thinking(f"I understand the task. Starting execution.", task)
         await self._emit_phase("implementing")
 
         while task.iterations < task.max_iterations:

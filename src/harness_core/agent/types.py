@@ -174,6 +174,82 @@ class TaskExecutionStats:
         return ", ".join(parts)
 
 
+class TodoStatus(Enum):
+    """Status of a TODO item."""
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+@dataclass
+class TodoItem:
+    """A single TODO item in the task plan."""
+
+    description: str = ""
+    status: TodoStatus = TodoStatus.PENDING
+
+    @property
+    def symbol(self) -> str:
+        return {
+            TodoStatus.PENDING: "☐",
+            TodoStatus.ACTIVE: "◐",
+            TodoStatus.COMPLETED: "☑",
+            TodoStatus.FAILED: "✗",
+            TodoStatus.SKIPPED: "—",
+        }[self.status]
+
+    def display(self) -> str:
+        return f"{self.symbol} {self.description}"
+
+
+@dataclass
+class TaskPlan:
+    """Dynamic task plan with live status tracking."""
+
+    items: list[TodoItem] = field(default_factory=list)
+
+    def add(self, description: str) -> TodoItem:
+        item = TodoItem(description=description)
+        self.items.append(item)
+        return item
+
+    def complete(self, description: str) -> None:
+        for item in self.items:
+            if item.description == description and item.status != TodoStatus.COMPLETED:
+                item.status = TodoStatus.COMPLETED
+                return
+
+    def activate(self, description: str) -> None:
+        for item in self.items:
+            if item.description == description and item.status == TodoStatus.PENDING:
+                item.status = TodoStatus.ACTIVE
+                return
+
+    def fail(self, description: str) -> None:
+        for item in self.items:
+            if item.description == description and item.status != TodoStatus.COMPLETED:
+                item.status = TodoStatus.FAILED
+                return
+
+    def display(self) -> list[str]:
+        return [item.display() for item in self.items]
+
+    @property
+    def completed_count(self) -> int:
+        return sum(1 for i in self.items if i.status == TodoStatus.COMPLETED)
+
+    @property
+    def total_count(self) -> int:
+        return len(self.items)
+
+    @property
+    def is_complete(self) -> bool:
+        return all(i.status in (TodoStatus.COMPLETED, TodoStatus.SKIPPED) for i in self.items)
+
+
 @dataclass
 class Task:
     """An engineering task."""
@@ -182,6 +258,8 @@ class Task:
     goal: str = ""
     status: TaskStatus = TaskStatus.PENDING
     plan: list[str] = field(default_factory=list)
+    task_plan: TaskPlan = field(default_factory=TaskPlan)
+    thinking: str = ""  # High-level execution status message
     tool_calls: list[ToolCall] = field(default_factory=list)
     iterations: int = 0
     max_iterations: int = 30

@@ -396,13 +396,41 @@ class InteractiveShell:
             self.task_start = time.time()
             self.console.print(f"\n  [bold]{goal}[/]", highlight=False)
 
+        async def on_thinking(event: Any) -> None:
+            message = event.data.get("message", "")
+            if message:
+                self.console.print(f"\n  [dim]• Thinking[/]", highlight=False)
+                # Wrap long messages
+                words = message.split()
+                lines = []
+                current = "  "
+                for word in words:
+                    if len(current) + len(word) > 70:
+                        lines.append(current)
+                        current = "  " + word
+                    else:
+                        current += " " + word if current.strip() else "  " + word
+                if current.strip():
+                    lines.append(current)
+                for line in lines:
+                    self.console.print(f"  [dim]{line.strip()}[/]", highlight=False)
+
+        async def on_todo_updated(event: Any) -> None:
+            items = event.data.get("items", [])
+            completed = event.data.get("completed", 0)
+            total = event.data.get("total", 0)
+            if items:
+                self.console.print(f"\n  [bold]TODOs[/] [dim]({completed}/{total})[/]")
+                for item in items:
+                    self.console.print(f"    {item}")
+                self.console.print()
+
         async def on_plan_created(event: Any) -> None:
             steps = event.data.get("steps", [])
             if steps:
-                # Display plan as a clean checklist
-                self.console.print(f"\n  [bold blue]Plan[/]")
-                for i, step in enumerate(steps, 1):
-                    self.console.print(f"    [dim]{i}.[/] {step}")
+                self.console.print(f"\n  [bold]TODOs[/]")
+                for step in steps:
+                    self.console.print(f"    ☐ {step}")
                 self.console.print()
 
         async def on_task_classified(event: Any) -> None:
@@ -442,30 +470,42 @@ class InteractiveShell:
         async def on_tool_call(event: Any) -> None:
             tool = event.data.get("tool", "")
             args = event.data.get("args", {})
-            display = _tool_display_name(tool, args)
             if self.verbose:
+                display = _tool_display_name(tool, args)
                 self.console.print(f"  [cyan]→[/] {display}", highlight=False)
             else:
-                # Clean mode: show compact activity
-                if tool in ("read_file", "list_files", "glob", "grep"):
-                    self.console.print(f"  [dim]  ◐ {display}[/]", highlight=False)
-                elif tool in ("write_file", "edit_file"):
+                # Clean mode: use Read/Edit/Write/Run labels
+                if tool == "read_file":
+                    filepath = args.get("path", "")
+                    fname = filepath.replace("\\", "/").split("/")[-1] if filepath else tool
+                    self.console.print(f"  [dim]• Read[/]", highlight=False)
+                    self.console.print(f"    {fname}", highlight=False)
+                elif tool == "write_file":
                     filepath = args.get("path", args.get("file_path", ""))
-                    if filepath:
-                        fname = filepath.replace("\\", "/").split("/")[-1]
-                        self.console.print(f"  [cyan]✎[/] {fname}", highlight=False)
-                    else:
-                        self.console.print(f"  [cyan]✎[/] {tool}", highlight=False)
+                    fname = filepath.replace("\\", "/").split("/")[-1] if filepath else tool
+                    self.console.print(f"  [bold cyan]• Write[/]", highlight=False)
+                    self.console.print(f"    {fname}", highlight=False)
+                elif tool == "edit_file":
+                    filepath = args.get("path", args.get("file_path", ""))
+                    fname = filepath.replace("\\", "/").split("/")[-1] if filepath else tool
+                    self.console.print(f"  [bold cyan]• Edit[/]", highlight=False)
+                    self.console.print(f"    {fname}", highlight=False)
                 elif tool == "run_command":
                     cmd = args.get("command", "")
-                    # Show a shortened command
                     if len(cmd) > 50:
                         cmd = cmd[:47] + "..."
-                    self.console.print(f"  [dim]  → {cmd}[/]", highlight=False)
+                    self.console.print(f"  [dim]• Run[/]", highlight=False)
+                    self.console.print(f"    {cmd}", highlight=False)
+                elif tool == "list_files":
+                    self.console.print(f"  [dim]• List[/]", highlight=False)
+                elif tool in ("glob", "grep"):
+                    self.console.print(f"  [dim]• Search[/]", highlight=False)
                 elif tool.startswith("git_"):
-                    self.console.print(f"  [dim]  ◐ {display}[/]", highlight=False)
+                    self.console.print(f"  [dim]• Git[/]", highlight=False)
+                    self.console.print(f"    {display}", highlight=False)
                 else:
-                    self.console.print(f"  [dim]  ◐ {display}[/]", highlight=False)
+                    display = _tool_display_name(tool, args)
+                    self.console.print(f"  [dim]• {tool}[/]", highlight=False)
 
         async def on_tool_result(event: Any) -> None:
             tool = event.data.get("tool", "")
@@ -557,7 +597,9 @@ class InteractiveShell:
                 "verifying": "Verifying",
                 "complete": "Complete",
             }.get(phase, phase)
-            self.console.print(f"  [bold blue]◐[/] [bold]{phase_display}[/]", highlight=False)
+            # Show phase as a subtle status, not a big header
+            if self.verbose:
+                self.console.print(f"  [bold blue]◐[/] [bold]{phase_display}[/]", highlight=False)
 
         async def on_task_completed(event: Any) -> None:
             status = event.data.get("status", "")
@@ -600,6 +642,8 @@ class InteractiveShell:
 
         # Register handlers
         bus.on("task.started", on_task_started)
+        bus.on("thinking.status", on_thinking)
+        bus.on("todo.updated", on_todo_updated)
         bus.on("plan.created", on_plan_created)
         bus.on("task.classified", on_task_classified)
         bus.on("task.phase", on_task_phase)
@@ -1059,6 +1103,12 @@ class InteractiveShell:
                         if fname not in files_changed:
                             files_changed.append(fname)
 
+            # Final TODO checklist
+            if task.task_plan.items:
+                self.console.print(f"\n  [bold]TODOs[/]")
+                for item in task.task_plan.items:
+                    self.console.print(f"    {item.display()}")
+
             # Print result summary
             if task.status.value == "completed":
                 self.console.print("")
@@ -1078,7 +1128,6 @@ class InteractiveShell:
                     for f in files_changed:
                         self.console.print(f"    {f}")
                 # Execution summary
-                stats = task.execution_stats
                 self.console.print(f"\n  [dim]{task.iterations} iterations · {len(task.tool_calls)} tool calls · {elapsed:.1f}s[/]")
             elif task.status.value == "failed":
                 self.console.print("")
@@ -1088,7 +1137,6 @@ class InteractiveShell:
                     padding=(0, 1),
                 ))
                 if task.error:
-                    # Clean up the error message
                     error_msg = _safe_str(task.error)
                     if len(error_msg) > 200:
                         error_msg = error_msg[:200] + "..."
