@@ -1054,7 +1054,35 @@ When you are done, summarize what you did and provide evidence of success."""
         return None
 
     async def _execute_tool_checked(self, call: ToolCall) -> ToolResult:
-        """Execute a tool call with permission checking."""
+        """Execute a tool call with permission checking.
+
+        Added validation to ensure required arguments are present and to
+        provide structured errors for missing arguments, improving reliability.
+        """
+        tool = self.tools.get(call.tool_name)
+        if not tool:
+            self._reset_denial_tracking()
+            return ToolResult(
+                status=ToolResultStatus.ERROR,
+                output="",
+                error=f"Unknown tool: {call.tool_name}",
+                retryable=False,
+            )
+        # --- BEGIN VALIDATION BLOCK ---
+        
+        required_args = tool.schema.parameters.get("required", [])
+        missing = [arg for arg in required_args if arg not in call.arguments]
+        if missing:
+            # Record a failure to enforce bounded correction attempts
+            self._record_failure(call.tool_name, call.arguments, exit_code=-1)
+            missing_msg = ", ".join(missing)
+            return ToolResult(
+                status=ToolResultStatus.ERROR,
+                output="",
+                error=f"Missing required argument(s): {missing_msg}",
+                retryable=False,
+            )
+        # --- END VALIDATION BLOCK ---
         tool = self.tools.get(call.tool_name)
         if not tool:
             self._reset_denial_tracking()
@@ -1065,6 +1093,20 @@ When you are done, summarize what you did and provide evidence of success."""
                 retryable=False,
             )
 
+        
+        
+        required_args = tool.schema.parameters.get("required", [])
+        missing = [arg for arg in required_args if arg not in call.arguments]
+        if missing:
+            # Record a failure to enforce bounded correction attempts
+            self._record_failure(call.tool_name, call.arguments, exit_code=-1)
+            missing_msg = ", ".join(missing)
+            return ToolResult(
+                status=ToolResultStatus.ERROR,
+                output="",
+                error=f"Missing required argument(s): {missing_msg}",
+                retryable=False,
+            )
         # Hard workspace boundary: confine file paths and working directory.
         confinement_denial = self._confine_call(call)
         if confinement_denial is not None:
