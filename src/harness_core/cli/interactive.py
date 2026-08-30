@@ -19,6 +19,9 @@ from rich.table import Table
 from rich.text import Text
 from rich.columns import Columns
 
+from harness_core.agent.report import build_execution_report, files_from_task
+from harness_core.agent.types import TaskStatus
+
 
 # ─── Version ──────────────────────────────────────────────────────────────
 
@@ -107,149 +110,237 @@ def _format_elapsed(seconds: float) -> str:
 
 # ─── Live Status Display ─────────────────────────────────────────────────
 
-class LiveStatus:
-    """Compact live status display that updates during task execution.
+_PHASE_ICONS = {
+    "understanding": "◐", "planning": "◐", "implementing": "◐",
+    "testing": "◐", "diagnosing": "⚠", "fixing": "◐", "recovering": "⚠",
+    "verifying": "◐", "committing": "◐", "pushing": "◐", "complete": "✓",
+}
 
-    Uses ANSI cursor movement to update a stable screen region
-    without causing terminal scrolling.
+
+class LiveStatus:
+    """One canonical live renderer for task execution.
+
+    Rich mode renders a single Live region that updates in place (no
+    repeated terminal lines, smooth elapsed timer). Plain mode prints a
+    compact line only when its content changes. All state is held here;
+    the render is a pure function of that state.
     """
+
+    MAX_TRAIL = 8
 
     def __init__(self, console: Console, plain: bool = False) -> None:
         self.console = console
         self.plain = plain
         self.task_start: float = 0.0
+        self.goal: str = ""
         self.current_phase: str = ""
         self.current_activity: str = ""
         self.activity_detail: str = ""
         self.todo_completed: int = 0
+        self.todo_failed: int = 0
         self.todo_total: int = 0
+        self.todo_items: list[dict[str, Any]] = []
         self.iterations: int = 0
         self.tool_calls: int = 0
         self.current_model: str = ""
+        self.tests_line: str = ""
+        self.trail: list[tuple[str, str]] = []  # (icon, text)
         self._active: bool = False
-        self._timer_task: asyncio.Task | None = None
+        self._live: Any = None
+        self._last_plain_line: str = ""
+
+    # ── lifecycle ─────────────────────────────────────────────────────
 
     def start(self, goal: str) -> None:
-        """Start the live status display."""
+        """Start the live display."""
         self.task_start = time.time()
+        self.goal = goal
         self.current_phase = "understanding"
         self.current_activity = "Initializing"
         self.activity_detail = ""
         self.todo_completed = 0
+        self.todo_failed = 0
         self.todo_total = 0
+        self.todo_items = []
         self.iterations = 0
         self.tool_calls = 0
+        self.tests_line = ""
+        self.trail = []
         self._active = True
-        # Print initial status line
-        self._render()
+        self._last_plain_line = ""
+        if not self.plain:
+            from rich.live import Live
+            self._live = Live(
+                self._renderable(),
+                console=self.console,
+                refresh_per_second=8,
+                transient=False,
+            )
+            self._live.start()
+        else:
+            self._render_plain()
 
     def stop(self) -> None:
-        """Stop the live status display."""
+        """Stop the live display, leaving the final frame visible."""
         self._active = False
-        if self._timer_task and not self._timer_task.done():
-            self._timer_task.cancel()
-            self._timer_task = None
-        # Clear status line by moving cursor up and overwriting
-        self._clear()
+        if self._live is not None:
+            try:
+                self._live.update(self._renderable())
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+        else:
+            # Plain mode: finish the status line
+            self.console.print("", highlight=False)
+
+    def _refresh(self) -> None:
+        if not self._active:
+            return
+        if self._live is not None:
+            self._live.update(self._renderable())
+        else:
+            self._render_plain()
+
+    # ── state updates ─────────────────────────────────────────────────
 
     def update_phase(self, phase: str) -> None:
         self.current_phase = phase
-        if self._active:
-            self._render()
+        self._refresh()
 
     def update_activity(self, tool: str, args: dict[str, Any]) -> None:
-        """Update current activity from tool call."""
+        """Set the current activity from a tool call."""
         self.current_activity = _tool_display_name(tool, args)
-        # Extract file name for detail
         if tool in ("read_file", "write_file", "edit_file"):
             fp = args.get("path", args.get("file_path", ""))
-            if fp:
-                self.activity_detail = fp.replace("\\", "/").split("/")[-1]
-            else:
-                self.activity_detail = ""
+            self.activity_detail = fp.replace("\\", "/").split("/")[-1] if fp else ""
         elif tool == "run_command":
             cmd = args.get("command", "")
             self.activity_detail = cmd[:50] + "..." if len(cmd) > 50 else cmd
         else:
             self.activity_detail = ""
         self.tool_calls += 1
-        if self._active:
-            self._render()
+        self._push_trail("◐", self.current_activity)
+        self._refresh()
 
     def update_activity_complete(self, tool: str, status: str) -> None:
-        """Mark activity as complete."""
+        """Mark the most recent activity success/failed in the trail."""
+        if self.trail:
+            _, text = self.trail[-1]
+            icon = "✓" if status == "success" else "✗"
+            self.trail[-1] = (icon, text)
         if status == "success":
-            self.current_activity = f"Done"
+            self.current_activity = "Done"
             self.activity_detail = ""
         else:
-            self.current_activity = f"Failed"
+            self.current_activity = "Failed"
             self.activity_detail = status
-        if self._active:
-            self._render()
+        self._refresh()
 
     def update_todos(self, completed: int, total: int) -> None:
         self.todo_completed = completed
         self.todo_total = total
-        if self._active:
-            self._render()
+        self._refresh()
+
+    def update_todo_items(self, items: list[dict[str, Any]]) -> None:
+        """Set structured TODO items (runtime-owned state)."""
+        self.todo_items = items or []
+        self.todo_completed = sum(1 for i in self.todo_items if i.get("status") == "completed")
+        self.todo_failed = sum(1 for i in self.todo_items if i.get("status") == "failed")
+        self.todo_total = len(self.todo_items)
+        self._refresh()
 
     def update_iterations(self, count: int) -> None:
         self.iterations = count
-        if self._active:
-            self._render()
+        self._refresh()
 
     def update_model(self, model: str) -> None:
         self.current_model = model
+        self._refresh()
 
-    def _render(self) -> None:
-        """Render the compact status line."""
+    def update_tests(self, line: str) -> None:
+        self.tests_line = line
+        self._refresh()
+
+    def _push_trail(self, icon: str, text: str) -> None:
+        self.trail.append((icon, text))
+        if len(self.trail) > self.MAX_TRAIL:
+            self.trail = self.trail[-self.MAX_TRAIL:]
+
+    # ── rendering ─────────────────────────────────────────────────────
+
+    def _elapsed_str(self) -> str:
         elapsed = time.time() - self.task_start if self.task_start else 0
-        elapsed_str = _format_elapsed(elapsed)
+        return _format_elapsed(elapsed)
 
-        if self.plain:
-            parts = [
-                f"[{self.current_phase}]",
-                f"{self.current_activity}",
-                f"{elapsed_str}",
-            ]
-            if self.todo_total > 0:
-                parts.append(f"TODO {self.todo_completed}/{self.todo_total}")
-            if self.iterations > 0:
-                parts.append(f"iter:{self.iterations}")
-            line = " ".join(parts)
-            self.console.print(f"\r  {line}", end="", highlight=False)
-            return
+    def _renderable(self) -> Any:
+        """Build the single canonical Rich renderable from current state."""
+        from rich.console import Group
+        from rich.progress_bar import ProgressBar
 
-        # Rich formatted status line
-        parts: list[str] = []
-        parts.append(f"  [bold blue]◐[/] [bold]{self.current_phase.title()}[/]")
-
-        if self.current_activity:
-            parts.append(f" [dim]│[/] {self.current_activity}")
-            if self.activity_detail:
-                parts.append(f" [dim]{self.activity_detail}[/]")
-
-        parts.append(f" [dim]│[/] [dim]{elapsed_str}[/]")
+        lines: list[Any] = []
+        icon = _PHASE_ICONS.get(self.current_phase, "◐")
+        lines.append(Text.assemble(
+            ("HARNESS", "bold white"), ("  ", ""), (self.goal[:60], "dim"),
+        ))
+        lines.append(Text.assemble(
+            (f"{icon} ", "bold blue"), (self.current_phase.title(), "bold"),
+            ("   ", ""), (self.current_activity, "cyan"),
+            ("  ", ""), (self.activity_detail, "dim"),
+        ))
 
         if self.todo_total > 0:
-            parts.append(f" [dim]│[/] TODO {self.todo_completed}/{self.todo_total}")
+            frac = self.todo_completed / self.todo_total
+            bar = ProgressBar(total=self.todo_total, completed=self.todo_completed, width=24)
+            lines.append(Text.assemble(("Progress  ", "dim"), (f"{self.todo_completed}/{self.todo_total}", "bold")))
+            lines.append(bar)
 
-        if self.iterations > 0:
-            parts.append(f" [dim]│[/] {self.iterations} iter")
-
+        meta_bits = [f"Elapsed {self._elapsed_str()}"]
+        if self.iterations:
+            meta_bits.append(f"Iter {self.iterations}")
+        meta_bits.append(f"Tools {self.tool_calls}")
         if self.current_model:
-            parts.append(f" [dim]│[/] [dim]{self.current_model}[/]")
+            meta_bits.append(self.current_model)
+        lines.append(Text("  ".join(meta_bits), style="dim"))
 
-        line = "".join(parts)
-        # Use \r to overwrite the previous status line
-        self.console.print(f"\r{line:<80}", end="", highlight=False)
+        if self.tests_line:
+            lines.append(Text(self.tests_line, style="dim"))
 
-    def _clear(self) -> None:
-        """Clear the status line."""
-        if self._active:
-            return
-        # Overwrite with spaces then move to next line
-        self.console.print(f"\r{'':<80}\r", end="", highlight=False)
+        if self.trail:
+            lines.append(Text("Activity", style="dim"))
+            for ticon, ttext in self.trail:
+                style = "green" if ticon == "✓" else ("red" if ticon == "✗" else "blue")
+                lines.append(Text.assemble((f"  {ticon} ", style), (ttext[:70], "")))
+
+        if self.todo_items:
+            lines.append(Text("TODOs", style="dim"))
+            for item in self.todo_items:
+                status = item.get("status", "pending")
+                title = item.get("title", "")
+                symbol = {
+                    "completed": ("✓", "green"),
+                    "in_progress": ("◐", "blue"),
+                    "failed": ("✗", "red"),
+                    "skipped": ("—", "dim"),
+                }.get(status, ("☐", "dim"))
+                lines.append(Text.assemble((f"  {symbol[0]} ", symbol[1]), (title[:70], "")))
+
+        return Group(*lines)
+
+    def _render_plain(self) -> None:
+        """Plain mode: one compact line, printed only on meaningful changes."""
+        parts = [f"[{self.current_phase}]"]
+        if self.todo_total > 0:
+            parts.append(f"TODO {self.todo_completed}/{self.todo_total}")
+        if self.iterations > 0:
+            parts.append(f"iter:{self.iterations}")
+        line = " ".join(parts)
+        if line != self._last_plain_line:
+            self._last_plain_line = line
+            activity = f" {self.current_activity}" if self.current_activity else ""
+            self.console.print(
+                f"  {line}{activity} ({self._elapsed_str()})", highlight=False
+            )
 
 
 # ─── Interactive Shell ────────────────────────────────────────────────────
@@ -409,8 +500,8 @@ class InteractiveShell:
                 EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool,
             )
             from harness_core.tools.git import (
-                GitDiffTool, GitIdentityTool, GitLogTool, GitStatusTool,
-                GitPushTool, GitRemoteTool,
+                GitAddTool, GitCommitTool, GitDiffTool, GitIdentityTool,
+                GitLogTool, GitStatusTool, GitPushTool, GitRemoteTool,
             )
             from harness_core.tools.search import GlobTool, GrepTool
             from harness_core.tools.shell import RunCommandTool
@@ -495,11 +586,13 @@ class InteractiveShell:
                 ListFilesTool(),
                 GlobTool(),
                 GrepTool(),
-                RunCommandTool(),
+                RunCommandTool(working_directory=self.workspace),
                 GitStatusTool(),
                 GitDiffTool(),
                 GitLogTool(),
                 GitIdentityTool(),
+                GitAddTool(),
+                GitCommitTool(),
                 GitPushTool(),
                 GitRemoteTool(),
             ]
@@ -551,18 +644,21 @@ class InteractiveShell:
                 self.console.print(f"  [dim]• Thinking: {message}[/]", highlight=False)
 
         async def on_todo_updated(event: Any) -> None:
-            items = event.data.get("items", [])
-            completed = event.data.get("completed", 0)
-            total = event.data.get("total", 0)
-            self._live_status.update_todos(completed, total)
+            todos = event.data.get("todos")
+            if todos:
+                # Runtime-owned structured TODO state
+                self._live_status.update_todo_items(todos)
+            else:
+                completed = event.data.get("completed", 0)
+                total = event.data.get("total", 0)
+                self._live_status.update_todos(completed, total)
 
         async def on_plan_created(event: Any) -> None:
             steps = event.data.get("steps", [])
-            if steps:
-                self.console.print(f"  [bold]TODOs[/]")
-                for step in steps:
-                    self.console.print(f"    ☐ {step}")
-                self.console.print()
+            todos = event.data.get("todos")
+            if todos:
+                self._live_status.update_todo_items(todos)
+            elif steps:
                 self._live_status.update_todos(0, len(steps))
 
         async def on_task_classified(event: Any) -> None:
@@ -583,10 +679,16 @@ class InteractiveShell:
                 self.console.print(
                     f"  [dim]  model: {model} ({provider}, score: {score:.2f})[/]", highlight=False
                 )
-            else:
-                self.console.print(
-                    f"  [dim]  → {model}[/]", highlight=False
-                )
+
+        async def on_model_switched(event: Any) -> None:
+            frm = event.data.get("from", "")
+            to = event.data.get("to", "")
+            reason = event.data.get("reason", "unavailable")
+            # Quiet, change-only model rotation notice
+            self.console.print(
+                f"  [magenta]⚡[/] [dim]Model fallback {frm} → {to} ({reason})[/]",
+                highlight=False,
+            )
 
         async def on_routing_models_refreshed(event: Any) -> None:
             count = event.data.get("count", 0)
@@ -603,35 +705,11 @@ class InteractiveShell:
         async def on_tool_call(event: Any) -> None:
             tool = event.data.get("tool", "")
             args = event.data.get("args", {})
-            # Update live status with current activity
+            # Update the canonical live activity trail (single renderer)
             self._live_status.update_activity(tool, args)
-            # Also print for event trail
             if self.verbose:
                 display = _tool_display_name(tool, args)
                 self.console.print(f"  [cyan]→[/] {display}", highlight=False)
-            else:
-                # Clean mode: compact activity indicator
-                if tool in ("read_file", "write_file", "edit_file"):
-                    filepath = args.get("path", args.get("file_path", ""))
-                    fname = filepath.replace("\\", "/").split("/")[-1] if filepath else tool
-                    label = {"read_file": "Read", "write_file": "Write", "edit_file": "Edit"}[tool]
-                    style = "dim" if tool == "read_file" else "bold cyan"
-                    self.console.print(f"  [{style}]• {label}[/]  {fname}", highlight=False)
-                elif tool == "run_command":
-                    cmd = args.get("command", "")
-                    if len(cmd) > 50:
-                        cmd = cmd[:47] + "..."
-                    self.console.print(f"  [dim]• Run[/]  {cmd}", highlight=False)
-                elif tool in ("glob", "grep"):
-                    self.console.print(f"  [dim]• Search[/]", highlight=False)
-                elif tool.startswith("git_"):
-                    display = _tool_display_name(tool, args)
-                    self.console.print(f"  [dim]• Git[/]  {display}", highlight=False)
-                elif tool == "list_files":
-                    self.console.print(f"  [dim]• List[/]", highlight=False)
-                else:
-                    display = _tool_display_name(tool, args)
-                    self.console.print(f"  [dim]• {tool}[/]", highlight=False)
 
         async def on_tool_result(event: Any) -> None:
             tool = event.data.get("tool", "")
@@ -779,6 +857,33 @@ class InteractiveShell:
             if warning:
                 self.console.print(f"  [dim]  {_safe_str(warning)[:120]}[/]", highlight=False)
 
+        async def on_test_completed(event: Any) -> None:
+            passed = event.data.get("passed")
+            total = event.data.get("total")
+            success = event.data.get("success", False)
+            if total and passed is not None:
+                line = f"Tests {passed}/{total} passed"
+            else:
+                line = "Tests passed" if success else "Tests failed"
+            self._live_status.update_tests(line)
+            icon = "green" if success else "red"
+            mark = "✓" if success else "✗"
+            self.console.print(f"  [{icon}]{mark}[/] [dim]{line}[/]", highlight=False)
+
+        async def on_task_paused(event: Any) -> None:
+            completed = event.data.get("completed_todos", 0)
+            total = event.data.get("total_todos", 0)
+            files = event.data.get("files_changed", [])
+            self.console.print(
+                "  [yellow]⚠ Model unavailable[/]", highlight=False
+            )
+            self.console.print("  [dim]Execution state preserved.[/]", highlight=False)
+            if total:
+                self.console.print(f"  [dim]Completed: ✓ {completed}/{total} TODOs[/]", highlight=False)
+            if files:
+                names = ", ".join(str(f).replace("\\", "/").split("/")[-1] for f in files)
+                self.console.print(f"  [dim]Modified: {names}[/]", highlight=False)
+
         async def on_error(event: Any) -> None:
             error = event.data.get("error", "")
             self.console.print(f"  [red]✗ Error: {_safe_str(error)}[/]", highlight=False)
@@ -798,6 +903,9 @@ class InteractiveShell:
         bus.on("model.error", on_model_error)
         bus.on("task.completed", on_task_completed)
         bus.on("task.failed", on_task_failed)
+        bus.on("task.paused", on_task_paused)
+        bus.on("model.switched", on_model_switched)
+        bus.on("test.completed", on_test_completed)
         bus.on("diagnosis.triggered", on_diagnosis_triggered)
         bus.on("progress.stalled", on_progress_stalled)
         bus.on("execution.nudge", on_execution_nudge)
@@ -1249,61 +1357,11 @@ class InteractiveShell:
                         if fname not in files_changed:
                             files_changed.append(fname)
 
-            # Final TODO checklist
-            if task.task_plan.items:
-                self.console.print(f"\n  [bold]TODOs[/]")
-                for item in task.task_plan.items:
-                    self.console.print(f"    {item.display()}")
-
-            # Print result summary
-            if task.status.value == "completed":
-                self.console.print("")
-                self.console.print(Panel(
-                    f"  [bold green]✓ Task completed in {_format_elapsed(elapsed)}[/]",
-                    border_style="green",
-                    padding=(0, 1),
-                ))
-                if task.result:
-                    result = task.result
-                    if len(result) > 300:
-                        result = result[:270] + "..."
-                    self.console.print(f"  {result}", highlight=False)
-                # Files changed
-                if files_changed:
-                    self.console.print(f"\n  [bold]Files changed[/]")
-                    for f in files_changed:
-                        self.console.print(f"    {f}")
-                # Execution summary
-                stats_parts = [f"{task.iterations} iterations", f"{len(task.tool_calls)} tools", f"{_format_elapsed(elapsed)}"]
-                self.console.print(f"\n  [dim]{' · '.join(stats_parts)}[/]")
-                if task.verification_passed is True:
-                    self.console.print("  [green]✓[/] [dim]Changes verified[/]", highlight=False)
-                elif task.verification_passed is False:
-                    self.console.print("  [red]✗[/] [dim]Verification failed[/]", highlight=False)
-            elif task.status.value == "failed":
-                self.console.print("")
-                self.console.print(Panel(
-                    f"  [bold red]✗ Task failed after {_format_elapsed(elapsed)}[/]",
-                    border_style="red",
-                    padding=(0, 1),
-                ))
-                if task.error:
-                    error_msg = _safe_str(task.error)
-                    if len(error_msg) > 200:
-                        error_msg = error_msg[:200] + "..."
-                    self.console.print(f"  {error_msg}", highlight=False)
-                # Partial work
-                if files_changed:
-                    self.console.print(f"\n  [yellow]Partial work completed:[/]")
-                    for f in files_changed:
-                        self.console.print(f"    {f}")
-                stats_parts = [f"{task.iterations} iterations", f"{len(task.tool_calls)} tools", f"{_format_elapsed(elapsed)}"]
-                self.console.print(f"\n  [dim]{' · '.join(stats_parts)}[/]")
-            else:
-                self.console.print("")
-                self.console.print(
-                    f"  [yellow]Task ended with status: {task.status.value}[/]", highlight=False
-                )
+            # Evidence-based engineering report (never invented from model prose)
+            report = build_execution_report(task, elapsed, files_changed)
+            self.console.print("")
+            for line in report.split("\n"):
+                self.console.print(f"  {line}", highlight=False)
 
             # Update run in session
             if run and self.session_manager:
@@ -1325,9 +1383,9 @@ class InteractiveShell:
 
             return task.result
 
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, KeyboardInterrupt):
             self._live_status.stop()
-            self.console.print("\n  [yellow]✗ Task cancelled[/]", highlight=False)
+            self._render_cancellation()
             if run and self.session_manager:
                 try:
                     self.session_manager.interrupt_run(run.run_id)
@@ -1346,6 +1404,22 @@ class InteractiveShell:
         finally:
             self.running = False
             self._live_status.stop()
+
+    def _render_cancellation(self) -> None:
+        """Render a truthful partial-state report for a cancelled task."""
+        elapsed = time.time() - self.task_start if self.task_start else 0.0
+        task = getattr(self._agent_loop, "_active_task", None)
+        self.console.print("", highlight=False)
+        if task is None:
+            self.console.print("  [yellow]⚠ Task cancelled[/]", highlight=False)
+            self.console.print("  [dim]Execution stopped safely.[/]", highlight=False)
+            return
+        # Report against the interrupted task's real state
+        task.status = TaskStatus.CANCELLED
+        files_changed = files_from_task(task)
+        report = build_execution_report(task, elapsed, files_changed)
+        for line in report.split("\n"):
+            self.console.print(f"  {line}", highlight=False)
 
     # ─── Input Handling ──────────────────────────────────────────────
 

@@ -21,6 +21,7 @@ class TaskStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    PAUSED = "paused"
 
 
 class AgentRole(Enum):
@@ -175,13 +176,14 @@ class TaskExecutionStats:
 
 
 class TodoStatus(Enum):
-    """Status of a TODO item."""
+    """Status of a TODO item. Runtime-owned — never set from model prose."""
 
     PENDING = "pending"
-    ACTIVE = "active"
+    IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    ACTIVE = IN_PROGRESS  # backward-compatible alias
 
 
 @dataclass
@@ -190,16 +192,26 @@ class TodoItem:
 
     description: str = ""
     status: TodoStatus = TodoStatus.PENDING
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    completed_at: float | None = None
+    evidence: dict[str, Any] | None = None
+    error: str | None = None
+
+    @property
+    def title(self) -> str:
+        return self.description
 
     @property
     def symbol(self) -> str:
         return {
             TodoStatus.PENDING: "☐",
-            TodoStatus.ACTIVE: "◐",
-            TodoStatus.COMPLETED: "☑",
+            TodoStatus.IN_PROGRESS: "◐",
+            TodoStatus.COMPLETED: "✓",
             TodoStatus.FAILED: "✗",
             TodoStatus.SKIPPED: "—",
-        }[self.status]
+        }.get(self.status, "☐")
 
     def display(self) -> str:
         return f"{self.symbol} {self.description}"
@@ -216,30 +228,96 @@ class TaskPlan:
         self.items.append(item)
         return item
 
-    def complete(self, description: str) -> None:
+    def get(self, todo_id: str) -> TodoItem | None:
+        for item in self.items:
+            if item.id == todo_id:
+                return item
+        return None
+
+    def complete(self, description: str, evidence: dict[str, Any] | None = None) -> None:
         for item in self.items:
             if item.description == description and item.status != TodoStatus.COMPLETED:
-                item.status = TodoStatus.COMPLETED
+                self._mark_completed(item, evidence)
                 return
+
+    def complete_id(self, todo_id: str, evidence: dict[str, Any] | None = None) -> TodoItem | None:
+        item = self.get(todo_id)
+        if item and item.status != TodoStatus.COMPLETED:
+            self._mark_completed(item, evidence)
+            return item
+        return None
 
     def activate(self, description: str) -> None:
         for item in self.items:
             if item.description == description and item.status == TodoStatus.PENDING:
-                item.status = TodoStatus.ACTIVE
+                self._mark_started(item)
                 return
 
-    def fail(self, description: str) -> None:
+    def activate_id(self, todo_id: str) -> TodoItem | None:
+        item = self.get(todo_id)
+        if item and item.status == TodoStatus.PENDING:
+            self._mark_started(item)
+            return item
+        return None
+
+    def fail(self, description: str, error: str | None = None) -> None:
         for item in self.items:
             if item.description == description and item.status != TodoStatus.COMPLETED:
-                item.status = TodoStatus.FAILED
+                self._mark_failed(item, error)
                 return
+
+    def fail_id(self, todo_id: str, error: str | None = None) -> TodoItem | None:
+        item = self.get(todo_id)
+        if item and item.status not in (TodoStatus.COMPLETED, TodoStatus.SKIPPED):
+            self._mark_failed(item, error)
+            return item
+        return None
+
+    @staticmethod
+    def _mark_started(item: TodoItem) -> None:
+        item.status = TodoStatus.IN_PROGRESS
+        if item.started_at is None:
+            item.started_at = time.time()
+
+    @staticmethod
+    def _mark_completed(item: TodoItem, evidence: dict[str, Any] | None) -> None:
+        item.status = TodoStatus.COMPLETED
+        item.completed_at = time.time()
+        if item.started_at is None:
+            item.started_at = item.completed_at
+        if evidence:
+            item.evidence = evidence
+        item.error = None
+
+    @staticmethod
+    def _mark_failed(item: TodoItem, error: str | None) -> None:
+        item.status = TodoStatus.FAILED
+        item.completed_at = time.time()
+        if error:
+            item.error = error
 
     def display(self) -> list[str]:
         return [item.display() for item in self.items]
 
+    def to_event_items(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": i.id,
+                "title": i.description,
+                "status": i.status.value,
+                "evidence": i.evidence,
+                "error": i.error,
+            }
+            for i in self.items
+        ]
+
     @property
     def completed_count(self) -> int:
         return sum(1 for i in self.items if i.status == TodoStatus.COMPLETED)
+
+    @property
+    def failed_count(self) -> int:
+        return sum(1 for i in self.items if i.status == TodoStatus.FAILED)
 
     @property
     def total_count(self) -> int:
@@ -270,6 +348,13 @@ class Task:
     execution_stats: TaskExecutionStats = field(default_factory=TaskExecutionStats)
     verification_passed: bool | None = None  # None = not verified, True/False = outcome
     verification_summary: str = ""
+    models_used: list[str] = field(default_factory=list)
+    model_fallbacks: int = 0
+    tests_run: int = 0
+    tests_passed: int | None = None
+    git_commit: str | None = None
+    git_push: str | None = None
+    paused_reason: str | None = None
 
 
 class TaskPhase(Enum):
@@ -283,7 +368,10 @@ class TaskPhase(Enum):
     FIXING = "fixing"
     RECOVERING = "recovering"
     VERIFYING = "verifying"
+    COMMITTING = "committing"
+    PUSHING = "pushing"
     COMPLETE = "complete"
+    COMPLETED = "complete"
 
 
 @dataclass

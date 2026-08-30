@@ -35,8 +35,8 @@ class TestTodoItem:
 
     def test_completed_symbol(self):
         item = TodoItem(description="Edit file", status=TodoStatus.COMPLETED)
-        assert item.symbol == "☑"
-        assert item.display() == "☑ Edit file"
+        assert item.symbol == "✓"
+        assert item.display() == "✓ Edit file"
 
     def test_failed_symbol(self):
         item = TodoItem(description="Fix bug", status=TodoStatus.FAILED)
@@ -109,7 +109,7 @@ class TestTaskPlan:
         plan.complete("Inspect")
         display = plan.display()
         assert len(display) == 2
-        assert "☑ Inspect" in display[0]
+        assert "✓ Inspect" in display[0]
         assert "☐ Implement" in display[1]
 
     def test_complete_nonexistent_item(self):

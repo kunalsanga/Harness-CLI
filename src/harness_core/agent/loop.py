@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -27,6 +28,21 @@ from harness_core.routing.router import ModelRouter, RouterConfig
 from harness_core.tools.base import Tool
 from harness_core.verification.engine import VerificationEngine
 from harness_core.verification.integrity import check_test_integrity, is_test_like_path
+from harness_core.agent.todos import (
+    apply_tool_result,
+    apply_tool_started,
+    fallback_todo_plan,
+    reconcile_on_evidence,
+    sanitize_todo_titles,
+    select_todo,
+)
+from harness_core.agent.report import build_execution_report, files_from_task
+from harness_core.tools.diagnosis import (
+    classify_command_failure,
+    normalize_shell_command,
+    parse_test_counts,
+)
+from harness_core.tools.paths import cwd_in_workspace, resolve_in_workspace
 
 if TYPE_CHECKING:
     from harness_core.routing.task_aware import TaskAwareRouter
@@ -99,6 +115,7 @@ class AgentLoop:
         self._modified_files: list[str] = []  # files written/edited (raw paths)
         self._had_test_failure: bool = False
         self._last_model_used: str = ""  # for model rotation on no-tool responses
+        self._active_task: Task | None = None  # currently running task (cancellation reporting)
 
     def _workspace_snapshot_text(self) -> str:
         """Compact workspace snapshot for model context.
@@ -191,8 +208,17 @@ When you are done, summarize what you did and provide evidence of success."""
 
     @staticmethod
     def _action_key(tool_name: str, arguments: dict[str, Any]) -> str:
-        """Normalized identity for a tool call (used for repetition detection)."""
-        return f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+        """Normalized identity for a tool call (used for repetition detection).
+
+        For run_command, the command is normalized (cd / shell wrappers
+        stripped) so retrying the same underlying command through different
+        shell formats counts as the same action — blocking shell-guessing loops.
+        """
+        args = arguments
+        if tool_name == "run_command" and isinstance(arguments.get("command"), str):
+            args = dict(arguments)
+            args["command"] = normalize_shell_command(arguments["command"])
+        return f"{tool_name}:{json.dumps(args, sort_keys=True)}"
 
     @staticmethod
     def _is_test_command(command: str) -> bool:
@@ -436,48 +462,21 @@ When you are done, summarize what you did and provide evidence of success."""
 
     # ── Plan validation ────────────────────────────────────────────────
 
-    _INVALID_PLAN_MARKERS = (
-        "i don't have", "i do not have", "i don't see", "i cannot see",
-        "i can't see", "no visibility", "not able to see", "unable to see",
-        "please provide", "please share", "please tell", "please specify",
-        "can you provide", "can you share", "can you tell", "could you provide",
-        "what technology", "what tech stack", "what framework", "which framework",
-        "what language", "which language", "what type of project",
-        "more context", "more information", "need more info",
-    )
-
     def _validate_plan_steps(self, steps: list[str]) -> list[str]:
-        """Keep only executable action steps; drop conversational prose.
+        """Keep only actionable engineering tasks; drop conversational prose.
 
-        Rejects questions, requests for information, and claims of
-        missing visibility — the workspace is discoverable via tools.
+        Every TODO must begin with an actionable engineering verb. Questions,
+        requests for information, claims of missing visibility, and chatter are
+        rejected — the workspace is discoverable via tools.
         """
-        valid: list[str] = []
-        for step in steps:
-            s = step.strip().strip("-•*").strip().strip('"\'')
-            if not s or len(s) > 140:
-                continue
-            low = s.lower()
-            if "?" in s:
-                continue
-            if any(marker in low for marker in self._INVALID_PLAN_MARKERS):
-                continue
-            valid.append(s)
-            if len(valid) >= 8:
-                break
-        return valid
+        return sanitize_todo_titles(steps)
 
-    def _default_plan_steps(self) -> list[str]:
-        """Structured fallback plan when the model proposes nothing usable."""
-        steps = [
-            "Inspect project files",
-            "Analyze current implementation",
-            "Implement the requested changes",
-        ]
-        if self._project_info and self._project_info.get("has_tests"):
-            steps.append("Run tests and fix any failures")
-        steps.append("Verify results")
-        return steps
+    def _default_plan_steps(self, goal: str = "") -> list[str]:
+        """Deterministic fallback plan from the task + workspace.
+
+        Never conversational. Used when the model proposes nothing usable.
+        """
+        return fallback_todo_plan(goal, self._project_info)
 
     # ── Completion verification ────────────────────────────────────────
 
@@ -653,7 +652,7 @@ When you are done, summarize what you did and provide evidence of success."""
         )
 
     async def _emit_todo_update(self, task: Task) -> None:
-        """Emit current TODO list state."""
+        """Emit current TODO list state (display + structured items)."""
         items = task.task_plan.display()
         completed = task.task_plan.completed_count
         total = task.task_plan.total_count
@@ -663,11 +662,189 @@ When you are done, summarize what you did and provide evidence of success."""
                 source="agent_loop",
                 data={
                     "items": items,
+                    "todos": task.task_plan.to_event_items(),
                     "completed": completed,
+                    "failed": task.task_plan.failed_count,
                     "total": total,
                 },
             )
         )
+
+    async def _emit_todo_event(self, event_type: str, item: TodoItem) -> None:
+        """Emit a per-TODO lifecycle event with structured metadata."""
+        await self.event_bus.emit(
+            Event(
+                type=event_type,
+                source="agent_loop",
+                data={
+                    "todo_id": item.id,
+                    "title": item.description,
+                    "status": item.status.value,
+                    "evidence": item.evidence,
+                    "error": item.error,
+                },
+            )
+        )
+
+    async def _todo_started(self, task: Task, call: ToolCall) -> None:
+        """Mark the best-matching TODO in progress from a real tool start."""
+        before = select_todo(task.task_plan, call.tool_name, call.arguments)
+        was_pending = before is not None and before.status == TodoStatus.PENDING
+        item = apply_tool_started(task.task_plan, call)
+        if item is not None and was_pending:
+            await self._emit_todo_event("todo.started", item)
+            await self._emit_todo_update(task)
+
+    async def _todo_result(self, task: Task, call: ToolCall, result: ToolResult) -> None:
+        """Update TODO state from the real tool outcome (evidence-based)."""
+        item = apply_tool_result(task.task_plan, call, result)
+        if item is None:
+            return
+        if item.status == TodoStatus.COMPLETED and item.completed_at:
+            await self._emit_todo_event("todo.completed", item)
+            await self._emit_todo_update(task)
+        elif item.status == TodoStatus.FAILED:
+            await self._emit_todo_event("todo.failed", item)
+            await self._emit_todo_update(task)
+
+    async def _postprocess_result(self, task: Task, call: ToolCall, result: ToolResult) -> None:
+        """Enrich a tool result with diagnosis, test accounting, and git state."""
+        tool = call.tool_name
+
+        # Command failure diagnosis + test accounting
+        if tool == "run_command":
+            command = str(call.arguments.get("command", ""))
+            if result.execution_failed:
+                diagnosis = classify_command_failure(
+                    command,
+                    exit_code=result.exit_code,
+                    stdout=result.output or "",
+                    stderr=result.stderr or "",
+                    timed_out=(result.status == ToolResultStatus.TIMEOUT),
+                )
+                result.metadata["diagnosis_category"] = diagnosis.category
+                result.metadata["diagnosis_reason"] = diagnosis.reason
+                hint = (
+                    f"\nDiagnosis: {diagnosis.category} — {diagnosis.reason}"
+                )
+                if diagnosis.category in ("command_syntax", "missing_executable"):
+                    hint += (
+                        "\nDo NOT retry with different shell wrappers (cd, cmd /c, powershell). "
+                        "Fix the underlying command or use the workspace-aware run_command."
+                    )
+                if result.error:
+                    result.error = result.error + hint
+                else:
+                    result.error = hint.strip()
+            # Test accounting (success or failure) if this ran a suite
+            if self._is_test_command(command):
+                counts = parse_test_counts(result.output or "")
+                if result.status == ToolResultStatus.SUCCESS and counts is None:
+                    # Passed but no parseable summary — still a passing run
+                    task.tests_run = task.tests_run or 1
+                    task.tests_passed = task.tests_passed if task.tests_passed is not None else task.tests_run
+                elif counts is not None:
+                    passed, total = counts
+                    task.tests_run = total
+                    task.tests_passed = passed
+                await self.event_bus.emit(
+                    Event(
+                        type="test.completed",
+                        source="agent_loop",
+                        data={
+                            "command": command,
+                            "passed": task.tests_passed,
+                            "total": task.tests_run,
+                            "success": result.status == ToolResultStatus.SUCCESS,
+                        },
+                    )
+                )
+
+        # Structured git accounting
+        elif tool == "git_commit":
+            await self._emit_phase("committing")
+            if result.status == ToolResultStatus.SUCCESS:
+                commit_hash = result.metadata.get("commit_hash") or self._parse_commit_hash(result.output or "")
+                if commit_hash:
+                    task.git_commit = commit_hash
+        elif tool == "git_add" or tool == "git_stage":
+            await self._emit_phase("committing")
+        elif tool == "git_push":
+            await self._emit_phase("pushing")
+            if result.status == ToolResultStatus.SUCCESS:
+                remote = result.metadata.get("remote", "origin")
+                branch = result.metadata.get("branch", "")
+                task.git_push = f"{remote}/{branch}" if branch else remote
+
+    @staticmethod
+    def _parse_commit_hash(output: str) -> str:
+        """Extract a short commit hash from `git commit` output."""
+        import re
+        m = re.search(r"\[([^\s\]]+)\s+([0-9a-f]{7,40})\]", output)
+        if m:
+            return m.group(2)
+        m = re.search(r"\b([0-9a-f]{40})\b", output)
+        return m.group(1)[:12] if m else ""
+
+    async def _stagnation_recovery(self, task: Task) -> bool:
+        """Stagnation stopped the loop — complete truthfully if evidence is green.
+
+        If files were changed, the last test run (if any) succeeded, and
+        verification passes, the work is done even though the model kept
+        issuing no-progress actions. Otherwise the task genuinely failed.
+        """
+        if not self._modified_files:
+            return False
+        for tc in reversed(task.tool_calls):
+            if tc.tool_name == "run_command" and self._is_test_command(
+                str(tc.arguments.get("command", ""))
+            ):
+                if tc.result is not None and tc.result.execution_failed:
+                    return False
+                break
+        await self._verify_task_completion(task)
+        if task.status == TaskStatus.FAILED:
+            return False
+        await self._reconcile_todos(task)
+        task.status = TaskStatus.COMPLETED
+        task.error = None
+        task.result = (
+            "Stopped repeating no-progress iterations; final state verified. "
+            + (task.result or "")
+        )
+        await self._emit_phase("complete")
+        return True
+
+    async def _reconcile_todos(self, task: Task) -> None:
+        """Complete/fail open TODOs using real execution evidence."""
+        did_inspect = any(
+            tc.tool_name in ("read_file", "list_files", "glob", "grep")
+            and tc.result and tc.result.status == ToolResultStatus.SUCCESS
+            for tc in task.tool_calls
+        )
+        did_implement = bool(self._modified_files)
+        tests_passed: bool | None = None
+        if task.tests_run > 0 and task.tests_passed is not None:
+            tests_passed = task.tests_passed >= task.tests_run
+        did_commit = bool(task.git_commit)
+        did_push = bool(task.git_push)
+
+        changed = reconcile_on_evidence(
+            task.task_plan,
+            did_inspect=did_inspect,
+            did_implement=did_implement,
+            tests_passed=tests_passed,
+            verified=task.verification_passed,
+            did_commit=did_commit,
+            did_push=did_push,
+        )
+        if changed:
+            for item in changed:
+                event_type = (
+                    "todo.completed" if item.status == TodoStatus.COMPLETED else "todo.failed"
+                )
+                await self._emit_todo_event(event_type, item)
+            await self._emit_todo_update(task)
 
     def _get_failure_summary(self, task: Task) -> str:
         """Build a summary of failed tool calls for the task error message."""
@@ -697,6 +874,43 @@ When you are done, summarize what you did and provide evidence of success."""
         call.result = result
         return result
 
+    # File tools whose "path" argument must stay inside the workspace.
+    _PATH_TOOLS_REQUIRED = {"read_file", "write_file", "edit_file"}
+    _PATH_TOOLS_OPTIONAL = {"list_files", "glob", "grep"}
+    _CWD_TOOLS = {"run_command", "git_status", "git_diff", "git_log", "git_add",
+                  "git_commit", "git_push", "git_remote", "git_identity"}
+
+    def _confine_call(self, call: ToolCall) -> ToolResult | None:
+        """Enforce the workspace boundary on paths and working directory.
+
+        Returns a denial ToolResult if a path escapes the workspace, else None.
+        """
+        name = call.tool_name
+        args = call.arguments
+
+        if name in self._PATH_TOOLS_REQUIRED or name in self._PATH_TOOLS_OPTIONAL:
+            raw = args.get("path") or args.get("file_path")
+            if raw or name in self._PATH_TOOLS_REQUIRED:
+                resolved, err = resolve_in_workspace(self.workspace_root, raw)
+                if err is not None:
+                    return ToolResult(
+                        status=ToolResultStatus.PERMISSION_DENIED,
+                        output="",
+                        error=f"Path confinement: {err}",
+                        retryable=False,
+                    )
+                if resolved is not None:
+                    if "path" in args or name in self._PATH_TOOLS_REQUIRED:
+                        args["path"] = str(resolved)
+                    if "file_path" in args:
+                        args["file_path"] = str(resolved)
+
+        if name in self._CWD_TOOLS:
+            cwd, _ = cwd_in_workspace(self.workspace_root, args.get("cwd"))
+            args["cwd"] = cwd
+
+        return None
+
     async def _execute_tool_checked(self, call: ToolCall) -> ToolResult:
         """Execute a tool call with permission checking."""
         tool = self.tools.get(call.tool_name)
@@ -708,6 +922,12 @@ When you are done, summarize what you did and provide evidence of success."""
                 error=f"Unknown tool: {call.tool_name}",
                 retryable=False,
             )
+
+        # Hard workspace boundary: confine file paths and working directory.
+        confinement_denial = self._confine_call(call)
+        if confinement_denial is not None:
+            self._record_denial(call.tool_name, call.arguments)
+            return confinement_denial
 
         # Check if this exact call was already denied
         if self._check_repeated_deny(call):
@@ -763,10 +983,12 @@ When you are done, summarize what you did and provide evidence of success."""
                 retryable=False,
             )
 
-        # Execute
+        # Execute with a bounded timeout so a hung tool can't freeze the CLI.
+        call_timeout = float(call.arguments.get("timeout") or tool.schema.timeout_seconds or 30.0)
+        call_timeout = min(max(call_timeout, 1.0), 300.0)
         start = time.time()
         try:
-            result = await tool.execute(call.arguments)
+            result = await asyncio.wait_for(tool.execute(call.arguments), timeout=call_timeout)
             call.duration_ms = (time.time() - start) * 1000
             call.result = result
             self._reset_denial_tracking()
@@ -778,6 +1000,19 @@ When you are done, summarize what you did and provide evidence of success."""
                 self._reset_failure_tracking()
             await self._record_execution_outcome(call, result)
             return result
+        except asyncio.TimeoutError:
+            call.duration_ms = (time.time() - start) * 1000
+            self._reset_denial_tracking()
+            self._record_failure(call.tool_name, call.arguments, -1)
+            timeout_result = ToolResult(
+                status=ToolResultStatus.TIMEOUT,
+                output="",
+                error=f"Command timed out after {call_timeout:.0f}s",
+                retryable=True,
+            )
+            call.result = timeout_result
+            await self._record_execution_outcome(call, timeout_result)
+            return timeout_result
         except Exception as e:
             call.duration_ms = (time.time() - start) * 1000
             self._reset_denial_tracking()
@@ -793,6 +1028,7 @@ When you are done, summarize what you did and provide evidence of success."""
     async def run(self, goal: str) -> Task:
         """Run the agent loop for a given goal."""
         task = Task(goal=goal, max_iterations=self.config.max_iterations)
+        self._active_task = task
 
         # Reset per-task governor state (loops may be reused across tasks)
         self._corrections = []
@@ -891,20 +1127,25 @@ When you are done, summarize what you did and provide evidence of success."""
                 cleaned = re.sub(r"^[\d]+[.)\s]+[-•*]?\s*", "", line).strip()
                 if cleaned:
                     plan_steps.append(cleaned)
-            # Validate: TODOs must be executable actions, not conversational prose
+            # Validate: TODOs must be actionable engineering tasks (verb-first).
+            # Conversational prose is rejected and never displayed.
             plan_steps = self._validate_plan_steps(plan_steps)
             if not plan_steps:
-                plan_steps = self._default_plan_steps()
+                plan_steps = self._default_plan_steps(goal)
             if plan_steps:
                 task.plan = plan_steps
-                # Create dynamic task plan
+                # Create dynamic task plan (runtime owns status from here on)
                 for step in plan_steps:
                     task.task_plan.add(step)
                 await self.event_bus.emit(
                     Event(
                         type="plan.created",
                         source="agent_loop",
-                        data={"steps": plan_steps, "task_id": task.id},
+                        data={
+                            "steps": plan_steps,
+                            "task_id": task.id,
+                            "todos": task.task_plan.to_event_items(),
+                        },
                     )
                 )
                 await self._emit_todo_update(task)
@@ -952,7 +1193,24 @@ When you are done, summarize what you did and provide evidence of success."""
                         fallback_result = await self.router.execute(request)
                         if fallback_result.succeeded:
                             response = fallback_result.response
+                            prev_model = self._last_model_used
                             self._last_model_used = fallback_result.model_used
+                            # Account models + switches (quiet, change-only)
+                            if fallback_result.model_used and fallback_result.model_used not in task.models_used:
+                                task.models_used.append(fallback_result.model_used)
+                            if prev_model and fallback_result.model_used and fallback_result.model_used != prev_model:
+                                task.model_fallbacks += 1
+                                await self.event_bus.emit(
+                                    Event(
+                                        type="model.switched",
+                                        source="agent_loop",
+                                        data={
+                                            "from": prev_model,
+                                            "to": fallback_result.model_used,
+                                            "reason": "unavailable",
+                                        },
+                                    )
+                                )
                             break
                         if attempt == 0:
                             # Failed models were marked unhealthy (402/401/429);
@@ -972,7 +1230,6 @@ When you are done, summarize what you did and provide evidence of success."""
                 else:
                     response = await self.provider.generate(request)
             except Exception as e:
-                task.status = TaskStatus.RECOVERING
                 await self.event_bus.emit(
                     Event(
                         type="model.error",
@@ -980,8 +1237,36 @@ When you are done, summarize what you did and provide evidence of success."""
                         data={"error": str(e)},
                     )
                 )
-                task.status = TaskStatus.FAILED
-                task.error = f"Provider error: {e}"
+                # MODEL FAILURE ≠ TASK FAILURE. If real work already happened,
+                # preserve state and pause instead of discarding progress.
+                did_work = bool(self._modified_files) or any(
+                    tc.result is not None for tc in task.tool_calls
+                )
+                if did_work:
+                    task.status = TaskStatus.PAUSED
+                    task.paused_reason = (
+                        "No usable model is currently available (rate limited or unreachable). "
+                        "Execution state preserved."
+                    )
+                    task.error = None
+                    await self._reconcile_todos(task)
+                    await self.event_bus.emit(
+                        Event(
+                            type="task.paused",
+                            source="agent_loop",
+                            data={
+                                "task_id": task.id,
+                                "reason": "model_unavailable",
+                                "error": str(e),
+                                "completed_todos": task.task_plan.completed_count,
+                                "total_todos": task.task_plan.total_count,
+                                "files_changed": list(self._modified_files),
+                            },
+                        )
+                    )
+                else:
+                    task.status = TaskStatus.FAILED
+                    task.error = f"Provider error: {e}"
                 break
 
             # Process response
@@ -1007,7 +1292,15 @@ When you are done, summarize what you did and provide evidence of success."""
                         )
                     )
 
+                    # Runtime-owned TODO state: mark matching item in progress
+                    await self._todo_started(task, call)
+
                     result = await self._execute_tool(call)
+
+                    # Enrich with diagnosis / test accounting / git state
+                    await self._postprocess_result(task, call, result)
+                    # Evidence-based TODO transitions (never from model prose)
+                    await self._todo_result(task, call, result)
 
                     # Track execution stats
                     task.execution_stats.record_attempt()
@@ -1112,6 +1405,7 @@ When you are done, summarize what you did and provide evidence of success."""
                 task.result = response.content
                 await self._verify_task_completion(task)
                 if task.status == TaskStatus.FAILED:
+                    await self._reconcile_todos(task)
                     await self.event_bus.emit(
                         Event(
                             type="task.failed",
@@ -1123,6 +1417,9 @@ When you are done, summarize what you did and provide evidence of success."""
                         )
                     )
                     break
+
+                # Reconcile remaining TODOs against real execution evidence
+                await self._reconcile_todos(task)
 
                 await self._emit_phase("complete")
                 task.status = TaskStatus.COMPLETED
@@ -1152,6 +1449,10 @@ When you are done, summarize what you did and provide evidence of success."""
                         "different concrete action."
                     )
                 elif self._stagnation_counter >= STAGNATION_STOP_AT:
+                    # If the evidence is already green, finish truthfully instead
+                    # of failing a completed task.
+                    if await self._stagnation_recovery(task):
+                        break
                     task.status = TaskStatus.FAILED
                     task.error = (
                         "Stopped: no meaningful progress detected for "
@@ -1199,7 +1500,10 @@ When you are done, summarize what you did and provide evidence of success."""
                 )
                 break
 
-        if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+        if task.status not in (
+            TaskStatus.COMPLETED, TaskStatus.FAILED,
+            TaskStatus.PAUSED, TaskStatus.CANCELLED,
+        ):
             if self._consecutive_denials >= 3:
                 task.status = TaskStatus.FAILED
                 task.error = task.error or "Task blocked by permission policy"
@@ -1239,6 +1543,17 @@ When you are done, summarize what you did and provide evidence of success."""
                     "verification_passed": task.verification_passed,
                     "verification_summary": task.verification_summary,
                     "files_changed": list(self._modified_files),
+                    "todos": task.task_plan.to_event_items(),
+                    "todos_completed": task.task_plan.completed_count,
+                    "todos_failed": task.task_plan.failed_count,
+                    "todos_total": task.task_plan.total_count,
+                    "tests_run": task.tests_run,
+                    "tests_passed": task.tests_passed,
+                    "models_used": list(task.models_used),
+                    "model_fallbacks": task.model_fallbacks,
+                    "git_commit": task.git_commit,
+                    "git_push": task.git_push,
+                    "paused_reason": task.paused_reason,
                 },
             )
         )

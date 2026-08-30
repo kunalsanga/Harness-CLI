@@ -131,6 +131,8 @@ class PermissionManager:
             PermissionRule(tool_pattern="write_file", action="allow"),
             PermissionRule(tool_pattern="run_command", action="allow"),
             PermissionRule(tool_pattern="git_commit", action="allow"),
+            PermissionRule(tool_pattern="git_add", action="allow"),
+            PermissionRule(tool_pattern="git_stage", action="allow"),
             PermissionRule(tool_pattern="git_push", action="allow"),
             PermissionRule(tool_pattern="git_status", action="allow"),
             PermissionRule(tool_pattern="git_diff", action="allow"),
