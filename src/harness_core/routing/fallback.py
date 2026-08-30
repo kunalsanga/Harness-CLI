@@ -39,6 +39,10 @@ def classify_error(error: Exception) -> ErrorClassification:
     if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
         return ErrorClassification.RATE_LIMITED
 
+    # Payment required (402) — model requires payment, don't retry
+    if "402" in error_str or "payment required" in error_str:
+        return ErrorClassification.PERMANENT
+
     # Permanent client errors (don't retry)
     if any(code in error_str for code in ["400", "401", "403", "404", "422"]):
         return ErrorClassification.PERMANENT
@@ -250,12 +254,14 @@ class FallbackEngine:
                         break
 
                     elif classification == ErrorClassification.PERMANENT:
-                        # Detect auth errors (401/403) — mark THIS MODEL as unavailable
-                        # Do NOT disable the entire provider
                         error_str = str(e).lower()
+                        # Detect specific failure types for model-level health tracking
                         is_auth_error = any(code in error_str for code in ["401", "403"])
                         is_auth_keyword = any(kw in error_str for kw in ["unauthorized", "forbidden"])
-                        if is_auth_error or is_auth_keyword:
+                        is_payment = "402" in error_str or "payment required" in error_str
+                        if is_payment:
+                            self.health.record_failure(model_id, HealthEvent.PAYMENT_REQUIRED, latency_ms)
+                        elif is_auth_error or is_auth_keyword:
                             self.health.record_failure(model_id, HealthEvent.AUTH_FAILED, latency_ms)
                         else:
                             self.health.record_failure(model_id, HealthEvent.CLIENT_ERROR_4XX, latency_ms)
@@ -282,12 +288,16 @@ class FallbackEngine:
         if not result.final_error:
             # Build a more informative error message
             auth_failures = []
+            payment_failures = []
             other_failures = []
             for attempt in result.attempts:
                 if attempt.get("status") == "error":
                     error_str = attempt.get("error", "")
-                    if "401" in error_str or "403" in error_str or "forbidden" in error_str.lower():
+                    error_lower = error_str.lower()
+                    if "401" in error_str or "403" in error_str or "forbidden" in error_lower:
                         auth_failures.append(attempt.get("model", "unknown"))
+                    elif "402" in error_str or "payment required" in error_lower:
+                        payment_failures.append(attempt.get("model", "unknown"))
                     else:
                         other_failures.append(attempt.get("model", "unknown"))
 
@@ -298,10 +308,16 @@ class FallbackEngine:
                     f"Models: {', '.join(auth_failures[:3])}. "
                     f"Try other models or check your provider access."
                 )
-            elif auth_failures:
+            elif payment_failures and not other_failures and not auth_failures:
+                result.final_error = (
+                    f"{len(payment_failures)} model(s) require payment (402). "
+                    f"Enable free mode (/free) or configure a provider with credits."
+                )
+            elif auth_failures or payment_failures:
                 result.final_error = (
                     f"{len(auth_failures)} model(s) unavailable (401/403), "
-                    f"{len(other_failures)} model(s) failed for other reasons. "
+                    f"{len(payment_failures)} require payment (402), "
+                    f"{len(other_failures)} failed for other reasons. "
                     f"Last error: {result.attempts[-1].get('error', 'unknown')}"
                 )
             else:

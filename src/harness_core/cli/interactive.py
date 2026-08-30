@@ -490,7 +490,14 @@ class InteractiveShell:
         async def on_model_error(event: Any) -> None:
             error = event.data.get("error", "")
             error_lower = error.lower()
-            if "403" in error_lower or "forbidden" in error_lower:
+            if "no usable free model" in error_lower:
+                self.console.print(f"  [red]✗ No usable free model available[/]", highlight=False)
+                self.console.print(f"  [dim]  Harness could not find an available free model.[/]", highlight=False)
+                self.console.print(f"  [dim]  Options: /models, disable free mode, configure another provider, or start Ollama.[/]", highlight=False)
+            elif "402" in error_lower or "payment required" in error_lower:
+                self.console.print(f"  [red]✗ Model requires payment (402)[/]", highlight=False)
+                self.console.print(f"  [dim]  This model is not free. Harness will try other models.[/]", highlight=False)
+            elif "403" in error_lower or "forbidden" in error_lower:
                 # Distinguish model-specific vs provider-level
                 if "model(s) returned 401/403" in error_lower or "unavailable" in error_lower:
                     self.console.print(f"  [red]✗ Model unavailable (403 Forbidden)[/]", highlight=False)

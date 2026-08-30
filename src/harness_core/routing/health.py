@@ -25,6 +25,7 @@ class HealthEvent(Enum):
     INVALID_RESPONSE = "invalid_response"
     NETWORK_ERROR = "network_error"
     AUTH_FAILED = "auth_failed"  # 401/403 — model-specific, not provider-wide
+    PAYMENT_REQUIRED = "402"     # 402 — model requires payment/credits
 
 
 class ModelHealthStatus(Enum):
@@ -33,6 +34,7 @@ class ModelHealthStatus(Enum):
     UNKNOWN = "unknown"       # No data yet
     HEALTHY = "healthy"       # Working normally
     UNAVAILABLE = "unavailable" # Returned 401/403 — not available to this user
+    PAYMENT_REQUIRED = "payment_required" # 402 — model requires payment
     RATE_LIMITED = "rate_limited" # 429 — temporarily unavailable
     ERROR = "error"           # Server errors, timeouts, etc.
 
@@ -102,6 +104,8 @@ class ModelHealthState:
         # Explicit status overrides all other checks
         if self.health_status == ModelHealthStatus.UNAVAILABLE:
             return False
+        if self.health_status == ModelHealthStatus.PAYMENT_REQUIRED:
+            return False  # requires payment, not usable in free mode
         if self.health_status == ModelHealthStatus.RATE_LIMITED:
             return self.is_rate_limited  # may have recovered
         if self.health_status == ModelHealthStatus.ERROR:
@@ -114,8 +118,11 @@ class ModelHealthState:
 
     @property
     def is_unavailable(self) -> bool:
-        """Whether this model is permanently unavailable (auth failure)."""
-        return self.health_status == ModelHealthStatus.UNAVAILABLE
+        """Whether this model is permanently unavailable (auth or payment failure)."""
+        return self.health_status in (
+            ModelHealthStatus.UNAVAILABLE,
+            ModelHealthStatus.PAYMENT_REQUIRED,
+        )
 
     def record_latency(self, latency_ms: float) -> None:
         """Record a latency measurement."""
@@ -219,6 +226,9 @@ class ModelHealthTracker:
             state.client_errors += 1
             state.health_status = ModelHealthStatus.UNAVAILABLE
             state.last_auth_failure_time = time.time()
+        elif event == HealthEvent.PAYMENT_REQUIRED:
+            state.client_errors += 1
+            state.health_status = ModelHealthStatus.PAYMENT_REQUIRED
 
     def record_tool_call_failure(self, model_id: str) -> None:
         """Record a tool call failure (model called wrong tool / bad args)."""

@@ -265,6 +265,7 @@ class ModelRouter:
         """Select an ordered chain of (model_id, provider) for fallback.
 
         Returns at least one model if any are available.
+        In free mode, only free models are considered — never falls back to paid.
         """
         models = await self.refresh_models()
         ctx = self._build_scoring_context(request)
@@ -272,7 +273,11 @@ class ModelRouter:
         # Filter
         filtered = self._filter_models(models, ctx)
         if not filtered:
-            # Fallback: use any model with tools support
+            if self.config.routing_mode == "free":
+                # In free mode: DO NOT fall back to paid models
+                # Return empty chain so the error is clear
+                return []
+            # Non-free fallback: use any model with tools support
             filtered = [m for m in models if m.supports_tools]
 
         # Score and rank
@@ -319,6 +324,10 @@ class ModelRouter:
                 ))
 
         if not chain:
+            if self.config.routing_mode == "free":
+                # In free mode: DO NOT fall back to paid models
+                # Return empty chain
+                return []
             # Absolute fallback: use the first available provider with any model
             for name, provider in self.providers.items():
                 try:
@@ -347,6 +356,14 @@ class ModelRouter:
 
         chain = await self.select_models(request)
         if not chain:
+            if self.config.routing_mode == "free":
+                return FallbackResult(
+                    final_error=(
+                        "No usable free model available. "
+                        "Harness could not find an available free model for this task. "
+                        "Options: /models, disable free mode, configure another provider, or start Ollama."
+                    )
+                )
             return FallbackResult(final_error="No available models")
 
         result = await self.fallback_engine.execute(request, chain)
