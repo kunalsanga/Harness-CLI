@@ -160,7 +160,7 @@ def run(
         from harness_core.routing.task_aware import TaskAwareRouter
         from harness_core.models.registry import ModelRegistry
         from harness_core.tools.filesystem import EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool
-        from harness_core.tools.git import GitDiffTool, GitLogTool, GitStatusTool
+        from harness_core.tools.git import GitDiffTool, GitIdentityTool, GitLogTool, GitStatusTool
         from harness_core.tools.search import GlobTool, GrepTool
         from harness_core.tools.shell import RunCommandTool
 
@@ -180,6 +180,7 @@ def run(
             GitStatusTool(),
             GitDiffTool(),
             GitLogTool(),
+            GitIdentityTool(),
         ]
 
         event_bus = EventBus()

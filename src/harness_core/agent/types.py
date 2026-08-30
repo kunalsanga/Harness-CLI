@@ -122,6 +122,59 @@ class ToolCall:
 
 
 @dataclass
+class TaskExecutionStats:
+    """Tracks execution accounting for truthful task completion."""
+
+    attempted: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    recovered: int = 0  # failures that were later succeeded
+    unresolved: int = 0  # failures with no subsequent success
+    _failed_tools: dict[str, int] = field(default_factory=dict)  # tool_name -> count of consecutive failures
+
+    def record_attempt(self) -> None:
+        self.attempted += 1
+
+    def record_success(self, tool_name: str) -> None:
+        self.succeeded += 1
+        # Check if this tool previously failed -> it's a recovery
+        if self._failed_tools.get(tool_name, 0) > 0:
+            self.recovered += self._failed_tools[tool_name]
+            self.unresolved = max(0, self.unresolved - self._failed_tools[tool_name])
+            del self._failed_tools[tool_name]
+
+    def record_failure(self, tool_name: str) -> None:
+        self.failed += 1
+        self.unresolved += 1
+        self._failed_tools[tool_name] = self._failed_tools.get(tool_name, 0) + 1
+
+    def record_permission_denied(self, tool_name: str) -> None:
+        """Permission denied is not a failure per se, but blocks progress."""
+        self.attempted += 1  # already counted in record_attempt
+        # Don't count as failed or unresolved — it's a constraint
+
+    @property
+    def has_unresolved_failures(self) -> bool:
+        return self.unresolved > 0
+
+    @property
+    def success_rate(self) -> float:
+        if self.attempted == 0:
+            return 0.0
+        return self.succeeded / self.attempted
+
+    def summary(self) -> str:
+        parts = [f"Attempted: {self.attempted}", f"Succeeded: {self.succeeded}"]
+        if self.failed > 0:
+            parts.append(f"Failed: {self.failed}")
+        if self.recovered > 0:
+            parts.append(f"Recovered: {self.recovered}")
+        if self.unresolved > 0:
+            parts.append(f"Unresolved: {self.unresolved}")
+        return ", ".join(parts)
+
+
+@dataclass
 class Task:
     """An engineering task."""
 
@@ -136,6 +189,7 @@ class Task:
     updated_at: float = field(default_factory=time.time)
     result: str | None = None
     error: str | None = None
+    execution_stats: TaskExecutionStats = field(default_factory=TaskExecutionStats)
 
 
 class TaskPhase(Enum):

@@ -126,6 +126,66 @@ class GitLogTool(Tool):
             return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
 
 
+class GitIdentityTool(Tool):
+    """Check git identity configuration."""
+
+    @property
+    def schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="git_identity",
+            description="Check if git user.name and user.email are configured",
+            parameters={"type": "object", "properties": {}},
+            permission_required="allow",
+            timeout_seconds=10.0,
+        )
+
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        try:
+            # Check user.name
+            name_proc = await asyncio.create_subprocess_exec(
+                "git", "config", "user.name",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            name_out, _ = await name_proc.communicate()
+            user_name = name_out.decode("utf-8", errors="replace").strip()
+
+            # Check user.email
+            email_proc = await asyncio.create_subprocess_exec(
+                "git", "config", "user.email",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            email_out, _ = await email_proc.communicate()
+            user_email = email_out.decode("utf-8", errors="replace").strip()
+
+            if user_name and user_email:
+                return ToolResult(
+                    status=ToolResultStatus.SUCCESS,
+                    output=f"Git identity configured:\n  user.name: {user_name}\n  user.email: {user_email}",
+                    metadata={"user_name": user_name, "user_email": user_email, "configured": True},
+                )
+            else:
+                missing = []
+                if not user_name:
+                    missing.append("user.name")
+                if not user_email:
+                    missing.append("user.email")
+                return ToolResult(
+                    status=ToolResultStatus.ERROR,
+                    output="",
+                    error=(
+                        f"Git identity is not configured. Missing: {', '.join(missing)}.\n"
+                        "Configure with:\n"
+                        "  git config user.name \"Your Name\"\n"
+                        "  git config user.email \"your.email@example.com\""
+                    ),
+                    metadata={"user_name": user_name or None, "user_email": user_email or None, "configured": False},
+                )
+        except Exception as e:
+            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+
+
 class GitCommitTool(Tool):
     """Create a git commit."""
 
@@ -153,6 +213,22 @@ class GitCommitTool(Tool):
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         message = arguments["message"]
         files = arguments.get("files", [])
+
+        # BLOCK: Never allow git config user.name/email to be set by the agent
+        forbidden_patterns = ["git config user.name", "git config user.email"]
+        full_command = f"git commit -m {message}"
+        for pattern in forbidden_patterns:
+            if pattern in message.lower():
+                return ToolResult(
+                    status=ToolResultStatus.ERROR,
+                    output="",
+                    error=(
+                        "Harness must never invent Git identity.\n"
+                        "Configure user.name and user.email manually with:\n"
+                        "  git config user.name \"Your Name\"\n"
+                        "  git config user.email \"your.email@example.com\""
+                    ),
+                )
 
         try:
             # Stage files

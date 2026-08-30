@@ -86,17 +86,23 @@ If a command fails:
 - Diagnose the root cause
 - Fix the code
 - Run the command again
-- Only claim success when the command passes
-
-IMPORTANT: If a tool call returns "permission denied", do NOT retry the same command.
+- Only claim success when the command passesIMPORTANT: If a tool call returns "permission denied", do NOT retry the same command.
 Instead:
 - Try a different approach that does not require the blocked operation
 - If verification is blocked, skip verification and report what was completed
 - Never retry a denied command more than once
 - Accept the permission constraint and work within it
 
+CRITICAL GIT RULE: NEVER invent Git identity (user.name, user.email).
+- If git_identity check fails, report that identity is missing and stop.
+- Do NOT run: git config user.name "Some Name"
+- Do NOT run: git config user.email "some@email.com"
+- Configure your OWN identity manually if needed.
+- The agent must NEVER write fake placeholder identities into repositories.
+
 Always verify your work before claiming success. Do not claim success without evidence.
 However, if verification itself is blocked by permissions, report that clearly.
+
 
 When you are done, summarize what you did and provide evidence of success."""
 
@@ -471,6 +477,15 @@ When you are done, summarize what you did and provide evidence of success."""
 
                     result = await self._execute_tool(call)
 
+                    # Track execution stats
+                    task.execution_stats.record_attempt()
+                    if result.status == ToolResultStatus.SUCCESS:
+                        task.execution_stats.record_success(call.tool_name)
+                    elif result.status == ToolResultStatus.PERMISSION_DENIED:
+                        task.execution_stats.record_permission_denied(call.tool_name)
+                    else:
+                        task.execution_stats.record_failure(call.tool_name)
+
                     event_data: dict[str, Any] = {
                         "tool": call.tool_name,
                         "status": result.status.value,
@@ -573,6 +588,12 @@ When you are done, summarize what you did and provide evidence of success."""
                     "status": task.status.value,
                     "iterations": task.iterations,
                     "tool_calls": len(task.tool_calls),
+                    "stats": task.execution_stats.summary(),
+                    "attempted": task.execution_stats.attempted,
+                    "succeeded": task.execution_stats.succeeded,
+                    "failed": task.execution_stats.failed,
+                    "recovered": task.execution_stats.recovered,
+                    "unresolved": task.execution_stats.unresolved,
                 },
             )
         )

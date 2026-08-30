@@ -146,6 +146,7 @@ class InteractiveShell:
         self._provider: Any = None
         self._router: Any = None
         self._task_aware: Any = None
+        self._last_stats: dict[str, int] = {}
 
     # ─── Initialization ──────────────────────────────────────────────
 
@@ -244,7 +245,7 @@ class InteractiveShell:
             from harness_core.tools.filesystem import (
                 EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool,
             )
-            from harness_core.tools.git import GitDiffTool, GitLogTool, GitStatusTool
+            from harness_core.tools.git import GitDiffTool, GitIdentityTool, GitLogTool, GitStatusTool
             from harness_core.tools.search import GlobTool, GrepTool
             from harness_core.tools.shell import RunCommandTool
 
@@ -334,6 +335,7 @@ class InteractiveShell:
                 GitStatusTool(),
                 GitDiffTool(),
                 GitLogTool(),
+                GitIdentityTool(),
             ]
 
             # Agent config
@@ -534,6 +536,14 @@ class InteractiveShell:
             tool_calls = event.data.get("tool_calls", 0)
             self.total_iterations = iterations
             self.total_tool_calls = tool_calls
+            # Store execution stats for summary
+            self._last_stats = {
+                "attempted": event.data.get("attempted", 0),
+                "succeeded": event.data.get("succeeded", 0),
+                "failed": event.data.get("failed", 0),
+                "recovered": event.data.get("recovered", 0),
+                "unresolved": event.data.get("unresolved", 0),
+            }
 
         async def on_verification(event: Any) -> None:
             event_type = event.type
@@ -1022,14 +1032,16 @@ class InteractiveShell:
                     if len(result) > 500:
                         result = result[:470] + "..."
                     self.console.print(f"  {result}", highlight=False)
-                # Count successes vs failures
-                successes = sum(1 for tc in task.tool_calls if tc.result and tc.result.status.value == "success")
-                failures = sum(1 for tc in task.tool_calls if tc.result and tc.result.execution_failed)
-                self.console.print(f"\n  [bold]Summary[/]")
-                if successes > 0:
-                    self.console.print(f"  [green]✓[/] {successes} tool operations succeeded")
-                if failures > 0:
-                    self.console.print(f"  [red]✗[/] {failures} tool operations failed")
+                # Use execution stats for truthful accounting
+                stats = task.execution_stats
+                self.console.print(f"\n  [bold]Execution[/]")
+                self.console.print(f"  Operations: {stats.attempted}")
+                if stats.recovered > 0:
+                    self.console.print(f"  [yellow]Recovered failures: {stats.recovered}[/]")
+                if stats.unresolved > 0:
+                    self.console.print(f"  [red]Unresolved failures: {stats.unresolved}[/]")
+                else:
+                    self.console.print(f"  [green]Unresolved failures: 0[/]")
                 self.console.print(f"  [dim]Completed in {elapsed:.1f}s ({task.iterations} iterations, {len(task.tool_calls)} tool calls)[/]")
             elif task.status.value == "failed":
                 self.console.print("")
