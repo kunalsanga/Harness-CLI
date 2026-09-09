@@ -33,6 +33,7 @@ from harness_core.agent.types import (
     AgentConfig,
     Task,
     TaskStatus,
+    TodoStatus,
     ToolCall,
     ToolResult,
     ToolResultStatus,
@@ -234,6 +235,18 @@ class TestPlanningValidation:
 class TestZeroToolCallGuard:
     @pytest.mark.asyncio
     async def test_nudges_model_that_skips_tools(self, tmp_path: Path):
+        """Nudge exhaustion caps the loop, but the model never did the required work.
+
+        Phase 10.6 contract: nudge exhaustion means "the model stopped
+        responding productively" — it is NOT evidence that the required work
+        is done. The model produced text-only responses after 2 nudges,
+        never inspecting, implementing, or testing anything. All required
+        TODOs remain PENDING. The correct terminal state is PARTIAL, not
+        COMPLETE. The comment on the old assertion explained the change:
+        the model claimed it lacked visibility (wrong), got nudged twice,
+        gave up, and stopped — no required work was done. PARTIAL honestly
+        reflects the gap. COMPLETED would have been a false positive.
+        """
         (tmp_path / "app.py").write_text("x = 1", encoding="utf-8")
         provider = ScriptedProvider([
             plan_response(),
@@ -248,9 +261,17 @@ class TestZeroToolCallGuard:
 
         nudges = collector.of_type("execution.nudge")
         assert len(nudges) == MAX_NO_TOOL_NUDGES
-        # Bounded: after the nudges the text answer is accepted, never an infinite loop
-        assert task.status == TaskStatus.COMPLETED
+        # Bounded: after the nudges the text answer is accepted, never an infinite loop.
+        # Phase 10.6: nudge exhaustion ≠ completion evidence. The model never
+        # did any required work, so PARTIAL is the honest terminal state.
+        assert task.status == TaskStatus.PARTIAL
         assert task.iterations == MAX_NO_TOOL_NUDGES + 1
+        # Evidence of the honest gap: all required TODOs are still PENDING
+        pending = [
+            i for i in task.task_plan.items
+            if i.status == TodoStatus.PENDING and i.required
+        ]
+        assert len(pending) == 3, f"expected all required TODOs pending, got {[i.description for i in pending]}"
 
     @pytest.mark.asyncio
     async def test_no_nudge_when_no_tools(self, tmp_path: Path):
@@ -518,15 +539,30 @@ class TestVerificationOnComplete:
             [VerificationCheck(name="pytest", command="python -m pytest -q")],
             collector,
         )
-        assert task.status == TaskStatus.COMPLETED
+        # Phase 10.6: 1/3 TODOs completed is not COMPLETE. Verification
+        # passed, but "Inspect" and "Run tests" are still PENDING, so the
+        # honest terminal state is PARTIAL. The 5/5 invariant forbids
+        # rendering "Done" when required work remains unresolved.
+        assert task.status == TaskStatus.PARTIAL
         assert task.verification_passed is True
         assert "verification.completed" in collector.types()
+        # The completed TODO is real evidence; the gap is also real evidence.
+        completed_titles = [
+            i.description for i in task.task_plan.items
+            if i.status == TodoStatus.COMPLETED
+        ]
+        assert "Implement changes" in completed_titles
+        # blockers must enumerate the remaining required work
+        assert any("pending" in b.lower() for b in (task.error or "").lower().split(";"))
 
     @pytest.mark.asyncio
     async def test_no_checks_verifies_file_existence(self, tmp_path: Path):
         collector = EventCollector()
         task = await self._run_write_task(tmp_path, None, [], collector)
-        assert task.status == TaskStatus.COMPLETED
+        # Phase 10.6: even when the verification engine approves, only 1/3
+        # TODOs are completed. The model never inspected or tested anything,
+        # so PARTIAL is the honest terminal state.
+        assert task.status == TaskStatus.PARTIAL
         assert task.verification_passed is True
 
     @pytest.mark.asyncio

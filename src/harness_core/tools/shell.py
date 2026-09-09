@@ -8,7 +8,7 @@ import platform
 import subprocess
 from typing import Any
 
-from harness_core.agent.types import ToolResult, ToolResultStatus
+from harness_core.agent.types import ToolResult, ToolResults
 from harness_core.tools.base import Tool, ToolSchema
 
 
@@ -47,14 +47,13 @@ class RunCommandTool(Tool):
         cwd = arguments.get("cwd", self.working_directory)
         timeout = arguments.get("timeout", 30.0)
 
-        # Dangerous command detection
+        # Dangerous command detection — these are never retryable.
         dangerous_patterns = ["rm -rf /", "mkfs", "> /dev/sda", "dd if="]
         for pattern in dangerous_patterns:
             if pattern in command:
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=f"Dangerous command detected: {pattern}",
+                return ToolResults.error(
+                    f"Dangerous command detected: {pattern}",
+                    retryable=False,
                 )
 
         try:
@@ -78,10 +77,9 @@ class RunCommandTool(Tool):
             except asyncio.TimeoutError:
                 process.kill()
                 await process.communicate()
-                return ToolResult(
-                    status=ToolResultStatus.TIMEOUT,
-                    output="",
-                    error=f"Command timed out after {timeout}s",
+                return ToolResults.timeout(
+                    f"Command timed out after {timeout}s",
+                    timeout_seconds=timeout,
                 )
 
             stdout_str = stdout.decode("utf-8", errors="replace")
@@ -101,32 +99,27 @@ class RunCommandTool(Tool):
             return_code = process.returncode or 0
 
             if return_code == 0:
-                return ToolResult(
-                    status=ToolResultStatus.SUCCESS,
-                    output=output,
+                return ToolResults.success(
+                    output,
                     metadata={"return_code": return_code},
                     exit_code=return_code,
                     stderr=stderr_str if stderr_str else None,
                 )
-            else:
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output=output,
-                    error=(
-                        f"Command failed with exit code {return_code}.\n"
-                        f"Command: {command}\n"
-                        f"Exit code: {return_code}"
-                        + (f"\nstderr: {stderr_str[:2000]}" if stderr_str else "")
-                    ),
-                    metadata={"return_code": return_code},
-                    retryable=True,
-                    exit_code=return_code,
-                    stderr=stderr_str if stderr_str else None,
-                )
-        except Exception as e:
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
-                output="",
-                error=f"Could not execute command: {e}",
-                retryable=True,
+            # Non-zero exit — retryable: same command may succeed on a retry
+            # (race condition, transient resource issue, etc.).
+            err_msg = (
+                f"Command failed with exit code {return_code}.\n"
+                f"Command: {command}\n"
+                f"Exit code: {return_code}"
+                + (f"\nstderr: {stderr_str[:2000]}" if stderr_str else "")
             )
+            return ToolResults.error(
+                err_msg,
+                output=output,
+                exit_code=return_code,
+                stderr=stderr_str if stderr_str else None,
+                retryable=True,
+                metadata={"return_code": return_code},
+            )
+        except Exception as e:
+            return ToolResults.from_exception(e, retryable=True)

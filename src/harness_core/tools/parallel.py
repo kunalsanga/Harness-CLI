@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from harness_core.agent.types import ToolResult, ToolResultStatus
+from harness_core.agent.types import ToolResult, ToolResults
 from harness_core.tools.base import Tool, ToolSchema
 
 
@@ -157,30 +157,18 @@ class ParallelToolExecutor:
 
         # Permission check
         if permission_check and not permission_check(tool_name, args):
-            return ToolResult(
-                status=ToolResultStatus.PERMISSION_DENIED,
-                output='',
-                error='Permission denied',
-            )
+            return ToolResults.permission_denied("Permission denied")
 
         # Execute
         tool = self._tools.get(tool_name)
         if not tool:
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
-                output='',
-                error=f'Unknown tool: {tool_name}',
-            )
+            return ToolResults.unknown_tool(tool_name)
 
         start = time.monotonic()
         try:
             result = await tool.execute(args)
         except Exception as e:
-            result = ToolResult(
-                status=ToolResultStatus.ERROR,
-                output='',
-                error=str(e),
-            )
+            result = ToolResults.from_exception(e, retryable=True)
         duration_ms = (time.monotonic() - start) * 1000
 
         # Record for deduplication

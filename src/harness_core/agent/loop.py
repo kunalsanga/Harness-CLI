@@ -6,28 +6,9 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from harness_core.agent.types import (
-    AgentConfig,
-    FailureReason,
-    Task,
-    TaskStatus,
-    TodoItem,
-    TodoStatus,
-    ToolCall,
-    ToolResult,
-    ToolResultStatus,
-)
-from harness_core.context.engine import ContextEngine
-from harness_core.observability.events import Event, EventBus
-from harness_core.permissions.manager import PermissionManager
-from harness_core.providers.base import CompletionRequest, CompletionResponse, ModelProvider
-from harness_core.routing.budgets import BudgetManager
-from harness_core.routing.router import ModelRouter, RouterConfig
-from harness_core.tools.base import Tool
-from harness_core.verification.engine import VerificationEngine
-from harness_core.verification.integrity import check_test_integrity, is_test_like_path
+from harness_core.agent.completion import can_complete_task, completion_blockers
 from harness_core.agent.todos import (
     apply_tool_result,
     apply_tool_started,
@@ -36,14 +17,34 @@ from harness_core.agent.todos import (
     sanitize_todo_titles,
     select_todo,
 )
-from harness_core.agent.report import build_execution_report, files_from_task
-from harness_core.agent.completion import can_complete_task, completion_blockers
+from harness_core.agent.types import (
+    AgentConfig,
+    Task,
+    TaskStatus,
+    TodoItem,
+    TodoStatus,
+    ToolCall,
+    ToolResult,
+    ToolResults,
+    ToolResultStatus,
+)
+from harness_core.context.compaction import AgentMessage, ContextCompactor
+from harness_core.context.engine import ContextEngine
+from harness_core.context.pack import estimate_tokens
+from harness_core.observability.events import Event, EventBus
+from harness_core.permissions.manager import PermissionManager
+from harness_core.providers.base import CompletionRequest, ModelProvider
+from harness_core.routing.budgets import BudgetManager
+from harness_core.routing.router import ModelRouter
+from harness_core.tools.base import Tool
 from harness_core.tools.diagnosis import (
     classify_command_failure,
     normalize_shell_command,
     parse_test_counts,
 )
 from harness_core.tools.paths import cwd_in_workspace, resolve_in_workspace
+from harness_core.verification.engine import VerificationEngine
+from harness_core.verification.integrity import check_test_integrity
 
 if TYPE_CHECKING:
     from harness_core.routing.task_aware import TaskAwareRouter
@@ -105,15 +106,92 @@ def _classify_model_failure(err: str) -> str:
 
 # How many iterations may be spent in diagnosis mode before stopping.
 MAX_DIAGNOSIS_ITERATIONS = 5
+
+# ── Context window management ────────────────────────────────────────────
+# Three independent mechanisms, weakest to strongest:
+#
+#   1. HISTORY_TOKEN_BUDGET decides *when* older tool calls stop being sent
+#      verbatim and collapse into a single TASK STATE summary.
+#   2. MAX_TOOL_RESULT_TOKENS caps any *single* tool result, so one enormous
+#      file read or test dump cannot dominate the prompt on its own.
+#   3. AgentConfig.context_token_budget is a hard ceiling on the whole
+#      assembled message list. _build_messages drops history until the
+#      request fits, so exceeding the model's window is not merely unlikely.
+#
+# Mechanisms 1 and 2 keep prompts small in the common case; mechanism 3 is
+# what makes an over-limit request impossible.
+#
 # History compaction: keep recent tool calls verbatim, summarize older.
 HISTORY_CHAR_BUDGET = 120_000
+# The trigger is expressed in tokens; ~4 characters per token.
+HISTORY_TOKEN_BUDGET = HISTORY_CHAR_BUDGET // 4
 KEEP_RECENT_CALLS = 10
+# No single tool result may occupy more than this share of the prompt.
+MAX_TOOL_RESULT_TOKENS = 8_000
+# Used when no AgentConfig budget is available.
+DEFAULT_CONTEXT_TOKEN_BUDGET = 120_000
+# Space held back for the TASK STATE summary whenever history is dropped, so
+# adding the summary cannot itself push the request over the ceiling.
+_SUMMARY_TOKEN_RESERVE = 1_500
+# A tool result is never shrunk below this: less than this and the model gets
+# no usable signal, at which point dropping the call outright would be better.
+_MIN_TOOL_RESULT_TOKENS = 256
+# Marker inserted where the middle of an oversized tool result was removed.
+_TRUNCATION_NOTICE = (
+    "\n\n... [{removed:,} characters omitted by the harness to protect the "
+    "context window; re-read a narrower range if you need the middle] ...\n\n"
+)
 
 _TEST_COMMAND_MARKERS = (
     "pytest", "npm test", "yarn test", "pnpm test", "bun test",
     "cargo test", "go test", "jest", "vitest", "mocha", "phpunit",
     "dotnet test", "gradle test", "mvn test",
 )
+
+
+def truncate_to_tokens(text: str, max_tokens: int = MAX_TOOL_RESULT_TOKENS) -> str:
+    """Clamp `text` to roughly `max_tokens` tokens, keeping head and tail.
+
+    Tool output is most useful at its edges: the head carries the opening of a
+    file or the start of a command, the tail carries the failing assertion or
+    the summary line. The middle is dropped and replaced with an explicit
+    notice so the model knows the content is partial rather than complete.
+    """
+    if max_tokens <= 0:
+        return ""
+    max_chars = max_tokens * 4
+    if len(text) <= max_chars:
+        return text
+    # The notice itself costs tokens, so it comes out of the budget rather
+    # than being added on top — otherwise the "capped" result overshoots.
+    notice_len = len(_TRUNCATION_NOTICE.format(removed=len(text)))
+    body_chars = max(max_chars - notice_len, 8)
+    # Favour the head — for source files the beginning carries imports and
+    # signatures — but always keep enough of the tail to see a final error.
+    head_chars = (body_chars * 7) // 10
+    tail_chars = body_chars - head_chars
+    removed = len(text) - head_chars - tail_chars
+    return text[:head_chars] + _TRUNCATION_NOTICE.format(removed=removed) + text[-tail_chars:]
+
+
+def message_tokens(message: dict[str, Any]) -> int:
+    """Estimate the prompt tokens contributed by one chat message.
+
+    Counts the textual content plus any serialized tool_calls payload, since
+    a message with `content: None` still costs tokens for the function name
+    and arguments it carries.
+    """
+    total = estimate_tokens(message.get("content") or "")
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        total += estimate_tokens(json.dumps(tool_calls))
+    # Small fixed overhead per message for role and framing tokens.
+    return total + 4
+
+
+def messages_tokens(messages: list[dict[str, Any]]) -> int:
+    """Estimate the total prompt tokens for an assembled message list."""
+    return sum(message_tokens(m) for m in messages)
 
 
 class AgentLoop:
@@ -128,6 +206,8 @@ class AgentLoop:
         event_bus: EventBus | None = None,
         router: ModelRouter | None = None,
         task_aware: TaskAwareRouter | None = None,
+        agent_id: str = "",
+        task_id: str = "",
     ) -> None:
         self.provider = provider
         self.tools = {t.schema.name: t for t in tools}
@@ -136,6 +216,10 @@ class AgentLoop:
         self.event_bus = event_bus or EventBus()
         self.router = router
         self.task_aware = task_aware
+        # Phase 10: identity stamped on emitted events so live dashboards can
+        # attribute tool/test activity to the correct agent without guessing.
+        self.agent_id = agent_id
+        self.task_id = task_id
         self.budget = BudgetManager() if router is None else router.budget
         self.context_engine = ContextEngine(self.workspace_root)
         self.permission_manager = PermissionManager(
@@ -278,8 +362,55 @@ When you are done, summarize what you did and provide evidence of success."""
         import re
         return bool(re.search(r"\b(node|python|python3|deno|bun)\s+\S*test\S*", cmd))
 
-    def _compact_task_state(self, task: Task, compacted_count: int) -> str:
-        """Build the compact TASK STATE summary for older tool history."""
+    @staticmethod
+    def _as_agent_messages(calls: list[ToolCall]) -> list[AgentMessage]:
+        """Represent dropped tool calls as AgentMessages for the compactor.
+
+        ContextCompactor works on a generic message stream, so each dropped
+        call becomes a `tool_call` message carrying the tool name and path in
+        metadata (that is what it reads to report tools used and files
+        modified) followed by a `tool_result` or `error` message for the
+        outcome.
+        """
+        msgs: list[AgentMessage] = []
+        for tc in calls:
+            path = tc.arguments.get("path") or tc.arguments.get("file_path") or ""
+            msgs.append(
+                AgentMessage(
+                    role="assistant",
+                    content=f"{tc.tool_name}({path})" if path else tc.tool_name,
+                    kind="tool_call",
+                    metadata={"tool_name": tc.tool_name, "path": path},
+                )
+            )
+            result = tc.result
+            if result is None:
+                continue
+            failed = result.execution_failed
+            msgs.append(
+                AgentMessage(
+                    role="tool",
+                    content=(result.error or result.output or "")[:500] if failed
+                    else (result.output or "(no output)")[:500],
+                    kind="error" if failed else "tool_result",
+                    metadata={"tool_name": tc.tool_name},
+                )
+            )
+        return msgs
+
+    def _compact_task_state(
+        self,
+        task: Task,
+        compacted_count: int,
+        compacted_calls: list[ToolCall] | None = None,
+    ) -> str:
+        """Build the compact TASK STATE summary for older tool history.
+
+        The framing (goal, workspace, plan progress, latest failure) is
+        task-specific and stays here; the roll-up of what the dropped calls
+        actually did is delegated to ContextCompactor so there is one
+        implementation of that summarization in the codebase.
+        """
         completed_steps = [
             i.description for i in task.task_plan.items
             if i.status == TodoStatus.COMPLETED
@@ -295,6 +426,14 @@ When you are done, summarize what you did and provide evidence of success."""
         if self._modified_files:
             lines.append("Changed files: " + ", ".join(self._modified_files[-10:]))
         lines.append(f"{compacted_count} earlier tool call(s) were made and are summarized above.")
+        if compacted_calls:
+            # preserve_recent=0: every dropped call belongs in the summary,
+            # nothing is held back to be replayed verbatim.
+            summary = ContextCompactor(preserve_recent=0).compact(
+                self._as_agent_messages(compacted_calls)
+            )
+            if summary.content:
+                lines.append(summary.content)
         last_failure = next(
             (tc for tc in reversed(task.tool_calls)
              if tc.result and tc.result.execution_failed and not tc.result.is_perm_denied),
@@ -308,76 +447,169 @@ When you are done, summarize what you did and provide evidence of success."""
                 lines.append(f"Error: {err}")
         return "\n".join(lines)
 
+    def _context_token_budget(self) -> int:
+        """The hard ceiling on estimated prompt tokens for one request."""
+        budget = getattr(self.config, "context_token_budget", None)
+        if not isinstance(budget, int) or budget <= 0:
+            return DEFAULT_CONTEXT_TOKEN_BUDGET
+        return budget
+
+    @staticmethod
+    def _tool_call_pair(tc: ToolCall) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build the assistant/tool message pair for one completed tool call.
+
+        These two messages must always travel together: an assistant message
+        announcing a tool_call with no matching tool message is a malformed
+        request for most providers, so every trimming decision below operates
+        on the pair rather than on individual messages.
+        """
+        assert tc.result is not None
+        raw = tc.result.output or tc.result.error or "(no output)"
+        return (
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.tool_name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": truncate_to_tokens(raw, MAX_TOOL_RESULT_TOKENS),
+            },
+        )
+
     def _build_messages(
         self,
         task: Task,
         context: list[Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the message list for the model.
+        """Build the message list for the model, within a hard token ceiling.
 
-        Keeps a compact task state: recent tool calls verbatim, older
-        history summarized, corrections (governor guidance) appended last.
+        Recent tool calls go in verbatim (each individually capped), older
+        history collapses into a single TASK STATE summary, and corrections
+        (governor guidance) are appended last. If the result would still
+        exceed `AgentConfig.context_token_budget`, the oldest tool call pairs
+        are dropped — in pairs, never orphaned — until it fits. The returned
+        list is therefore guaranteed to be within budget whenever the fixed
+        prefix alone is.
         """
-        messages: list[dict[str, Any]] = [
+        budget = self._context_token_budget()
+
+        prefix: list[dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt()},
         ]
 
         # Add context
         if context:
             for piece in context:
-                messages.append(
+                prefix.append(
                     {"role": "system", "content": f"[Context: {piece.source}]\n{piece.content}"}
                 )
 
         # Add task
-        messages.append({"role": "user", "content": task.goal})
-
-        # Determine which tool calls to keep verbatim (context management).
-        calls_with_results = [tc for tc in task.tool_calls if tc.result]
-        total_chars = sum(
-            len(tc.result.output or "") + len(tc.result.error or "")
-            for tc in calls_with_results
-        )
-        if len(calls_with_results) > KEEP_RECENT_CALLS and total_chars > HISTORY_CHAR_BUDGET:
-            compacted = calls_with_results[:-KEEP_RECENT_CALLS]
-            recent = calls_with_results[-KEEP_RECENT_CALLS:]
-            messages.append(
-                {"role": "system", "content": self._compact_task_state(task, len(compacted))}
-            )
-        else:
-            recent = calls_with_results
-
-        # Add previous tool call results
-        for tc in recent:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.tool_name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                    ],
-                }
-            )
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tc.result.output or tc.result.error or "(no output)",
-                }
-            )
+        prefix.append({"role": "user", "content": task.goal})
 
         # Governor guidance (nudge / diagnosis / stagnation) — most recent last
-        for correction in self._corrections[-3:]:
-            messages.append({"role": "user", "content": correction})
+        suffix: list[dict[str, Any]] = [
+            {"role": "user", "content": correction}
+            for correction in self._corrections[-3:]
+        ]
 
+        calls_with_results = [tc for tc in task.tool_calls if tc.result]
+
+        # Step 1: decide the *maximum* number of recent calls worth sending
+        # verbatim. Once the accumulated history is large, older calls stop
+        # earning their place and are better represented by a summary. Note
+        # this is a size test only: a long run of small results is cheap and
+        # more useful to the model in full.
+        history_tokens = sum(
+            estimate_tokens(tc.result.output or "") + estimate_tokens(tc.result.error or "")
+            for tc in calls_with_results
+        )
+        if history_tokens > HISTORY_TOKEN_BUDGET:
+            candidates = calls_with_results[-KEEP_RECENT_CALLS:]
+        else:
+            candidates = list(calls_with_results)
+
+        # Step 2: fit as many of those as the budget allows, newest first, so
+        # the model always retains the most recent observation it acted on.
+        # A summary is reserved for whenever anything gets left out.
+        pairs = [self._tool_call_pair(tc) for tc in candidates]
+        fixed_tokens = messages_tokens(prefix) + messages_tokens(suffix)
+        summary_reserve = _SUMMARY_TOKEN_RESERVE if len(candidates) < len(calls_with_results) else 0
+        available = budget - fixed_tokens - summary_reserve
+
+        kept: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        used = 0
+        for pair in reversed(pairs):
+            cost = message_tokens(pair[0]) + message_tokens(pair[1])
+            if kept and used + cost > available:
+                break
+            used += cost
+            kept.insert(0, pair)
+        dropped_count = len(calls_with_results) - len(kept)
+
+        # Step 3: assemble. The summary sits between the goal and the verbatim
+        # history so the model reads it as established background.
+        messages = list(prefix)
+        if dropped_count > 0:
+            dropped_calls = calls_with_results[:dropped_count]
+            messages.append(
+                {
+                    "role": "system",
+                    "content": self._compact_task_state(task, dropped_count, dropped_calls),
+                }
+            )
+        for assistant_msg, tool_msg in kept:
+            messages.append(assistant_msg)
+            messages.append(tool_msg)
+        messages.extend(suffix)
+
+        # Step 4: last resort. If the prefix, summary and a single mandatory
+        # tool pair still overflow, shrink the largest tool result rather than
+        # send a request the provider will reject outright.
+        self._enforce_token_ceiling(messages, budget)
         return messages
+
+    @staticmethod
+    def _enforce_token_ceiling(messages: list[dict[str, Any]], budget: int) -> None:
+        """Shrink oversized tool results in place until `messages` fits.
+
+        Only `role: tool` messages are touched: the system prompt, the goal
+        and the governor corrections are the parts the agent cannot function
+        without, and unlike tool output they are bounded by construction.
+        """
+        for _ in range(len(messages)):
+            overflow = messages_tokens(messages) - budget
+            if overflow <= 0:
+                return
+            tool_msgs = [m for m in messages if m.get("role") == "tool" and m.get("content")]
+            if not tool_msgs:
+                return
+            biggest = max(tool_msgs, key=lambda m: len(m["content"]))
+            # Target the *content* budget, not the message total: the per-message
+            # framing overhead is not something truncation can reclaim, so
+            # subtracting the overflow from the whole message undershoots.
+            target = estimate_tokens(biggest["content"]) - overflow
+            if target <= _MIN_TOOL_RESULT_TOKENS:
+                # Cannot recover the overflow from this message alone; reduce
+                # it to a stub and let the next pass attack the runner-up.
+                biggest["content"] = truncate_to_tokens(
+                    biggest["content"], _MIN_TOOL_RESULT_TOKENS
+                )
+                if len(tool_msgs) == 1:
+                    return
+                continue
+            biggest["content"] = truncate_to_tokens(biggest["content"], target)
 
     def _tool_schemas(self) -> list[dict[str, Any]]:
         """Get LLM-compatible tool schemas."""
@@ -539,7 +771,73 @@ When you are done, summarize what you did and provide evidence of success."""
             modified_files=self._modified_files,
             git_commit=getattr(self._active_task, "git_commit", None) if self._active_task else None,
             git_push=getattr(self._active_task, "git_push", None) if self._active_task else None,
+            record_tool_call=self._record_workflow_tool,
         )
+
+    async def _record_workflow_tool(
+        self, tool_name: str, args: dict[str, Any], result: ToolResult
+    ) -> None:
+        """Record one workflow-driven tool execution as a real ToolCall.
+
+        Workflows (git push / test / explain) execute tools directly rather
+        than through the model loop; without this hook their operations were
+        invisible to the runtime accounting (0 tool calls for a real push).
+        This makes every executed operation a first-class ToolCall with
+        events, iteration/tool accounting and execution stats.
+        """
+        task = self._active_task
+        if task is None:
+            return
+        call = ToolCall(
+            id=f"wf-{tool_name}-{len(task.tool_calls)}",
+            tool_name=tool_name,
+            arguments=dict(args),
+            result=result,
+        )
+        task.tool_calls.append(call)
+        task.iterations += 1
+        self.budget.record_iteration()
+        self.budget.record_tool_call()
+        self._seen_actions.add(self._action_key(tool_name, args))
+
+        await self._emit_event("tool.call", {"tool": tool_name, "args": args})
+        event_data: dict[str, Any] = {
+            "tool": tool_name,
+            "status": result.status.value,
+            "output_len": len(result.output or ""),
+        }
+        if tool_name == "run_command":
+            # Phase 10.5: the exact command rides on the result event so the
+            # runtime convergence governor can detect repeated commands.
+            event_data["command"] = str(args.get("command", ""))
+        if result.exit_code is not None:
+            event_data["exit_code"] = result.exit_code
+        if result.error:
+            event_data["error"] = result.error
+        if result.stderr:
+            event_data["stderr"] = result.stderr
+        if result.metadata:
+            event_data["metadata"] = dict(result.metadata)
+        await self._emit_event("tool.result", event_data)
+
+        task.execution_stats.record_attempt()
+        if result.status == ToolResultStatus.SUCCESS:
+            task.execution_stats.record_success(tool_name)
+            self._completed_operations.add(self._action_key(tool_name, args))
+        elif result.status == ToolResultStatus.PERMISSION_DENIED:
+            task.execution_stats.record_permission_denied(tool_name)
+        else:
+            task.execution_stats.record_failure(tool_name)
+            if tool_name == "run_command":
+                self._record_failure(tool_name, args, result.exit_code or -1)
+
+        # Structured git / test accounting identical to the model-loop path.
+        await self._postprocess_result(task, call, result)
+        if tool_name in ("write_file", "edit_file"):
+            path = args.get("path", args.get("file_path", ""))
+            if path and path not in self._modified_files:
+                self._modified_files.append(path)
+        await self._todo_result(task, call, result)
 
     def _apply_workflow_result(self, task: Task, result: Any) -> None:
         """Copy workflow outputs onto the task and emit per-step events.
@@ -556,6 +854,20 @@ When you are done, summarize what you did and provide evidence of success."""
         for op in result.completed_operations:
             self._completed_operations.add(op)
             task.completed_operations.append(op)
+            
+        if "snippets" in data and not task.result:
+            parts = ["**Project Overview**"]
+            parts.append("*Based on an automatic scan of the primary project files:*\n")
+            for s in data["snippets"]:
+                preview = s['preview'].strip()
+                if len(preview) > 400:
+                    preview = preview[:397] + "..."
+                parts.append(f"**📄 {s['path']}**")
+                for line in preview.split("\n"):
+                    parts.append(f"> {line}")
+                parts.append("")
+            task.result = "\n".join(parts)
+            
         # Stash TODO events for emission by an async wrapper
         for item in task.task_plan.items:
             if not getattr(item, "_workflow_emitted", False):
@@ -757,17 +1069,26 @@ When you are done, summarize what you did and provide evidence of success."""
         # Failed executions exist with no recovery — block completion
         return True
 
+    async def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
+        """Emit an event stamped with this loop's agent/task identity.
+
+        Identity is provided by the WorkerAgent that owns the loop; the
+        dashboard uses it to attribute activity truthfully (Phase 10).
+        """
+        payload = dict(data)
+        if self.task_id and not payload.get("task_id"):
+            payload["task_id"] = self.task_id
+        if self.agent_id and not payload.get("agent_id"):
+            payload["agent_id"] = self.agent_id
+        await self.event_bus.emit(
+            Event(type=event_type, source=self.agent_id or "agent_loop", data=payload)
+        )
+
     async def _emit_phase(self, phase: str) -> None:
         """Emit a task phase change event for progress tracking."""
         if phase != self._current_phase:
             self._current_phase = phase
-            await self.event_bus.emit(
-                Event(
-                    type="task.phase",
-                    source="agent_loop",
-                    data={"phase": phase, "task_id": ""},
-                )
-            )
+            await self._emit_event("task.phase", {"phase": phase})
 
     async def _emit_thinking(self, message: str, task: Task | None = None) -> None:
         """Emit a thinking status event (high-level execution intent)."""
@@ -877,17 +1198,14 @@ When you are done, summarize what you did and provide evidence of success."""
                     passed, total = counts
                     task.tests_run = total
                     task.tests_passed = passed
-                await self.event_bus.emit(
-                    Event(
-                        type="test.completed",
-                        source="agent_loop",
-                        data={
-                            "command": command,
-                            "passed": task.tests_passed,
-                            "total": task.tests_run,
-                            "success": result.status == ToolResultStatus.SUCCESS,
-                        },
-                    )
+                await self._emit_event(
+                    "test.completed",
+                    {
+                        "command": command,
+                        "passed": task.tests_passed,
+                        "total": task.tests_run,
+                        "success": result.status == ToolResultStatus.SUCCESS,
+                    },
                 )
 
         # Structured git accounting
@@ -979,6 +1297,7 @@ When you are done, summarize what you did and provide evidence of success."""
             verified=task.verification_passed,
             did_commit=did_commit,
             did_push=did_push,
+            tests_run=task.tests_run,
         )
         if changed:
             for item in changed:
@@ -1035,12 +1354,7 @@ When you are done, summarize what you did and provide evidence of success."""
             if raw or name in self._PATH_TOOLS_REQUIRED:
                 resolved, err = resolve_in_workspace(self.workspace_root, raw)
                 if err is not None:
-                    return ToolResult(
-                        status=ToolResultStatus.PERMISSION_DENIED,
-                        output="",
-                        error=f"Path confinement: {err}",
-                        retryable=False,
-                    )
+                    return ToolResults.permission_denied(f"Path confinement: {err}")
                 if resolved is not None:
                     if "path" in args or name in self._PATH_TOOLS_REQUIRED:
                         args["path"] = str(resolved)
@@ -1062,51 +1376,16 @@ When you are done, summarize what you did and provide evidence of success."""
         tool = self.tools.get(call.tool_name)
         if not tool:
             self._reset_denial_tracking()
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
-                output="",
-                error=f"Unknown tool: {call.tool_name}",
-                retryable=False,
-            )
-        # --- BEGIN VALIDATION BLOCK ---
-        
-        required_args = tool.schema.parameters.get("required", [])
-        missing = [arg for arg in required_args if arg not in call.arguments]
-        if missing:
-            # Record a failure to enforce bounded correction attempts
-            self._record_failure(call.tool_name, call.arguments, exit_code=-1)
-            missing_msg = ", ".join(missing)
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
-                output="",
-                error=f"Missing required argument(s): {missing_msg}",
-                retryable=False,
-            )
-        # --- END VALIDATION BLOCK ---
-        tool = self.tools.get(call.tool_name)
-        if not tool:
-            self._reset_denial_tracking()
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
-                output="",
-                error=f"Unknown tool: {call.tool_name}",
-                retryable=False,
-            )
+            return ToolResults.unknown_tool(call.tool_name)
 
-        
-        
+        # Validate required arguments up front so the model receives a
+        # structured error instead of a tool-level exception.
         required_args = tool.schema.parameters.get("required", [])
         missing = [arg for arg in required_args if arg not in call.arguments]
         if missing:
-            # Record a failure to enforce bounded correction attempts
+            # Record a failure to enforce bounded correction attempts.
             self._record_failure(call.tool_name, call.arguments, exit_code=-1)
-            missing_msg = ", ".join(missing)
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
-                output="",
-                error=f"Missing required argument(s): {missing_msg}",
-                retryable=False,
-            )
+            return ToolResults.missing_argument(call.tool_name, missing)
         # Hard workspace boundary: confine file paths and working directory.
         confinement_denial = self._confine_call(call)
         if confinement_denial is not None:
@@ -1116,54 +1395,36 @@ When you are done, summarize what you did and provide evidence of success."""
         # Check if this exact call was already denied
         if self._check_repeated_deny(call):
             self._consecutive_denials += 1
-            return ToolResult(
-                status=ToolResultStatus.PERMISSION_DENIED,
-                output="",
-                error=(
-                    "Permission denied (already rejected). "
-                    "This command cannot be retried under the current policy. "
-                    "Ask for user approval or choose a different approach."
-                ),
-                retryable=False,
+            return ToolResults.permission_denied(
+                "Permission denied (already rejected). "
+                "This command cannot be retried under the current policy. "
+                "Ask for user approval or choose a different approach."
             )
 
         # Check permission
         permission = self.permission_manager.check_permission(call.tool_name, call.arguments)
         if permission == "deny":
             self._record_denial(call.tool_name, call.arguments)
-            return ToolResult(
-                status=ToolResultStatus.PERMISSION_DENIED,
-                output="",
-                error="Permission denied by policy",
-                retryable=False,
-            )
+            return ToolResults.permission_denied("Permission denied by policy")
         if permission == "ask" and not self.permission_manager.request_approval(
             call.tool_name, str(call.arguments)
         ):
             self._record_denial(call.tool_name, call.arguments)
-            return ToolResult(
-                status=ToolResultStatus.PERMISSION_DENIED,
-                output="",
-                error=(
-                    "Permission denied. This command requires approval. "
-                    "Ask the user for permission or use a different approach."
-                ),
-                retryable=False,
+            return ToolResults.permission_denied(
+                "Permission denied. This command requires approval. "
+                "Ask the user for permission or use a different approach."
             )
 
         # Check for repeated failures of the same operation
         if self._is_repeating_failure(call):
             key = self._action_key(call.tool_name, call.arguments)
             count = self._failure_counts.get(key, 0)
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
-                output="",
-                error=(
-                    f"BLOCKED: this exact operation has already failed {count} times. "
-                    f"Running it again without changes is not allowed. "
-                    f"Diagnose the root cause (read the relevant files and error output), "
-                    f"apply a fix to the implementation, then retry."
-                ),
+            return ToolResults.error(
+                f"BLOCKED: this exact operation has already failed {count} times. "
+                f"Running it again without changes is not allowed. "
+                f"Diagnose the root cause (read the relevant files and error output), "
+                f"apply a fix to the implementation, then retry.",
+                metadata={"operation": key, "failure_count": count, "blocked": True},
                 retryable=False,
             )
 
@@ -1180,9 +1441,8 @@ When you are done, summarize what you did and provide evidence of success."""
             and op_key in self._completed_operations
         ):
             # Return the cached "already done" result without re-executing.
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS,
-                output="(already executed — cached)",
+            return ToolResults.success(
+                "(already executed — cached)",
                 metadata={"cached": True, "operation": op_key},
             )
 
@@ -1205,15 +1465,13 @@ When you are done, summarize what you did and provide evidence of success."""
                 self._reset_failure_tracking()
             await self._record_execution_outcome(call, result)
             return result
-        except asyncio.TimeoutError:
+        except TimeoutError:
             call.duration_ms = (time.time() - start) * 1000
             self._reset_denial_tracking()
             self._record_failure(call.tool_name, call.arguments, -1)
-            timeout_result = ToolResult(
-                status=ToolResultStatus.TIMEOUT,
-                output="",
-                error=f"Command timed out after {call_timeout:.0f}s",
-                retryable=True,
+            timeout_result = ToolResults.timeout(
+                f"Command timed out after {call_timeout:.0f}s",
+                timeout_seconds=call_timeout,
             )
             call.result = timeout_result
             await self._record_execution_outcome(call, timeout_result)
@@ -1222,10 +1480,10 @@ When you are done, summarize what you did and provide evidence of success."""
             call.duration_ms = (time.time() - start) * 1000
             self._reset_denial_tracking()
             self._record_failure(call.tool_name, call.arguments, -1)
-            error_result = ToolResult(
-                status=ToolResultStatus.ERROR, output="", error=str(e),
-                retryable=True,
-            )
+            # Unexpected exceptions at the loop level stay retryable: the loop
+            # cannot tell a transient fault from a deterministic bug, and the
+            # repeated-failure guard above bounds how often we retry.
+            error_result = ToolResults.from_exception(e, retryable=True)
             call.result = error_result
             await self._record_execution_outcome(call, error_result)
             return error_result
@@ -1264,8 +1522,8 @@ When you are done, summarize what you did and provide evidence of success."""
         # unbounded LLM iteration when the intent matches.
         from harness_core.agent.workflows import (
             classify_workflow,
-            run_git_push_workflow,
             run_explain_workflow,
+            run_git_push_workflow,
         )
         workflow_name = classify_workflow(goal)
         if workflow_name in ("git_push", "explain", "test"):
@@ -1293,14 +1551,25 @@ When you are done, summarize what you did and provide evidence of success."""
                 # Every workflow must pass can_complete_task before finishing.
                 await self._reconcile_todos(task)
                 if can_complete_task(task):
-                    await self._emit_phase("complete")
-                    task.status = TaskStatus.COMPLETED
+                    if workflow_name != "explain":
+                        await self._emit_phase("complete")
+                        task.status = TaskStatus.COMPLETED
                 else:
                     blockers = completion_blockers(task)
-                    await self._emit_phase("complete")
-                    task.status = TaskStatus.FAILED
+                    failed_required = [
+                        i for i in task.task_plan.items
+                        if i.required and i.status == TodoStatus.FAILED
+                    ]
+                    if failed_required or task.execution_stats.has_unresolved_failures:
+                        task.status = TaskStatus.FAILED
+                        task.failure_reason = "required_work_failed"
+                    else:
+                        # Required work merely did not happen: PARTIAL, never
+                        # COMPLETE and never a fabricated FAILURE.
+                        task.status = TaskStatus.PARTIAL
+                        task.failure_reason = "required_work_incomplete"
                     task.error = (
-                        "Workflow completed but task cannot be marked done: "
+                        "Workflow ended with required work unresolved: "
                         + "; ".join(blockers)
                     )
             else:
@@ -1308,42 +1577,45 @@ When you are done, summarize what you did and provide evidence of success."""
                 task.status = TaskStatus.FAILED
                 task.error = wf_result.failure_reason
                 task.failure_reason = wf_result.failure_reason
-            # Emit final event
-            await self.event_bus.emit(
-                Event(
-                    type="task.completed",
-                    source="agent_loop",
-                    data={
-                        "task_id": task.id,
-                        "status": task.status.value,
-                        "failure_reason": task.failure_reason,
-                        "iterations": task.iterations,
-                        "tool_calls": len(task.tool_calls),
-                        "stats": task.execution_stats.summary(),
-                        "attempted": task.execution_stats.attempted,
-                        "succeeded": task.execution_stats.succeeded,
-                        "failed": task.execution_stats.failed,
-                        "recovered": task.execution_stats.recovered,
-                        "unresolved": task.execution_stats.unresolved,
-                        "verification_passed": task.verification_passed,
-                        "verification_summary": task.verification_summary,
-                        "files_changed": list(self._modified_files),
-                        "completed_operations": list(self._completed_operations),
-                        "todos": task.task_plan.to_event_items(),
-                        "todos_completed": task.task_plan.completed_count,
-                        "todos_failed": task.task_plan.failed_count,
-                        "todos_total": task.task_plan.total_count,
-                        "tests_run": task.tests_run,
-                        "tests_passed": task.tests_passed,
-                        "models_used": list(task.models_used),
-                        "model_fallbacks": task.model_fallbacks,
-                        "git_commit": task.git_commit,
-                        "git_push": task.git_push,
-                        "paused_reason": task.paused_reason,
-                    },
+                
+            # Emit final event and return ONLY if we are fully done.
+            # Explain falls through to the LLM loop so it can summarize the gathered context.
+            if workflow_name != "explain" or task.status == TaskStatus.FAILED:
+                await self.event_bus.emit(
+                    Event(
+                        type="task.completed",
+                        source="agent_loop",
+                        data={
+                            "task_id": task.id,
+                            "status": task.status.value,
+                            "failure_reason": task.failure_reason,
+                            "iterations": task.iterations,
+                            "tool_calls": len(task.tool_calls),
+                            "stats": task.execution_stats.summary(),
+                            "attempted": task.execution_stats.attempted,
+                            "succeeded": task.execution_stats.succeeded,
+                            "failed": task.execution_stats.failed,
+                            "recovered": task.execution_stats.recovered,
+                            "unresolved": task.execution_stats.unresolved,
+                            "verification_passed": task.verification_passed,
+                            "verification_summary": task.verification_summary,
+                            "files_changed": list(self._modified_files),
+                            "completed_operations": list(self._completed_operations),
+                            "todos": task.task_plan.to_event_items(),
+                            "todos_completed": task.task_plan.completed_count,
+                            "todos_failed": task.task_plan.failed_count,
+                            "todos_total": task.task_plan.total_count,
+                            "tests_run": task.tests_run,
+                            "tests_passed": task.tests_passed,
+                            "models_used": list(task.models_used),
+                            "model_fallbacks": task.model_fallbacks,
+                            "git_commit": task.git_commit,
+                            "git_push": task.git_push,
+                            "paused_reason": task.paused_reason,
+                        },
+                    )
                 )
-            )
-            return task
+                return task
 
         # Classify task if task_aware router is available
         task_type = None
@@ -1400,7 +1672,10 @@ When you are done, summarize what you did and provide evidence of success."""
             ]
             plan_request = CompletionRequest(messages=plan_messages)
             if self.router is not None:
-                plan_result = await self.router.execute(plan_request)
+                plan_result = await self.router.execute(
+                    plan_request,
+                    routing_mode_override=self.config.routing_mode
+                )
                 if plan_result.succeeded and plan_result.response:
                     plan_text = plan_result.response.content or ""
                 else:
@@ -1424,6 +1699,26 @@ When you are done, summarize what you did and provide evidence of success."""
             plan_steps = self._validate_plan_steps(plan_steps)
             if not plan_steps:
                 plan_steps = self._default_plan_steps(goal)
+
+            # INTENT GUARD (Phase 10.6): a read-only request ("explain this
+            # project") must never acquire REQUIRED modification/test/fix
+            # tasks — even when the model's proposed plan over-decomposes.
+            # Only inspection/analysis steps survive; the plan cannot mutate
+            # the repository.
+            from harness_core.agent.intent import classify_intent, is_read_only_verb
+            from harness_core.agent.todos import todo_category
+            intent = classify_intent(goal)
+            if intent.read_only:
+                plan_steps = [
+                    s for s in plan_steps
+                    if todo_category(s) == "inspect" or is_read_only_verb(s)
+                ]
+                if not plan_steps:
+                    plan_steps = [
+                        "Discover workspace structure",
+                        "Read key project files",
+                        "Summarize findings",
+                    ]
             if plan_steps:
                 task.plan = plan_steps
                 # Create dynamic task plan (runtime owns status from here on)
@@ -1445,7 +1740,7 @@ When you are done, summarize what you did and provide evidence of success."""
             pass  # Planning is best-effort; don't fail the task
 
         # Emit initial thinking
-        await self._emit_thinking(f"I understand the task. Starting execution.", task)
+        await self._emit_thinking("I understand the task. Starting execution.", task)
         await self._emit_phase("implementing")
 
         while task.iterations < task.max_iterations:
@@ -1453,12 +1748,8 @@ When you are done, summarize what you did and provide evidence of success."""
             task.status = TaskStatus.EXECUTING
             self.budget.record_iteration()
 
-            await self.event_bus.emit(
-                Event(
-                    type="iteration.started",
-                    source="agent_loop",
-                    data={"iteration": task.iterations, "task_id": task.id},
-                )
+            await self._emit_event(
+                "iteration.started", {"iteration": task.iterations, "task_id": task.id}
             )
 
             # Build messages
@@ -1482,7 +1773,10 @@ When you are done, summarize what you did and provide evidence of success."""
                 if self.router is not None:
                     response = None
                     for attempt in range(2):
-                        fallback_result = await self.router.execute(request)
+                        fallback_result = await self.router.execute(
+                            request,
+                            routing_mode_override=self.config.routing_mode
+                        )
                         if fallback_result.succeeded:
                             response = fallback_result.response
                             prev_model = self._last_model_used
@@ -1555,8 +1849,7 @@ When you are done, summarize what you did and provide evidence of success."""
                             source="agent_loop",
                             data={
                                 "task_id": task.id,
-                                "reason": failure_reason,
-                                "reason": "model_unavailable",
+                                "reason": failure_reason or "model_unavailable",
                                 "error": str(e),
                                 "completed_todos": task.task_plan.completed_count,
                                 "total_todos": task.task_plan.total_count,
@@ -1570,6 +1863,13 @@ When you are done, summarize what you did and provide evidence of success."""
                 break
 
             # Process response
+            if response.content:
+                await self._emit_thinking(response.content, task)
+                if not task.result:
+                    task.result = response.content
+                else:
+                    task.result += "\n\n" + response.content
+
             iter_calls: list[ToolCall] = []
             if response.tool_calls:
                 # Execute tool calls
@@ -1584,12 +1884,8 @@ When you are done, summarize what you did and provide evidence of success."""
                     iter_calls.append(call)
                     self.budget.record_tool_call()
 
-                    await self.event_bus.emit(
-                        Event(
-                            type="tool.call",
-                            source="agent_loop",
-                            data={"tool": call.tool_name, "args": call.arguments},
-                        )
+                    await self._emit_event(
+                        "tool.call", {"tool": call.tool_name, "args": call.arguments}
                     )
 
                     # Runtime-owned TODO state: mark matching item in progress
@@ -1616,20 +1912,24 @@ When you are done, summarize what you did and provide evidence of success."""
                         "status": result.status.value,
                         "output_len": len(result.output),
                     }
+                    if call.tool_name == "run_command":
+                        # Phase 10.5: the exact command rides on the result
+                        # event for the convergence governor's repeated-command
+                        # detection.
+                        event_data["command"] = str(call.arguments.get("command", ""))
                     if result.exit_code is not None:
                         event_data["exit_code"] = result.exit_code
                     if result.error:
                         event_data["error"] = result.error
                     if result.stderr:
                         event_data["stderr"] = result.stderr
+                    # Phase 10.5: structured git metadata (commit_hash, remote,
+                    # branch, ...) travels on the event so dashboards can show
+                    # evidence-backed Git state instead of model prose.
+                    if result.metadata:
+                        event_data["metadata"] = dict(result.metadata)
 
-                    await self.event_bus.emit(
-                        Event(
-                            type="tool.result",
-                            source="agent_loop",
-                            data=event_data,
-                        )
-                    )
+                    await self._emit_event("tool.result", event_data)
 
                     # Check if we've hit tool call limit
                     if len(task.tool_calls) >= self.config.max_tool_calls:
@@ -1673,15 +1973,41 @@ When you are done, summarize what you did and provide evidence of success."""
                     continue
 
                 # When the model finishes with text only (no tool calls in this
-                # iteration) and the nudge budget is exhausted, skip all pending
-                # TODOs — the model chose to complete without further tool use.
+                # iteration), the remaining pending TODOs are evaluated:
+                #
+                # - OPTIONAL TODOs: always skipped (model finished, optional work
+                #   not performed).
+                # - REQUIRED TODOs with no tool surface / empty workspace:
+                #   skipped with authorization (work was physically impossible).
+                # - REQUIRED TODOs when nudge budget is exhausted: NOT skipped.
+                #   The completion invariant below correctly classifies this as
+                #   PARTIAL — "model stopped responding" is not the same as
+                #   "work is done". Required work that did not happen must
+                #   remain PENDING so the user sees the honest gap.
+                # - All other required TODOs: NOT skipped; the completion
+                #   invariant below decides whether PARTIAL or FAILED is honest.
                 if not iter_calls:
+                    cannot_work = (
+                        not self.tools or not self._workspace_has_files()
+                    )
                     for item in task.task_plan.items:
-                        if item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
-                            task.task_plan.skip_id(
-                                item.id,
-                                "Model completed with text response; no tool evidence",
-                            )
+                        if item.status not in (
+                            TodoStatus.PENDING, TodoStatus.IN_PROGRESS
+                        ):
+                            continue
+                        # Nudge exhaustion does NOT authorize skipping required
+                        # work — only the absence of a tool surface does.
+                        if item.required and not cannot_work:
+                            continue  # keep required work pending for invariant check
+                        if cannot_work and item.required:
+                            skip_reason = "No tool surface / empty workspace; work not performable"
+                        else:
+                            skip_reason = "Optional work not performed; model finished with text response"
+                        task.task_plan.skip_id(
+                            item.id,
+                            skip_reason,
+                            authorized=cannot_work,
+                        )
 
                 # HARD INVARIANT: TOOL FAILURE ≠ TASK SUCCESS
                 # The runtime execution results are the source of truth.
@@ -1713,7 +2039,6 @@ When you are done, summarize what you did and provide evidence of success."""
                     break
 
                 # Verification phase — truthful completion requires evidence.
-                task.result = response.content
                 await self._verify_task_completion(task)
                 if task.status == TaskStatus.FAILED:
                     await self._reconcile_todos(task)
@@ -1732,28 +2057,40 @@ When you are done, summarize what you did and provide evidence of success."""
                 # Reconcile remaining TODOs against real execution evidence
                 await self._reconcile_todos(task)
 
-                # COMPLETION INVARIANT
+                # COMPLETION INVARIANT (Phase 10.6)
                 # No code path sets COMPLETED without passing through
-                # can_complete_task. 4/5 is not completion; the runtime
-                # is the source of truth, not the model's text.
+                # can_complete_task. 3/5 is not completion; the runtime is
+                # the source of truth, not the model's text. When required
+                # work merely *did not happen* (nothing failed), the honest
+                # terminal state is PARTIAL — never COMPLETE, never FAILED.
                 if not can_complete_task(task):
                     blockers = completion_blockers(task)
-                    task.status = TaskStatus.FAILED
-                    task.error = (
-                        "Task cannot be marked complete: " + "; ".join(blockers)
-                    )
-                    await self.event_bus.emit(
-                        Event(
-                            type="task.failed",
-                            source="agent_loop",
-                            data={
-                                "task_id": task.id,
-                                "reason": "completion_invariant_violated",
-                                "blockers": blockers,
-                                "completed_todos": task.task_plan.completed_count,
-                                "total_todos": task.task_plan.total_count,
-                            },
+                    failed_required = [
+                        i for i in task.task_plan.items
+                        if i.required and i.status == TodoStatus.FAILED
+                    ]
+                    if failed_required or task.execution_stats.has_unresolved_failures:
+                        task.status = TaskStatus.FAILED
+                        task.failure_reason = "required_work_failed"
+                        await self.event_bus.emit(
+                            Event(
+                                type="task.failed",
+                                source="agent_loop",
+                                data={
+                                    "task_id": task.id,
+                                    "reason": "required_work_failed",
+                                    "blockers": blockers,
+                                    "completed_todos": task.task_plan.completed_count,
+                                    "total_todos": task.task_plan.total_count,
+                                },
+                            )
                         )
+                    else:
+                        task.status = TaskStatus.PARTIAL
+                        task.failure_reason = "required_work_incomplete"
+                    task.error = (
+                        "Task ended without completing all required work: "
+                        + "; ".join(blockers)
                     )
                     break
 
@@ -1838,11 +2175,28 @@ When you are done, summarize what you did and provide evidence of success."""
 
         if task.status not in (
             TaskStatus.COMPLETED, TaskStatus.FAILED,
-            TaskStatus.PAUSED, TaskStatus.CANCELLED,
+            TaskStatus.PAUSED, TaskStatus.CANCELLED, TaskStatus.PARTIAL,
         ):
             if self._consecutive_denials >= 3:
                 task.status = TaskStatus.FAILED
                 task.error = task.error or "Task blocked by permission policy"
+            elif (
+                not task.execution_stats.has_unresolved_failures
+                and not [
+                    i for i in task.task_plan.items
+                    if i.required and i.status == TodoStatus.FAILED
+                ]
+            ):
+                # Phase 10.6: nothing actually failed — the run simply ended
+                # before all required work completed. PARTIAL is honest;
+                # FAILED would claim a failure that did not happen and
+                # COMPLETE would claim work that did not happen.
+                task.status = TaskStatus.PARTIAL
+                task.failure_reason = "required_work_incomplete"
+                task.error = (
+                    task.error
+                    or "Iteration budget reached before all required work completed."
+                )
             else:
                 task.status = TaskStatus.FAILED
                 task.error = task.error or "Max iterations reached"

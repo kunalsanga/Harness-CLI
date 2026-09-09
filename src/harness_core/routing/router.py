@@ -177,6 +177,7 @@ class ModelRouter:
     def _build_scoring_context(
         self,
         request: CompletionRequest,
+        active_routing_mode: str,
     ) -> ScoringContext:
         """Build scoring context from a completion request.
 
@@ -194,7 +195,25 @@ class ModelRouter:
         needs_vision = False
 
         # Determine prefer_free based on routing mode
-        prefer_free = self.config.prefer_free or self.config.routing_mode == "free"
+        prefer_free = self.config.prefer_free or active_routing_mode == "free"
+
+        # Phase 10: honor per-agent model_policy values passed through
+        # routing_mode_override (e.g. "reasoning_high", "coding", "fast").
+        # Role policies are mapped onto the existing scoring vocabulary so
+        # the 14-dimension ranking actually prefers the right model class.
+        policy = (active_routing_mode or "auto").lower()
+        policy_tags_by_mode = {
+            "reasoning_high": ("reasoning", "plan"),
+            "reasoning": ("reasoning", "plan"),
+            "coding": ("coding",),
+            "implementation": ("coding",),
+            "fast": ("fast",),
+            "cheap": ("fast",),
+        }
+        policy_tags = policy_tags_by_mode.get(policy, ())
+        if policy in ("fast", "cheap") and not request.model:
+            # Fast/cheap agents prefer free models unless the user pinned one.
+            prefer_free = True
 
         # Use TaskAwareRouter for classification if available
         task_type = ""
@@ -231,6 +250,10 @@ class ModelRouter:
             task_tags.append("research")
         if any(kw in task_lower for kw in ["design", "architect", "plan", "reason"]):
             task_tags.append("reasoning")
+        # Policy tags take precedence over content heuristics.
+        for tag in policy_tags:
+            if tag not in task_tags:
+                task_tags.append(tag)
 
         # Estimate context size from messages
         est_tokens = sum(
@@ -246,7 +269,7 @@ class ModelRouter:
             requires_vision=needs_vision,
             estimated_context_tokens=est_tokens,
             prefer_free=prefer_free,
-            routing_mode=self.config.routing_mode,
+            routing_mode=active_routing_mode,
             task_tags=task_tags,
             # New 14-dimension fields
             task_type=task_type,
@@ -261,19 +284,21 @@ class ModelRouter:
     async def select_models(
         self,
         request: CompletionRequest,
+        routing_mode_override: str | None = None,
     ) -> list[tuple[str, ModelProvider]]:
         """Select an ordered chain of (model_id, provider) for fallback.
 
         Returns at least one model if any are available.
         In free mode, only free models are considered — never falls back to paid.
         """
+        active_routing_mode = routing_mode_override or self.config.routing_mode
         models = await self.refresh_models()
-        ctx = self._build_scoring_context(request)
+        ctx = self._build_scoring_context(request, active_routing_mode)
 
         # Filter
         filtered = self._filter_models(models, ctx)
         if not filtered:
-            if self.config.routing_mode == "free":
+            if active_routing_mode == "free":
                 # In free mode: DO NOT fall back to paid models
                 # Return empty chain so the error is clear
                 return []
@@ -295,7 +320,7 @@ class ModelRouter:
                 selected_model=model.id,
                 selected_provider=model.provider,
                 score=score,
-                routing_mode=self.config.routing_mode,
+                routing_mode=active_routing_mode,
             )
             self._routing_decisions.append(decision)
 
@@ -307,7 +332,7 @@ class ModelRouter:
                     "model": model.id,
                     "provider": model.provider,
                     "score": round(score, 3),
-                    "mode": self.config.routing_mode,
+                    "mode": active_routing_mode,
                     "alternatives": [
                         {"model": m.id, "score": round(s, 3)}
                         for m, s in ranked[1:5]
@@ -343,7 +368,7 @@ class ModelRouter:
         # credits this account does not have (402 Payment Required). Ensure
         # top-ranked free models are reachable in the chain so fallback can
         # land on a usable model instead of failing the whole task.
-        if self.config.routing_mode != "free" and ranked:
+        if active_routing_mode != "free" and ranked:
             min_free_slots = max(2, limit // 2)
             free_in_chain = sum(1 for m in chain_models if m.is_free)
             if free_in_chain < min_free_slots:
@@ -376,19 +401,25 @@ class ModelRouter:
     async def execute(
         self,
         request: CompletionRequest,
+        routing_mode_override: str | None = None,
     ) -> FallbackResult:
         """Route and execute a completion request.
 
-        Selects models, builds fallback chain, and executes with retry/fallback.
+        Args:
+            request: The completion request.
+            routing_mode_override: Optional per-request routing mode override
+                (e.g., from an AgentProfile).
         """
+        active_routing_mode = routing_mode_override or self.config.routing_mode
+
         # Check overall budget
         ok, reason = self.budget.check_all()
         if not ok:
             return FallbackResult(final_error=f"Budget exceeded: {reason}")
 
-        chain = await self.select_models(request)
+        chain = await self.select_models(request, routing_mode_override)
         if not chain:
-            if self.config.routing_mode == "free":
+            if active_routing_mode == "free":
                 return FallbackResult(
                     final_error=(
                         "No usable free model available. "

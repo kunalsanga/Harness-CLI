@@ -6,7 +6,7 @@ import fnmatch
 from pathlib import Path
 from typing import Any
 
-from harness_core.agent.types import ToolResult, ToolResultStatus
+from harness_core.agent.types import ToolResult, ToolResults
 from harness_core.tools.base import Tool, ToolSchema
 
 
@@ -42,10 +42,9 @@ class GlobTool(Tool):
             search_path = Path(arguments.get("path", "."))
 
             if not search_path.exists():
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=f"Path not found: {search_path}",
+                return ToolResults.error(
+                    f"Path not found: {search_path}",
+                    retryable=False,
                 )
 
             matches = sorted(
@@ -55,13 +54,12 @@ class GlobTool(Tool):
                 and not any(part.startswith(".") for part in p.parts)
             )
 
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS,
-                output="\n".join(matches[:200]) if matches else "(no matches)",
+            return ToolResults.success(
+                "\n".join(matches[:200]) if matches else "(no matches)",
                 metadata={"count": len(matches)},
             )
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
 
 
 class GrepTool(Tool):
@@ -98,10 +96,9 @@ class GrepTool(Tool):
             include = arguments.get("include", "*")
 
             if not search_path.exists():
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=f"Path not found: {search_path}",
+                return ToolResults.error(
+                    f"Path not found: {search_path}",
+                    retryable=False,
                 )
 
             results = []
@@ -131,10 +128,9 @@ class GrepTool(Tool):
                     break
 
             output = "\n".join(results) if results else "(no matches)"
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS,
-                output=output,
+            return ToolResults.success(
+                output,
                 metadata={"files_searched": files_searched, "matches": len(results)},
             )
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)

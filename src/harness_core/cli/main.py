@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -89,6 +89,9 @@ permissions:
   edit: allow
   network: ask
   git_push: ask
+
+memory:
+  enabled: true
 """
     config_file.write_text(config_content, encoding="utf-8")
     console.print(f"[green][OK] Created {config_file}[/]")
@@ -188,10 +191,12 @@ def run(
         # Load project config if available
         router_config = RouterConfig()
         config_file = Path(".harness/config.yaml")
+        config_data: dict = {}
         if config_file.exists():
             try:
                 import yaml
                 raw = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+                config_data = raw
                 routing_data = raw.get("routing", {})
                 budgets_data = raw.get("budgets", {})
                 if routing_data:
@@ -230,7 +235,7 @@ def run(
             task_aware=task_aware,
         )
 
-        if not headless:
+        if not headless and mode != "unified":
             async def log_event(event: Event) -> None:
                 if event.type == "task.started":
                     console.print(f"\n[bold blue]>> Task:[/] {event.data.get('goal', '')}")
@@ -279,9 +284,121 @@ def run(
 
         ws = str(Path.cwd())
 
+        # Unified runtime mode (Phase 9): CLI -> EngineeringRuntime, which owns
+        # the full project lifecycle (requirements -> plan -> TaskGraph ->
+        # Scheduler -> recovery -> verification) and coordinates the existing
+        # authorities. Legacy modes below are preserved unchanged.
+        if mode == "unified":
+            from harness_core.cli.runtime_dashboard import (
+                LiveTerminalUI,
+                RuntimeViewModel,
+                render_failure_summary,
+                render_startup_panel,
+                render_success_summary,
+            )
+            from harness_core.memory.manager import init_memory_manager_from_project
+            from harness_core.runtime.runtime import EngineeringRuntime
+
+            memory = None
+            if config_file.exists():
+                memory = init_memory_manager_from_project(Path.cwd(), config=config_data)
+                if memory is not None and not headless and not json_output:
+                    console.print("[dim]Persistent project memory: enabled[/]")
+            project_id = str(Path.cwd().resolve())
+
+            runtime = EngineeringRuntime(
+                workspace_path=ws,
+                provider=provider,
+                plan_provider=provider,
+                event_bus=event_bus,
+                router=router,
+                memory=memory,
+                project_id=project_id,
+                max_concurrency=max_parallel,
+            )
+            holder["runtime"] = runtime  # captured for Ctrl+C cleanup
+
+            # Phase 10: professional live engineering dashboard.  The view
+            # model is a pure adapter over real EventBus events — the UI never
+            # fabricates agent activity or progress.
+            interactive_ui = not headless and not json_output
+            plain_ui = (
+                headless
+                or json_output
+                or bool(os.environ.get("NO_COLOR"))
+                or not sys.stdout.isatty()
+            )
+            vm = RuntimeViewModel()
+            live_ui: LiveTerminalUI | None = None
+            if interactive_ui:
+                render_startup_panel(
+                    console,
+                    ws,
+                    {
+                        "provider": provider is not None,
+                        "router": router is not None,
+                        "workspace": True,
+                        "memory": memory is not None
+                        and bool(getattr(memory, "enabled", False)),
+                        "runtime": True,
+                    },
+                    plain=plain_ui,
+                )
+                console.print("")
+                console.print("  [bold]Harness[/]")
+                console.print(
+                    "  I'll inspect the existing project first, then plan the architecture, "
+                    "implement the independent components in parallel where possible, "
+                    "run the test suite, and verify the result before declaring success."
+                )
+                console.print("")
+                live_ui = LiveTerminalUI(console, plain=plain_ui)
+
+            vm.attach(event_bus)
+            if live_ui is not None:
+                live_ui.start(vm)
+
+                async def _on_event_refresh(event: Any) -> None:
+                    live_ui.update(vm)
+
+                event_bus.on("*", _on_event_refresh)
+
+            outcome = await runtime.run(goal)
+
+            if live_ui is not None:
+                event_bus.off("*", _on_event_refresh)
+                live_ui.stop(vm)
+            vm.finalize(outcome)
+
+            if json_output:
+                snapshot = outcome.state.to_dict()
+                console.print(json.dumps(snapshot, indent=2), soft_wrap=True)
+            elif outcome.status.value == "success":
+                render_success_summary(console, vm, outcome, plain=plain_ui)
+            else:
+                render_failure_summary(console, vm, outcome, plain=plain_ui)
+
+            await provider.close()
+
+            if outcome.status.value != "success":
+                raise typer.Exit(code=1)
+            return
+
         # Multi-agent mode
         if mode == "multi-agent":
             from harness_core.agents.orchestrator import Orchestrator, ExecutionMode, AgentBudget
+            # Phase 8 integration: persistent project memory.
+            # Enabled by default for initialised projects (.harness/config.yaml);
+            # opt out with `memory: {enabled: false}` in that file. Memory is
+            # best-effort only — initialisation failures degrade silently and
+            # never abort the run (see init_memory_manager_from_project).
+            memory = None
+            if config_file.exists():
+                from harness_core.memory.manager import init_memory_manager_from_project
+                memory = init_memory_manager_from_project(Path.cwd(), config=config_data)
+                if memory is not None and not headless and not json_output:
+                    console.print("[dim]Persistent project memory: enabled[/]")
+            project_id = str(Path.cwd().resolve())
 
             budget = AgentBudget(
                 max_agents=max_agents,
@@ -298,6 +415,8 @@ def run(
                 event_bus=event_bus,
                 workspace_path=ws,
                 budget=budget,
+                memory=memory,
+                project_id=project_id,
             )
 
             with Progress(
@@ -402,7 +521,26 @@ def run(
         if result.status.value != "completed":
             raise typer.Exit(code=1)
 
-    asyncio.run(_run())
+    # Phase 10: professional Ctrl+C handling.  asyncio.run unwinds on
+    # KeyboardInterrupt and tears down tasks scheduled from inside the
+    # cancelled coroutine, so the interruption cleanup (agents stopped,
+    # locks released, state preserved) is re-run here on a fresh loop.
+    holder: dict[str, Any] = {"runtime": None}
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        from harness_core.cli.runtime_dashboard import render_cancelled_summary
+
+        runtime_obj = holder.get("runtime")
+        if runtime_obj is not None:
+            try:
+                asyncio.run(runtime_obj.request_cancel("User cancelled (Ctrl+C)"))
+            except Exception:
+                pass
+        console.print("")
+        render_cancelled_summary(console)
+        raise typer.Exit(code=130)
 
 
 @app.command(name="shell")

@@ -16,8 +16,9 @@ import enum
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
+from harness_core.agents.locks import WorkspaceResource
 
 # ── Enums ────────────────────────────────────────────────────────────────
 
@@ -31,39 +32,67 @@ class AgentRole(enum.Enum):
     TESTER = "tester"
     REVIEWER = "reviewer"
     DEBUGGER = "debugger"
+    ARCHITECT = "architect"
+    UI_DESIGNER = "ui_designer"
+    FRONTEND = "frontend"
+    BACKEND = "backend"
+    DATABASE = "database"
+    INTEGRATION = "integration"
+    SECURITY_REVIEWER = "security_reviewer"
+    VERIFIER = "verifier"
+    GIT_RELEASE = "git_release"
+
+
+class WorkspaceScope(enum.Enum):
+    """Logical workspace scopes."""
+    PROJECT = "project"
+    FRONTEND = "frontend"
+    BACKEND = "backend"
+    DATABASE = "database"
+    TESTS = "tests"
+    DOCS = "docs"
+    READ_ONLY = "read_only"
 
 
 class AgentStatus(enum.Enum):
     """Agent lifecycle states."""
-    IDLE = "idle"
+    CREATED = "created"
+    QUEUED = "queued"
     PLANNING = "planning"
     RUNNING = "running"
     WAITING = "waiting"
+    BLOCKED = "blocked"
+    REVIEWING = "reviewing"
+    VERIFYING = "verifying"
     COMPLETED = "completed"
     FAILED = "failed"
-    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
 
 
 class TaskStatus(enum.Enum):
     """Subtask lifecycle states."""
-    PENDING = "pending"
+    CREATED = "created"
+    BLOCKED = "blocked"
     READY = "ready"
+    QUEUED = "queued"
     RUNNING = "running"
+    WAITING = "waiting"
+    REVIEWING = "reviewing"
+    VERIFYING = "verifying"
     COMPLETED = "completed"
     FAILED = "failed"
-    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 class MessageType(enum.Enum):
     """Inter-agent message types."""
-    REQUEST = "request"
-    RESULT = "result"
-    QUESTION = "question"
-    WARNING = "warning"
-    ERROR = "error"
     HANDOFF = "handoff"
-    REVIEW = "review"
-    APPROVAL = "approval"
+    RESULT = "result"
+    REQUEST = "request"
+    INFORMATION = "information"
+    BLOCKED = "blocked"
+    REVIEW_REQUEST = "review_request"
+    VERIFICATION_REQUEST = "verification_request"
 
 
 class ReviewVerdict(enum.Enum):
@@ -85,7 +114,7 @@ class SubTask:
     role: AgentRole = AgentRole.CODER
     dependencies: list[str] = field(default_factory=list)
     priority: int = 0
-    status: TaskStatus = TaskStatus.PENDING
+    status: TaskStatus = TaskStatus.CREATED
     assigned_agent: str = ""
     result: str = ""
     error: str = ""
@@ -96,20 +125,30 @@ class SubTask:
     duration_ms: float = 0.0
     tool_calls: int = 0
     iterations: int = 0
+    resources: list[WorkspaceResource] = field(default_factory=list)
+    # Phase 9: runtime-assembled context for this task (requirements, traces,
+    # artifact refs, handoffs). Provided by EngineeringRuntime; the task graph
+    # remains the single source of task state — this is auxiliary prompt data.
+    runtime_context: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
             "description": self.description,
             "role": self.role.value,
-            "status": self.status.value,
             "dependencies": self.dependencies,
-            "priority": self.priority,
+            "status": self.status.value,
             "assigned_agent": self.assigned_agent,
+            "result": self.result,
+            "error": self.error,
             "files_changed": self.files_changed,
             "model_id": self.model_id,
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
+            "duration_ms": self.duration_ms,
             "tool_calls": self.tool_calls,
             "iterations": self.iterations,
+            "resources": [r.to_dict() for r in self.resources],
         }
 
 
@@ -138,7 +177,7 @@ class TaskGraph:
         """Get tasks whose dependencies are all completed."""
         ready = []
         for task in self.tasks.values():
-            if task.status != TaskStatus.PENDING:
+            if task.status != TaskStatus.CREATED:
                 continue
             deps_met = all(
                 self.tasks.get(dep) is not None
@@ -150,6 +189,30 @@ class TaskGraph:
                 ready.append(task)
         return ready
 
+    def update_task_status(self, task_id: str, status: TaskStatus, error: str = "") -> None:
+        """Update a task's status and handle cascading effects."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+
+        task.status = status
+        if error:
+            task.error = error
+
+        if status == TaskStatus.FAILED:
+            self._propagate_status(task_id, TaskStatus.BLOCKED, f"Dependency {task_id} failed.")
+        elif status == TaskStatus.CANCELLED:
+            self._propagate_status(task_id, TaskStatus.CANCELLED, f"Dependency {task_id} cancelled.")
+
+    def _propagate_status(self, task_id: str, status: TaskStatus, reason: str) -> None:
+        """Recursively apply a status to all dependents."""
+        dependents = self.get_dependents(task_id)
+        for dep in dependents:
+            if dep.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED) and dep.status != status:
+                dep.status = status
+                dep.error = reason
+                self._propagate_status(dep.task_id, status, reason)
+
     def get_completed_count(self) -> int:
         return sum(1 for t in self.tasks.values() if t.status == TaskStatus.COMPLETED)
 
@@ -160,9 +223,9 @@ class TaskGraph:
         return len(self.tasks)
 
     def is_complete(self) -> bool:
-        """Check if all tasks are completed, failed, or skipped."""
+        """Check if all tasks are completed, failed, or cancelled."""
         return all(
-            t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.SKIPPED)
+            t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
             for t in self.tasks.values()
         )
 
@@ -175,6 +238,54 @@ class TaskGraph:
             t for t in self.tasks.values()
             if task_id in t.dependencies
         ]
+
+    def insert_recovery_sequence(self, failed_task_id: str, recovery_tasks: list[SubTask]) -> None:
+        """
+        Mutate graph to insert recovery tasks.
+        The recovery tasks will execute, and the last recovery task will re-trigger
+        dependents of the failed task.
+        """
+        if failed_task_id not in self.tasks:
+            raise ValueError(f"Failed task {failed_task_id} not found in graph.")
+
+        failed_task = self.tasks[failed_task_id]
+
+        # We don't overwrite the original task status if it's FAILED (immutable history).
+        # We just insert new tasks.
+
+        # Let's make the first recovery task have NO dependencies on the FAILED task,
+        # but depend on whatever the failed task depended on, so it can start immediately.
+        if recovery_tasks:
+            recovery_tasks[0].dependencies = list(failed_task.dependencies)
+
+            # Chain them together
+            for i in range(1, len(recovery_tasks)):
+                recovery_tasks[i].dependencies.append(recovery_tasks[i-1].task_id)
+
+            for t in recovery_tasks:
+                self.tasks[t.task_id] = t
+
+            # Update dependents to point to the last recovery task
+            dependents = [t for t in self.tasks.values() if failed_task_id in t.dependencies and t.task_id not in [rt.task_id for rt in recovery_tasks]]
+            last_recovery_task = recovery_tasks[-1]
+
+            for dep in dependents:
+                dep.dependencies.remove(failed_task_id)
+                dep.dependencies.append(last_recovery_task.task_id)
+
+                # We also need to recursively unblock them!
+                self._unblock_dependents(dep.task_id)
+
+    def _unblock_dependents(self, task_id: str) -> None:
+        """Recursively reset BLOCKED tasks back to CREATED."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+        if task.status in (TaskStatus.BLOCKED, TaskStatus.CANCELLED, TaskStatus.FAILED):
+            task.status = TaskStatus.CREATED
+            task.error = ""
+            for dep in self.get_dependents(task_id):
+                self._unblock_dependents(dep.task_id)
 
     def validate(self) -> list[str]:
         """Validate the graph for issues. Returns list of error messages."""
@@ -291,23 +402,75 @@ class AgentResult:
 class AgentMessage:
     """Structured inter-agent communication."""
 
-    message_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    sender: str = ""
-    receiver: str = ""
-    task_id: str = ""
-    message_type: MessageType = MessageType.RESULT
-    content: str = ""
-    artifacts: list[str] = field(default_factory=list)
-    data: dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
+    message_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    sender_agent_id: str = ""
+    sender_task_id: str = ""
+    recipient_agent_id: str = ""
+    recipient_task_id: str = ""
+    message_type: MessageType = MessageType.INFORMATION
+    payload: dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    correlation_id: str = ""
+    parent_message_id: str = ""
+    schema_version: str = "1.0"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "message_id": self.message_id,
-            "sender": self.sender,
-            "receiver": self.receiver,
-            "task_id": self.task_id,
+            "sender_agent_id": self.sender_agent_id,
+            "sender_task_id": self.sender_task_id,
+            "recipient_agent_id": self.recipient_agent_id,
+            "recipient_task_id": self.recipient_task_id,
             "message_type": self.message_type.value,
-            "content": self.content[:200],
-            "timestamp": self.timestamp,
+            "payload": self.payload,
+            "created_at": self.created_at,
+            "correlation_id": self.correlation_id,
+            "parent_message_id": self.parent_message_id,
+            "schema_version": self.schema_version,
+        }
+
+
+@dataclass
+class AgentContract:
+    """Explicit contract defining an agent's execution parameters and constraints."""
+
+    agent_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    role: AgentRole = AgentRole.CODER
+    task_id: str = ""
+    objective: str = ""
+    inputs: list[str] = field(default_factory=list)
+    allowed_tools: list[str] = field(default_factory=list)
+    denied_tools: list[str] = field(default_factory=list)
+    workspace_scope: WorkspaceScope = WorkspaceScope.PROJECT
+    dependencies: list[str] = field(default_factory=list)
+    expected_outputs: list[str] = field(default_factory=list)
+    success_criteria: list[str] = field(default_factory=list)
+    model_policy: str = "auto"
+    timeout_seconds: float = 300.0
+    budget_cost: float = 1.0
+    system_instructions: str = ""
+    output_requirements: list[str] = field(default_factory=list)
+    resources: list[WorkspaceResource] = field(default_factory=list)
+    # Phase 9: runtime-assembled project context injected into the prompt.
+    runtime_context: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "role": self.role.value,
+            "task_id": self.task_id,
+            "objective": self.objective,
+            "inputs": self.inputs,
+            "allowed_tools": self.allowed_tools,
+            "denied_tools": self.denied_tools,
+            "workspace_scope": self.workspace_scope.value,
+            "dependencies": self.dependencies,
+            "expected_outputs": self.expected_outputs,
+            "success_criteria": self.success_criteria,
+            "model_policy": self.model_policy,
+            "timeout_seconds": self.timeout_seconds,
+            "budget_cost": self.budget_cost,
+            "system_instructions": self.system_instructions,
+            "output_requirements": self.output_requirements,
+            "resources": [r.to_dict() for r in self.resources],
         }

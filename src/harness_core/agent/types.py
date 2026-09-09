@@ -20,6 +20,9 @@ class TaskStatus(Enum):
     EVALUATING = "evaluating"
     RECOVERING = "recovering"
     COMPLETED = "completed"
+    # Phase 10.6: work ended with required tasks still unresolved and
+    # nothing *failed*. NEVER rendered as success — only PARTIAL is honest.
+    PARTIAL = "partial"
     FAILED = "failed"
     CANCELLED = "cancelled"
     PAUSED = "paused"
@@ -330,15 +333,30 @@ class TaskPlan:
             return item
         return None
 
-    def skip_id(self, todo_id: str, reason: str = "") -> TodoItem | None:
+    def skip_id(
+        self,
+        todo_id: str,
+        reason: str = "",
+        *,
+        authorized: bool = False,
+    ) -> TodoItem | None:
+        """Mark a TODO as SKIPPED.
+
+        Phase 10.6 trust rule: a REQUIRED TODO can only be skipped when the
+        caller is runtime code with evidence (``authorized=True``). A model
+        text response can never waive required work — it would let 3/5 render
+        as COMPLETE.
+        """
         item = self.get(todo_id)
-        if item and item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
-            item.status = TodoStatus.SKIPPED
-            item.completed_at = time.time()
-            if reason:
-                item.error = reason
-            return item
-        return None
+        if item is None or item.status not in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
+            return None
+        if item.required and not authorized:
+            return None  # required work cannot be waived without authorization
+        item.status = TodoStatus.SKIPPED
+        item.completed_at = time.time()
+        if reason:
+            item.error = reason
+        return item
 
     def skip_dependents(self, todo_id: str, reason: str = "dependency failed") -> list[TodoItem]:
         """Mark every TODO whose dependency chain includes `todo_id` as SKIPPED.
@@ -364,7 +382,9 @@ class TaskPlan:
         for item_id in affected:
             if item_id == todo_id:
                 continue
-            s = self.skip_id(item_id, reason)
+            # Dependency failure is runtime evidence: dependents are
+            # legitimately skipped rather than blindly executed.
+            s = self.skip_id(item_id, reason, authorized=True)
             if s is not None:
                 skipped.append(s)
         return skipped
@@ -535,3 +555,239 @@ class AgentConfig:
     autonomous_mode: bool = True
     verbose: bool = False
     verify_on_complete: bool = True
+    # Hard ceiling on the estimated prompt tokens the agent may send in one
+    # request. The loop trims history until the assembled message list fits,
+    # so this is an enforced limit rather than a hint. Keep it comfortably
+    # below the smallest context window the router may select.
+    context_token_budget: int = 120_000
+
+
+# ── Canonical ToolResult constructors ─────────────────────────────────────────────────────
+# Use these instead of constructing ToolResult(...) directly in tool implementations.
+# Every tool in the runtime must use these factories so that the contract is uniform
+# and the runtime can reason about results without inspecting unstructured error strings.
+
+
+class ToolResults:
+    """Canonical constructors for ToolResult.
+
+    Use these in every tool implementation so that the runtime gets consistent,
+    structured results regardless of which tool produced them.  These factories
+    document the expected shape of each result type and keep all the defaults
+    in one place.
+
+    ToolResult fields
+    ──────────────────
+    status       : ToolResultStatus (required)
+    output       : str  — stdout / content; empty string when there is none
+    error        : str | None  — human-readable explanation of what went wrong
+    metadata     : dict  — structured operation-specific data
+    retryable    : bool  — True = transient; runtime should retry
+    exit_code    : int | None  — raw exit code from a subprocess; None for tools
+                                 that do not spawn subprocesses
+    stderr       : str | None  — raw stderr from a subprocess; None otherwise
+    """
+
+    # ── Success ───────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def success(
+        output: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        exit_code: int | None = None,
+        stderr: str | None = None,
+    ) -> ToolResult:
+        """Command/tool completed successfully."""
+        return ToolResult(
+            status=ToolResultStatus.SUCCESS,
+            output=output,
+            metadata=metadata or {},
+            exit_code=exit_code,
+            stderr=stderr,
+        )
+
+    # ── Errors ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def error(
+        error: str,
+        *,
+        output: str = "",
+        metadata: dict[str, Any] | None = None,
+        exit_code: int | None = None,
+        stderr: str | None = None,
+        retryable: bool = True,
+    ) -> ToolResult:
+        """Command or tool failed (non-zero exit, missing resource, etc.).
+
+        retryable=True  → transient (network glitch, flaky command). Runtime may retry.
+        retryable=False → permanent (bad path, bad arguments, logic error). Do not retry.
+        """
+        return ToolResult(
+            status=ToolResultStatus.ERROR,
+            output=output,
+            error=error,
+            metadata=metadata or {},
+            exit_code=exit_code,
+            stderr=stderr,
+            retryable=retryable,
+        )
+
+    @staticmethod
+    def permission_denied(
+        error: str = "Permission denied",
+        *,
+        output: str = "",
+    ) -> ToolResult:
+        """Call was blocked by a permission policy or workspace confinement.
+
+        These are not execution failures — the tool never ran.
+        """
+        return ToolResult(
+            status=ToolResultStatus.PERMISSION_DENIED,
+            output=output,
+            error=error,
+            retryable=False,
+        )
+
+    @staticmethod
+    def timeout(
+        error: str,
+        *,
+        timeout_seconds: float | None = None,
+        output: str = "",
+        stderr: str | None = None,
+    ) -> ToolResult:
+        """Operation exceeded its allocated time budget.
+
+        timeouts are transient — retrying with a higher timeout is reasonable.
+        """
+        meta: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            meta["timeout_seconds"] = timeout_seconds
+        return ToolResult(
+            status=ToolResultStatus.TIMEOUT,
+            output=output,
+            error=error,
+            metadata=meta,
+            retryable=True,
+            stderr=stderr,
+        )
+
+    @staticmethod
+    def network_failure(
+        error: str,
+        *,
+        output: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        """Network-level failure (DNS, connection refused, etc.).
+
+        These are always transient — retry after a short back-off.
+        """
+        return ToolResult(
+            status=ToolResultStatus.ERROR,
+            output=output,
+            error=error,
+            metadata=metadata or {},
+            retryable=True,
+        )
+
+    @staticmethod
+    def git_failure(
+        operation: str,
+        error: str,
+        *,
+        output: str = "",
+        exit_code: int | None = None,
+        stderr: str | None = None,
+        retryable: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        """Git operation failed (bad identity, auth, no remote, etc.).
+
+        Git failures are almost always permanent — the user must fix the
+        underlying configuration before retrying will succeed.
+        """
+        meta: dict[str, Any] = {"operation": operation}
+        if metadata:
+            meta.update(metadata)
+        return ToolResult(
+            status=ToolResultStatus.ERROR,
+            output=output,
+            error=error,
+            metadata=meta,
+            exit_code=exit_code,
+            stderr=stderr,
+            retryable=retryable,
+        )
+
+    @staticmethod
+    def from_exception(
+        exc: BaseException,
+        *,
+        retryable: bool = True,
+    ) -> ToolResult:
+        """Tool raised an exception during execution.
+
+        retryable=True  → unexpected / transient (OOM, race condition).
+        retryable=False → programming error, re-running will fail the same way.
+        """
+        return ToolResult(
+            status=ToolResultStatus.ERROR,
+            output="",
+            error=str(exc),
+            retryable=retryable,
+        )
+
+    @staticmethod
+    def unknown_tool(tool_name: str) -> ToolResult:
+        """Requested tool does not exist in the runtime."""
+        return ToolResult(
+            status=ToolResultStatus.ERROR,
+            output="",
+            error=f"Unknown tool: {tool_name}",
+            retryable=False,
+        )
+
+    @staticmethod
+    def missing_argument(tool_name: str, args: list[str]) -> ToolResult:
+        """Required arguments were not supplied."""
+        missing = ", ".join(args)
+        return ToolResult(
+            status=ToolResultStatus.ERROR,
+            output="",
+            error=f"{tool_name}: missing required argument(s): {missing}",
+            retryable=False,
+        )
+
+
+# ── Failure classification enums ─────────────────────────────────────────────────────
+# Used for canonical ToolResult fields.
+
+
+class Retryability(str, Enum):
+    """Retryability classification for a tool execution."""
+
+    RETRYABLE = "retryable"
+    NON_RETRYABLE = "non_retryable"
+    PERMISSION_DENIED = "permission_denied"
+    RATE_LIMITED = "rate_limited"
+    PAYMENT_REQUIRED = "payment_required"
+    UNAVAILABLE = "unavailable"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+class FailureType(str, Enum):
+    """Failure classification for a tool execution."""
+
+    EXECUTION_ERROR = "execution_error"
+    PERMISSION_DENIED = "permission_denied"
+    TIMEOUT = "timeout"
+    NETWORK_FAILURE = "network_failure"
+    UNKNOWN = "unknown"
+    TEST_FAILURE = "test_failure"
+    GIT_FAILURE = "git_failure"
+    COMMAND_SYNTAX = "command_syntax"

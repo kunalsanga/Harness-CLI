@@ -18,7 +18,7 @@ import enum
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .domain import (
     AgentMessage,
@@ -33,6 +33,9 @@ from .domain import (
 )
 from .executor import AgentExecutor
 from .registry import AgentConfig, AgentRegistry
+
+if TYPE_CHECKING:
+    from harness_core.memory.manager import MemoryManager
 
 
 class ExecutionMode(enum.Enum):
@@ -151,6 +154,8 @@ class Orchestrator:
         task_aware=None,
         event_bus=None,
         workspace_path: str = "",
+        memory: "MemoryManager | None" = None,
+        project_id: str = "",
     ) -> None:
         self.registry = registry or AgentRegistry()
         self.budget = budget or AgentBudget()
@@ -173,59 +178,68 @@ class Orchestrator:
         self._task_aware = task_aware
         self._event_bus = event_bus
         self._workspace_path = workspace_path
+        # Phase 8: Memory subsystem (optional; None = no memory)
+        self._memory = memory
+        self._project_id = project_id
 
-    def decompose_task(self, task_description: str) -> TaskGraph:
-        """Decompose a user task into a TaskGraph of subtasks.
+    async def decompose_task(self, task_description: str, context: dict[str, Any] | None = None) -> tuple[TaskGraph | None, list[str]]:
+        """Decompose a user task into a TaskGraph of subtasks via Autonomous Planner."""
+        from harness_core.planning.planner import Planner
+        from harness_core.observability.events import Event, EventBus
+        from harness_core.agents.locks import WorkspaceResource
 
-        Uses role-based heuristics to create appropriate subtasks.
-        """
+        event_bus = self._event_bus or EventBus()
+        await event_bus.emit(Event(type="planning_started", data={"task_description": task_description}))
+
+        if not self._provider:
+            return None, ["No model provider configured for planning."]
+
+        # Phase 8F: Pass memory to planner for RAG
+        planner = Planner(
+            provider=self._provider,
+            registry=self.registry,
+            memory=self._memory,
+            project_id=self._project_id,
+        )
+        result = await planner.plan(task_description, context)
+        
+        if not result.success or not result.plan:
+            await event_bus.emit(Event(type="plan_validation_failed", data={"errors": result.errors}))
+            return None, result.errors
+
+        await event_bus.emit(Event(type="planning_completed", data={"summary": result.plan.summary}))
+
         graph = TaskGraph()
+        for p_task in result.plan.tasks:
+            try:
+                role_enum = AgentRole(p_task.role.lower())
+            except ValueError:
+                # Should be caught by PlanValidator, but just in case
+                role_enum = AgentRole.CODER
 
-        # Phase 1: Research
-        research = SubTask(
-            description=f"Research codebase for: {task_description}",
-            role=AgentRole.RESEARCHER,
-            priority=10,
-        )
-        graph.add_task(research)
+            resources = []
+            for res_dict in p_task.resources:
+                if "path" in res_dict and "mode" in res_dict:
+                    resources.append(WorkspaceResource.from_dict(res_dict))
 
-        # Phase 2: Plan
-        plan = SubTask(
-            description=f"Plan implementation for: {task_description}",
-            role=AgentRole.PLANNER,
-            dependencies=[research.task_id],
-            priority=9,
-        )
-        graph.add_task(plan)
+            st = SubTask(
+                task_id=p_task.task_id,
+                description=p_task.objective,
+                role=role_enum,
+                dependencies=p_task.dependencies,
+                priority=p_task.priority,
+                resources=resources,
+            )
+            graph.add_task(st)
 
-        # Phase 3: Implement
-        implement = SubTask(
-            description=f"Implement: {task_description}",
-            role=AgentRole.CODER,
-            dependencies=[plan.task_id],
-            priority=8,
-        )
-        graph.add_task(implement)
+        # Let the TaskGraph run its own final validation (just to ensure parity)
+        errors = graph.validate()
+        if errors:
+            await event_bus.emit(Event(type="plan_validation_failed", data={"errors": errors}))
+            return None, errors
 
-        # Phase 4: Test
-        test = SubTask(
-            description="Run tests and verify implementation",
-            role=AgentRole.TESTER,
-            dependencies=[implement.task_id],
-            priority=7,
-        )
-        graph.add_task(test)
-
-        # Phase 5: Review
-        review = SubTask(
-            description="Review implementation quality",
-            role=AgentRole.REVIEWER,
-            dependencies=[test.task_id],
-            priority=6,
-        )
-        graph.add_task(review)
-
-        return graph
+        await event_bus.emit(Event(type="task_graph_created", data={"total_tasks": graph.get_total_count()}))
+        return graph, []
 
     async def execute(
         self,
@@ -248,102 +262,60 @@ class Orchestrator:
                 task_description, workspace_path or self._workspace_path, context
             )
 
-        # Multi-agent mode: decompose and execute
-        graph = self.decompose_task(task_description)
-        result.task_graph = graph
-
-        # Validate graph
-        errors = graph.validate()
-        if errors:
-            result.errors.extend(errors)
-            result.summary = f"Task decomposition failed: {'; '.join(errors)}"
+        # Multi-agent mode: autonomously plan and execute
+        graph, errors = await self.decompose_task(task_description, context)
+        
+        if errors or not graph:
+            result.errors.extend(errors or ["Unknown planning error."])
+            result.summary = f"Task decomposition failed: {'; '.join(errors or [])}"
             result.duration_ms = (time.time() - start_time) * 1000
             return result
+            
+        result.task_graph = graph
 
-        # Execute task graph
-        agent_results: dict[str, AgentResult] = {}
-        max_rounds = 20  # Safety limit
+        # Execute task graph using the new Scheduler
+        from harness_core.agents.scheduler import Scheduler
+        from harness_core.observability.events import EventBus
 
-        for round_num in range(max_rounds):
-            if graph.is_complete():
-                break
+        # Phase 8E/8G: Pass memory subsystem to scheduler for RAG-execution and memory writes
+        scheduler = Scheduler(
+            event_bus=self._event_bus or EventBus(),
+            registry=self.registry,
+            provider=self._provider,
+            tools=self._tools,
+            workspace_path=workspace_path or self._workspace_path,
+            max_concurrency=self.budget.max_parallel_agents,
+            router=self._router,
+            memory=self._memory,
+            project_id=self._project_id,
+        )
 
-            if not self.budget.can_start_agent():
-                result.warnings.append("Budget exceeded — stopping execution")
-                break
+        await scheduler.execute(graph)
 
-            ready_tasks = graph.get_ready_tasks()
-            if not ready_tasks:
-                if not graph.has_failures():
-                    result.warnings.append("No ready tasks and none failed — possible deadlock")
-                break
-
-            # Execute ready tasks
-            for task in ready_tasks:
-                task.status = TaskStatus.RUNNING
-
-                agent_config = self.registry.get_default_for_role(task.role)
-                if agent_config is None:
-                    task.status = TaskStatus.FAILED
-                    task.error = f"No agent registered for role {task.role.value}"
-                    result.errors.append(task.error)
-                    continue
-
-                agent_result = await self.executor.execute(
-                    config=agent_config,
-                    task=task,
-                    context=context,
-                    workspace_path=workspace_path or self._workspace_path,
-                    previous_results=agent_results,
-                )
-
-                agent_results[agent_config.name] = agent_result
-                self.budget.record_agent(
-                    iterations=agent_result.iterations,
-                    tool_calls=agent_result.tool_calls,
-                )
-
-                # Record message
-                self._messages.append(AgentMessage(
-                    sender=agent_config.name,
-                    task_id=task.task_id,
-                    message_type=MessageType.RESULT,
-                    content=agent_result.summary,
-                ))
-
-                if agent_result.status == AgentStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                    task.error = "; ".join(agent_result.errors)
-                    result.errors.append(f"Agent {agent_config.name} failed: {task.error}")
-
-                    # Trigger debugger for failures
-                    if self.budget.record_repair():
-                        debug_task = SubTask(
-                            description=f"Debug failure in: {task.description}",
-                            role=AgentRole.DEBUGGER,
-                            dependencies=[],
-                        )
-                        graph.add_task(debug_task)
-                else:
-                    task.status = TaskStatus.COMPLETED
-                    task.result = agent_result.summary
-                    task.files_changed = agent_result.files_changed
-                    result.files_changed.extend(agent_result.files_changed)
+        agent_results = {}
+        for agent_id, worker in scheduler.workers.items():
+            if worker._result:
+                agent_results[agent_id] = worker._result
 
         # Synthesize final result
         result.agent_results = agent_results
         result.success = graph.is_complete() and not graph.has_failures()
+        
+        for task in graph.tasks.values():
+            result.files_changed.extend(task.files_changed)
+            
         result.files_changed = list(set(result.files_changed))
 
-        # Collect test results
+        # Collect test results, reviews, and update budget
         for ar in agent_results.values():
             result.tests_passed += ar.tests_passed
             result.tests_total += ar.tests_total
-
-        # Collect review verdict
-        for ar in agent_results.values():
             if ar.review_verdict:
                 result.review_verdict = ar.review_verdict
+            self.budget.record_agent(
+                iterations=ar.iterations,
+                tool_calls=ar.tool_calls,
+            )
 
         # Build summary
         completed = graph.get_completed_count()

@@ -342,7 +342,16 @@ class TestAgentLoopFalseCompletionPrevention:
 
     @pytest.mark.asyncio
     async def test_permission_denied_does_not_block_completion(self, tmp_path: Path):
-        """Permission denied on verification doesn't prevent completion of other work."""
+        """Permission denied on verification doesn't prevent completion of other work.
+
+        Phase 10.6 contract: required work that did not happen must surface as
+        PARTIAL, not COMPLETE. The original test expected COMPLETED because
+        permission denial was treated as non-fatal, but the goal was "Write
+        code and verify" and the model never wrote code — only the test command
+        was attempted, then denied. The required work (write + verify) did not
+        happen, so the honest terminal state is PARTIAL. This test was updated
+        to reflect the new completion invariant.
+        """
         (tmp_path / "app.py").write_text("x = 1")
 
         tools = [RunCommandTool()]
@@ -386,8 +395,17 @@ class TestAgentLoopFalseCompletionPrevention:
         agent.provider.generate = AsyncMock(side_effect=mock_generate)
         task = await agent.run("Write code and verify")
 
-        # Permission denied is NOT an execution failure, so completion is allowed
-        assert task.status == TaskStatus.COMPLETED
+        # Phase 10.6: the model never wrote the code, only attempted one
+        # (denied) verification command. All required TODOs are still PENDING,
+        # so PARTIAL is the honest terminal state.
+        assert task.status == TaskStatus.PARTIAL
+        # Required TODOs are still pending — that's the evidence the work
+        # was not actually performed despite the model's claim.
+        pending = [
+            i for i in task.task_plan.items
+            if i.status.value == "pending"
+        ]
+        assert len(pending) > 0, "expected required TODOs to remain pending"
 
 
 # ─── Repetition detection ─────────────────────────────────────────────────

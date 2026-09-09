@@ -14,28 +14,19 @@ a find, but it does NOT drive each git command individually.
 
 from __future__ import annotations
 
-import asyncio
-import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from harness_core.agent.todos import (
+    _CATEGORY_TOOLS,
+    TodoSpec,
+)
 from harness_core.agent.types import (
-    FailureReason,
-    Task,
-    TaskStatus,
-    TodoItem,
-    TodoStatus,
     ToolResult,
+    ToolResults,
     ToolResultStatus,
 )
-from harness_core.agent.todos import (
-    TodoSpec,
-    fallback_todo_specs,
-    _CATEGORY_TOOLS,
-)
-
 
 # ── Context (DI surface for workflows) ─────────────────────────────────
 
@@ -53,6 +44,11 @@ class WorkflowContext:
     modified_files: list[str] = field(default_factory=list)
     git_commit: str | None = None
     git_push: str | None = None
+    # Phase 10.5: hook for the owning AgentLoop to record every tool
+    # execution as a real ToolCall (events + iteration/tool accounting).
+    # Without it, workflow-driven git/test operations were invisible to
+    # the runtime: "Commit 06a6ae3 / Push origin/main" with 0 tool calls.
+    record_tool_call: Any = None  # async (tool_name, args, result) -> None
 
 
 class ModelCaller(Protocol):
@@ -76,17 +72,25 @@ class WorkflowResult:
 
 
 async def _run_tool(ctx: WorkflowContext, name: str, **kwargs: Any) -> ToolResult:
-    """Execute a tool by name. Records success for the duplicate-op guard."""
+    """Execute a tool by name.
+
+    Records the execution through ``ctx.record_tool_call`` when the owning
+    loop supplied one, so workflow-driven operations become real ToolCalls
+    with events and iteration/tool accounting (Phase 10.5 — no invisible
+    git/test operations).
+    """
     tool = ctx.tools.get(name)
     if tool is None:
-        return ToolResult(
-            status=ToolResultStatus.ERROR,
-            output="",
-            error=f"Tool not available: {name}",
-        )
+        return ToolResults.error(f"Tool not available: {name}", retryable=False)
     args = dict(kwargs)
     args.setdefault("cwd", str(ctx.workspace))
-    return await tool.execute(args)
+    result = await tool.execute(args)
+    if ctx.record_tool_call is not None:
+        try:
+            await ctx.record_tool_call(name, args, result)
+        except Exception:
+            pass  # accounting must never break the workflow itself
+    return result
 
 
 def _category_for_op(op: str) -> str:
@@ -165,9 +169,15 @@ async def run_git_push_workflow(
         plan.fail_id(todo_ids[0], status.error or "git status failed")
         return WorkflowResult(False, "tool_failure", completed_ops)
     if status.metadata.get("clean"):
-        # Nothing to commit; report and finish truthfully
+        # Nothing to commit; report and finish truthfully. The skip is
+        # authorized runtime evidence (clean tree), so it applies to
+        # required steps too (Phase 10.6).
         for i in range(1, 4):
-            plan.skip_id(todo_ids[i], "Working tree clean — nothing to commit or push")
+            plan.skip_id(
+                todo_ids[i],
+                "Working tree clean — nothing to commit or push",
+                authorized=True,
+            )
         await _advance(6, {"op": "clean_tree"})
         return WorkflowResult(True, None, completed_ops)
     await _advance(0, {"tool": "git_status", "files": status.metadata.get("files", [])})
@@ -220,7 +230,7 @@ async def run_git_push_workflow(
         plan.fail_id(todo_ids[4], commit.error or "git commit failed")
         return WorkflowResult(False, "tool_failure", completed_ops)
     if commit.metadata.get("nothing_to_commit"):
-        plan.skip_id(todo_ids[4], "Nothing to commit")
+        plan.skip_id(todo_ids[4], "Nothing to commit", authorized=True)
     else:
         ctx.git_commit = commit.metadata.get("commit_hash")
         await _advance(4, {"commit_hash": ctx.git_commit})
@@ -280,7 +290,7 @@ async def run_test_workflow(
         plan.activate_id(todo_ids[0])
         plan.complete_id(todo_ids[0], {"op": "list"})
     else:
-        plan.skip_id(todo_ids[0], "list_files unavailable")
+        plan.skip_id(todo_ids[0], "list_files unavailable", authorized=True)
 
     # 2. Run tests
     result = await _run_tool(ctx, "run_command", command=test_command)
@@ -326,7 +336,11 @@ async def run_explain_workflow(
 
     listing = await _run_tool(ctx, "list_files", path=".")
     completed_ops.append("list_files")
-    files = (listing.metadata or {}).get("files", []) if listing.status == ToolResultStatus.SUCCESS else []
+    
+    if listing.status == ToolResultStatus.SUCCESS and listing.output:
+        files = [f.strip() for f in listing.output.split("\n") if f.strip() and f.strip() != "(empty)"]
+    else:
+        files = []
     plan.activate_id(todo_ids[0])
     plan.complete_id(todo_ids[0], {"file_count": len(files)})
 
@@ -366,6 +380,15 @@ _EXPLAIN_KEYWORDS = (
     "explain", "describe", "what does this project", "what is this project",
     "overview", "summarize", "research", "analyze this", "how does",
 )
+# Phase 10.6: modification signals that make a goal a COMPOSITE request.
+# "explain why tests fail and fix them" must not be routed to the read-only
+# explain workflow — the fix half would never execute, yet the explain plan
+# would complete and the task would be declared done.
+_COMPOSITE_HINTS = (
+    " fix ", "fix the", "fix it", "fix them", "fix this", "fix failing",
+    "and implement", "and update", "and change", "and improve", "and fix",
+    "and create", "and build", "then implement", "then fix", "and make",
+)
 
 
 def classify_workflow(goal: str) -> str | None:
@@ -389,6 +412,14 @@ def classify_workflow(goal: str) -> str | None:
         return "git_push"
     if any(k in first_5 for k in _TEST_KEYWORDS) or (is_short and any(k in g for k in _TEST_KEYWORDS)):
         return "test"
-    if any(k in first_5 for k in _EXPLAIN_KEYWORDS) or (is_short and any(k in g for k in _EXPLAIN_KEYWORDS)):
+    explain_hit = any(k in first_5 for k in _EXPLAIN_KEYWORDS) or (
+        is_short and any(k in g for k in _EXPLAIN_KEYWORDS)
+    )
+    if explain_hit:
+        # Composite request (modification half present)? Send it through the
+        # generic LLM loop so BOTH halves execute — the read-only explain
+        # workflow must never swallow a requested fix.
+        if any(k in g for k in _COMPOSITE_HINTS):
+            return None
         return "explain"
     return None

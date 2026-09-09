@@ -15,7 +15,7 @@ import asyncio
 import os
 from typing import Any
 
-from harness_core.agent.types import ToolResult, ToolResultStatus
+from harness_core.agent.types import ToolResult, ToolResults
 from harness_core.tools.base import Tool, ToolSchema
 from harness_core.tools.diagnosis import classify_git_failure
 
@@ -41,15 +41,20 @@ def _cwd(arguments: dict[str, Any], working_directory: str | None) -> str:
 
 
 def _git_error(operation: str, stdout: str, stderr: str, exit_code: int) -> ToolResult:
-    """Build a diagnosed ERROR ToolResult for a failed git operation."""
+    """Build a diagnosed canonical ERROR ToolResult for a failed git operation.
+
+    Single place where a non-zero git exit code becomes a ToolResult, so the
+    diagnosis (human-readable reason plus its structured category) is attached
+    consistently for every git tool.
+    """
     diagnosis = classify_git_failure(operation, stdout, stderr, exit_code)
-    return ToolResult(
-        status=ToolResultStatus.ERROR,
+    return ToolResults.git_failure(
+        operation,
+        diagnosis.reason,
         output=stdout,
-        error=diagnosis.reason,
         exit_code=exit_code,
         stderr=stderr if stderr else None,
-        metadata={"operation": operation},
+        metadata={"category": diagnosis.category},
     )
 
 
@@ -76,15 +81,14 @@ class GitStatusTool(Tool):
         try:
             rc, stdout, stderr = await _run_git(["status", "--short"], cwd)
         except asyncio.TimeoutError:
-            return ToolResult(status=ToolResultStatus.TIMEOUT, output="", error="git status timed out")
+            return ToolResults.timeout("git status timed out")
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
         if rc != 0:
             return _git_error("status", stdout, stderr, rc)
         files = [line for line in stdout.splitlines() if line.strip()]
-        return ToolResult(
-            status=ToolResultStatus.SUCCESS,
-            output=stdout or "(working tree clean)",
+        return ToolResults.success(
+            stdout or "(working tree clean)",
             metadata={"operation": "status", "clean": not files, "files": files},
         )
 
@@ -120,14 +124,14 @@ class GitDiffTool(Tool):
         try:
             rc, stdout, stderr = await _run_git(args, cwd)
         except asyncio.TimeoutError:
-            return ToolResult(status=ToolResultStatus.TIMEOUT, output="", error="git diff timed out")
+            return ToolResults.timeout("git diff timed out")
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
         if rc != 0:
             return _git_error("diff", stdout, stderr, rc)
         if len(stdout) > 5000:
             stdout = stdout[:5000] + "\n... (truncated)"
-        return ToolResult(status=ToolResultStatus.SUCCESS, output=stdout, metadata={"operation": "diff"})
+        return ToolResults.success(stdout, metadata={"operation": "diff"})
 
 
 class GitLogTool(Tool):
@@ -158,12 +162,15 @@ class GitLogTool(Tool):
         try:
             rc, stdout, stderr = await _run_git(["log", "--oneline", f"-{count}"], cwd)
         except asyncio.TimeoutError:
-            return ToolResult(status=ToolResultStatus.TIMEOUT, output="", error="git log timed out")
+            return ToolResults.timeout("git log timed out")
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
         if rc != 0:
             return _git_error("log", stdout, stderr, rc)
-        return ToolResult(status=ToolResultStatus.SUCCESS, output=stdout or "(no commits)", metadata={"operation": "log"})
+        return ToolResults.success(
+            stdout or "(no commits)",
+            metadata={"operation": "log"},
+        )
 
 
 class GitIdentityTool(Tool):
@@ -193,9 +200,8 @@ class GitIdentityTool(Tool):
             user_email = email_out.strip()
 
             if user_name and user_email:
-                return ToolResult(
-                    status=ToolResultStatus.SUCCESS,
-                    output=f"Git identity configured:\n  user.name: {user_name}\n  user.email: {user_email}",
+                return ToolResults.success(
+                    f"Git identity configured:\n  user.name: {user_name}\n  user.email: {user_email}",
                     metadata={"user_name": user_name, "user_email": user_email, "configured": True},
                 )
             missing = []
@@ -203,19 +209,19 @@ class GitIdentityTool(Tool):
                 missing.append("user.name")
             if not user_email:
                 missing.append("user.email")
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
-                output="",
-                error=(
+            return ToolResults.error(
+                (
                     f"Git identity is not configured. Missing: {', '.join(missing)}.\n"
                     "Configure your OWN identity with:\n"
                     "  git config user.name \"Your Name\"\n"
                     "  git config user.email \"your.email@example.com\""
                 ),
+                output="",
+                retryable=False,
                 metadata={"user_name": user_name or None, "user_email": user_email or None, "configured": False},
             )
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
 
 
 class GitRemoteTool(Tool):
@@ -241,9 +247,9 @@ class GitRemoteTool(Tool):
         try:
             rc, stdout, stderr = await _run_git(["remote", "-v"], cwd)
         except asyncio.TimeoutError:
-            return ToolResult(status=ToolResultStatus.TIMEOUT, output="", error="git remote timed out")
+            return ToolResults.timeout("git remote timed out")
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
         if rc != 0:
             return _git_error("remote", stdout, stderr, rc)
         remotes: dict[str, str] = {}
@@ -251,9 +257,8 @@ class GitRemoteTool(Tool):
             parts = line.split()
             if len(parts) >= 2:
                 remotes.setdefault(parts[0], parts[1])
-        return ToolResult(
-            status=ToolResultStatus.SUCCESS,
-            output=stdout or "(no remotes)",
+        return ToolResults.success(
+            stdout or "(no remotes)",
             metadata={"operation": "remote", "remotes": remotes},
         )
 
@@ -291,14 +296,13 @@ class GitAddTool(Tool):
         try:
             rc, stdout, stderr = await _run_git(args, cwd)
         except asyncio.TimeoutError:
-            return ToolResult(status=ToolResultStatus.TIMEOUT, output="", error="git add timed out")
+            return ToolResults.timeout("git add timed out")
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
         if rc != 0:
             return _git_error("add", stdout, stderr, rc)
-        return ToolResult(
-            status=ToolResultStatus.SUCCESS,
-            output=stdout or "Staged changes.",
+        return ToolResults.success(
+            stdout or "Staged changes.",
             metadata={"operation": "add", "files": files or ["-A"]},
         )
 
@@ -340,15 +344,15 @@ class GitCommitTool(Tool):
         forbidden_patterns = ["git config user.name", "git config user.email"]
         for pattern in forbidden_patterns:
             if pattern in message.lower():
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=(
+                return ToolResults.error(
+                    (
                         "Harness must never invent Git identity.\n"
                         "Configure user.name and user.email manually with:\n"
                         "  git config user.name \"Your Name\"\n"
                         "  git config user.email \"your.email@example.com\""
                     ),
+                    output="",
+                    retryable=False,
                 )
 
         try:
@@ -361,20 +365,19 @@ class GitCommitTool(Tool):
 
             combined = f"{stdout}\n{stderr}".lower()
             if rc != 0 and ("nothing to commit" in combined or "no changes added" in combined):
-                return ToolResult(
-                    status=ToolResultStatus.SUCCESS,
-                    output="Working tree already clean. Nothing to commit.",
+                return ToolResults.success(
+                    "Working tree already clean. Nothing to commit.",
                     metadata={"operation": "commit", "nothing_to_commit": True},
                 )
             if rc != 0 and ("please tell me who you are" in combined or "author identity unknown" in combined):
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=(
+                return ToolResults.error(
+                    (
                         "Git identity is not configured. Configure your OWN identity:\n"
                         "  git config user.name \"Your Name\"\n"
                         "  git config user.email \"your.email@example.com\""
                     ),
+                    output="",
+                    retryable=False,
                     metadata={"operation": "commit"},
                 )
             if rc != 0:
@@ -383,15 +386,14 @@ class GitCommitTool(Tool):
             commit_hash = self._parse_hash(stdout)
             branch = self._parse_branch(stdout)
             short = commit_hash[:7] if commit_hash else ""
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS,
-                output=f"Commit created {short} {message}".strip(),
+            return ToolResults.success(
+                f"Commit created {short} {message}".strip(),
                 metadata={"operation": "commit", "commit_hash": commit_hash, "branch": branch},
             )
         except asyncio.TimeoutError:
-            return ToolResult(status=ToolResultStatus.TIMEOUT, output="", error="git commit timed out")
+            return ToolResults.timeout("git commit timed out")
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
 
     @staticmethod
     def _bracket_content(output: str) -> str:
@@ -449,10 +451,10 @@ class GitPushTool(Tool):
                 rc, stdout, _ = await _run_git(["remote"], cwd)
                 remotes = [r.strip() for r in stdout.splitlines() if r.strip()]
                 if rc != 0 or not remotes:
-                    return ToolResult(
-                        status=ToolResultStatus.ERROR,
+                    return ToolResults.error(
+                        "No git remote configured.\nAdd a remote with: git remote add origin <url>",
                         output="",
-                        error="No git remote configured.\nAdd a remote with: git remote add origin <url>",
+                        retryable=False,
                         metadata={"operation": "push"},
                     )
                 remote = "origin" if "origin" in remotes else remotes[0]
@@ -462,10 +464,10 @@ class GitPushTool(Tool):
                 rc, stdout, _ = await _run_git(["branch", "--show-current"], cwd)
                 branch = stdout.strip()
                 if rc != 0 or not branch:
-                    return ToolResult(
-                        status=ToolResultStatus.ERROR,
+                    return ToolResults.error(
+                        "Not on any branch (detached HEAD). Switch to a branch first.",
                         output="",
-                        error="Not on any branch (detached HEAD). Switch to a branch first.",
+                        retryable=False,
                         metadata={"operation": "push"},
                     )
 
@@ -479,9 +481,8 @@ class GitPushTool(Tool):
                 # Verify remote state: resolve the pushed commit hash
                 _, rev_out, _ = await _run_git(["rev-parse", "HEAD"], cwd)
                 commit_hash = rev_out.strip()
-                return ToolResult(
-                    status=ToolResultStatus.SUCCESS,
-                    output=f"Pushed to {remote}/{branch}" + (f" ({commit_hash[:7]})" if commit_hash else ""),
+                return ToolResults.success(
+                    f"Pushed to {remote}/{branch}" + (f" ({commit_hash[:7]})" if commit_hash else ""),
                     exit_code=0,
                     metadata={
                         "operation": "push",
@@ -502,15 +503,14 @@ class GitPushTool(Tool):
                     "  - Set up SSH keys\n"
                     "  - Configure Git credential manager"
                 )
-            return ToolResult(
-                status=ToolResultStatus.ERROR,
+            return ToolResults.git_failure(
+                "push", error_msg,
                 output=stdout,
-                error=error_msg,
                 exit_code=rc,
-                stderr=stderr if stderr else None,
+                stderr=stderr,
                 metadata={"operation": "push", "remote": remote, "branch": branch},
             )
         except asyncio.TimeoutError:
-            return ToolResult(status=ToolResultStatus.TIMEOUT, output="", error="Push timed out after 30s")
+            return ToolResults.timeout("Push timed out after 30s", timeout_seconds=30.0)
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)

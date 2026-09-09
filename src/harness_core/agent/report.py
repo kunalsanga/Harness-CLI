@@ -19,6 +19,11 @@ def build_execution_report(task: Task, elapsed: float, files_changed: list[str])
 
     if status == TaskStatus.COMPLETED:
         lines.append(f"✓ Task completed in {_fmt_elapsed(elapsed)}")
+    elif status == TaskStatus.PARTIAL:
+        # Phase 10.6: required work remains unresolved and nothing failed.
+        # Never render this as success ("✓ Task completed").
+        lines.append("⚠ Partially completed")
+        lines.append("Some required work was not finished.")
     elif status == TaskStatus.PAUSED:
         lines.append("⚠ Model unavailable")
         lines.append("Execution state preserved.")
@@ -56,6 +61,34 @@ def build_execution_report(task: Task, elapsed: float, files_changed: list[str])
         lines.append(
             f"TODO progress: {task.task_plan.completed_count}/{task.task_plan.total_count}"
         )
+
+    if status == TaskStatus.PARTIAL:
+        completed = [i for i in task.task_plan.items if i.status == TodoStatus.COMPLETED]
+        remaining = [
+            i for i in task.task_plan.items
+            if i.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS)
+        ]
+        if completed:
+            lines.append("")
+            lines.append("Completed:")
+            for item in completed:
+                lines.append(f"  ✓ {item.description}")
+        if remaining:
+            lines.append("")
+            lines.append("Remaining:")
+            for item in remaining:
+                lines.append(f"  ☐ {item.description}")
+        lines.append("")
+        lines.append("Verification")
+        if task.verification_passed is True:
+            lines.append("  ✓ Passed")
+        elif task.verification_passed is False:
+            lines.append("  ✗ Failed")
+        else:
+            lines.append("  — Not completed")
+        lines.append("")
+        lines.append("Next action:")
+        lines.append("  Continue the remaining work or narrow the request.")
 
     if status == TaskStatus.FAILED:
         failed_items = [i for i in task.task_plan.items if i.status == TodoStatus.FAILED]
@@ -139,7 +172,11 @@ def build_execution_report(task: Task, elapsed: float, files_changed: list[str])
     if status == TaskStatus.COMPLETED:
         lines.append("")
         lines.append("Result")
-        lines.append(f"  { _result_sentence(task, files_changed) }")
+        res = (task.result or "").strip()
+        if res and not (res.startswith("Task ") and res.endswith(" completed")) and not res.startswith("Stopped:"):
+            lines.extend(f"  {line}" for line in res.splitlines())
+        else:
+            lines.append(f"  { _result_sentence(task, files_changed) }")
 
     return "\n".join(lines)
 

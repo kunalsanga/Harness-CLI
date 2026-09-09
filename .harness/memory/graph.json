@@ -1,0 +1,21 @@
+{
+  "edges": [
+    {
+      "dst": "task_1",
+      "properties": {},
+      "src": "task_1",
+      "type": "created",
+      "weight": 1.0
+    }
+  ],
+  "nodes": [
+    {
+      "id": "task_1",
+      "label": "Create artifact",
+      "properties": {
+        "outcome": "success"
+      },
+      "type": "task"
+    }
+  ]
+}

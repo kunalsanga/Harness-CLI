@@ -41,7 +41,7 @@ class TestSubTask:
     def test_create_subtask(self):
         t = SubTask(description="Fix auth bug", role=AgentRole.CODER)
         assert t.task_id
-        assert t.status == TaskStatus.PENDING
+        assert t.status == TaskStatus.CREATED
 
     def test_subtask_to_dict(self):
         t = SubTask(description="Test", role=AgentRole.TESTER)
@@ -356,17 +356,54 @@ class TestAgentBudget:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestOrchestrator:
-    def test_decompose_task(self):
-        orch = Orchestrator()
-        graph = orch.decompose_task("Implement authentication")
+    @pytest.mark.asyncio
+    async def test_decompose_task(self):
+        from unittest.mock import MagicMock
+        from harness_core.providers.base import ModelProvider, CompletionResponse
+        import json
+        
+        mock_provider = MagicMock(spec=ModelProvider)
+        valid_json = json.dumps({
+            "summary": "Plan",
+            "tasks": [
+                {"task_id": "t1", "title": "t1", "objective": "o1", "role": "researcher", "dependencies": []},
+                {"task_id": "t2", "title": "t2", "objective": "o2", "role": "planner", "dependencies": ["t1"]},
+                {"task_id": "t3", "title": "t3", "objective": "o3", "role": "coder", "dependencies": ["t2"]},
+                {"task_id": "t4", "title": "t4", "objective": "o4", "role": "tester", "dependencies": ["t3"]},
+                {"task_id": "t5", "title": "t5", "objective": "o5", "role": "reviewer", "dependencies": ["t4"]},
+            ]
+        })
+        mock_provider.generate.return_value = CompletionResponse(content=valid_json, model="test")
+        
+        orch = Orchestrator(provider=mock_provider)
+        graph, errors = await orch.decompose_task("Implement authentication")
 
+        assert not errors
         assert graph.get_total_count() >= 5  # research, plan, implement, test, review
         errors = graph.validate()
         assert len(errors) == 0  # No cycles or missing deps
 
-    def test_decompose_produces_valid_graph(self):
-        orch = Orchestrator()
-        graph = orch.decompose_task("Fix all failing tests")
+    @pytest.mark.asyncio
+    async def test_decompose_produces_valid_graph(self):
+        from unittest.mock import MagicMock
+        from harness_core.providers.base import ModelProvider, CompletionResponse
+        import json
+        
+        mock_provider = MagicMock(spec=ModelProvider)
+        valid_json = json.dumps({
+            "summary": "Plan",
+            "tasks": [
+                {"task_id": "t1", "title": "t1", "objective": "o1", "role": "researcher", "dependencies": []},
+                {"task_id": "t2", "title": "t2", "objective": "o2", "role": "planner", "dependencies": ["t1"]},
+                {"task_id": "t3", "title": "t3", "objective": "o3", "role": "coder", "dependencies": ["t2"]},
+                {"task_id": "t4", "title": "t4", "objective": "o4", "role": "tester", "dependencies": ["t3"]},
+                {"task_id": "t5", "title": "t5", "objective": "o5", "role": "reviewer", "dependencies": ["t4"]},
+            ]
+        })
+        mock_provider.generate.return_value = CompletionResponse(content=valid_json, model="test")
+        
+        orch = Orchestrator(provider=mock_provider)
+        graph, errors = await orch.decompose_task("Fix all failing tests")
 
         # Should have correct dependency chain
         order = graph.topological_sort()
@@ -385,7 +422,20 @@ class TestOrchestrator:
 
     @pytest.mark.asyncio
     async def test_execute_multi_agent_mode(self):
-        orch = Orchestrator()
+        from unittest.mock import MagicMock
+        from harness_core.providers.base import ModelProvider, CompletionResponse
+        import json
+        
+        mock_provider = MagicMock(spec=ModelProvider)
+        valid_json = json.dumps({
+            "summary": "Plan",
+            "tasks": [
+                {"task_id": "t1", "title": "t1", "objective": "o1", "role": "coder", "dependencies": []},
+            ]
+        })
+        mock_provider.generate.return_value = CompletionResponse(content=valid_json, model="test")
+        
+        orch = Orchestrator(provider=mock_provider)
         result = await orch.execute(
             "Implement authentication",
             mode=ExecutionMode.MULTI_AGENT,
@@ -443,14 +493,45 @@ class TestMultiAgentIntegration:
     @pytest.mark.asyncio
     async def test_full_pipeline(self):
         """Test: decompose → plan → execute → review."""
-        orch = Orchestrator()
+        from unittest.mock import MagicMock
+        from harness_core.providers.base import ModelProvider, CompletionResponse
+        import json
+        
+        mock_provider = MagicMock(spec=ModelProvider)
+        valid_json = json.dumps({
+            "summary": "Plan",
+            "tasks": [
+                {"task_id": "arch", "title": "Architecture", "objective": "Design system", "role": "architect", "dependencies": []},
+                {"task_id": "db", "title": "Database", "objective": "Schema", "role": "database", "dependencies": ["arch"]},
+                {"task_id": "back", "title": "Backend", "objective": "API", "role": "backend", "dependencies": ["db"]},
+                {"task_id": "front", "title": "Frontend", "objective": "UI", "role": "frontend", "dependencies": ["arch"]},
+                {"task_id": "integ", "title": "Integration", "objective": "Integrate", "role": "integration", "dependencies": ["back", "front"]},
+                {"task_id": "test", "title": "Tester", "objective": "Test", "role": "tester", "dependencies": ["integ"]},
+                {"task_id": "rev", "title": "Reviewer", "objective": "Review", "role": "reviewer", "dependencies": ["test"]},
+                {"task_id": "verif", "title": "Verifier", "objective": "Verify", "role": "verifier", "dependencies": ["rev"]},
+            ]
+        })
+        
+        # We need the provider to return the JSON for the planner, and then some dummy text for the worker agents.
+        mock_provider.generate.side_effect = [
+            CompletionResponse(content=valid_json, model="test") # Planner
+        ] + [CompletionResponse(content="I completed the task.", model="test") for _ in range(50)] # Workers
+        
+        orch = Orchestrator(provider=mock_provider)
         result = await orch.execute(
-            "Implement a new REST endpoint with tests",
+            "Build a full-stack task management application with authentication.",
             mode=ExecutionMode.MULTI_AGENT,
         )
 
+        for t_id, agent_res in result.agent_results.items():
+            print(f"Task {t_id} error: {agent_res.errors}")
+
         # Should have executed multiple agents
-        assert len(result.agent_results) >= 1
+        assert result.success is True
+        assert len(result.agent_results) == 8
+        assert "arch" in result.task_graph.tasks
+        assert "front" in result.task_graph.tasks
+        assert "back" in result.task_graph.tasks
 
         # Budget should be tracked
         assert result.budget is not None
@@ -459,8 +540,21 @@ class TestMultiAgentIntegration:
     @pytest.mark.asyncio
     async def test_budget_enforcement(self):
         """Test that budgets are respected."""
+        from unittest.mock import MagicMock
+        from harness_core.providers.base import ModelProvider, CompletionResponse
+        import json
+        
+        mock_provider = MagicMock(spec=ModelProvider)
+        valid_json = json.dumps({
+            "summary": "Plan",
+            "tasks": [
+                {"task_id": "t1", "title": "t1", "objective": "o1", "role": "coder", "dependencies": []},
+            ]
+        })
+        mock_provider.generate.return_value = CompletionResponse(content=valid_json, model="test")
+        
         budget = AgentBudget(max_agents=2)
-        orch = Orchestrator(budget=budget)
+        orch = Orchestrator(budget=budget, provider=mock_provider)
 
         result = await orch.execute(
             "Complex multi-step task",
@@ -473,7 +567,21 @@ class TestMultiAgentIntegration:
     @pytest.mark.asyncio
     async def test_single_vs_multi_agent(self):
         """Single mode should produce fewer agents than multi-agent."""
-        orch = Orchestrator()
+        from unittest.mock import MagicMock
+        from harness_core.providers.base import ModelProvider, CompletionResponse
+        import json
+        
+        mock_provider = MagicMock(spec=ModelProvider)
+        valid_json = json.dumps({
+            "summary": "Plan",
+            "tasks": [
+                {"task_id": "t1", "title": "t1", "objective": "o1", "role": "coder", "dependencies": []},
+                {"task_id": "t2", "title": "t2", "objective": "o2", "role": "tester", "dependencies": ["t1"]},
+            ]
+        })
+        mock_provider.generate.return_value = CompletionResponse(content=valid_json, model="test")
+        
+        orch = Orchestrator(provider=mock_provider)
 
         single = await orch.execute("Fix bug", mode=ExecutionMode.SINGLE)
         multi = await orch.execute("Fix bug", mode=ExecutionMode.MULTI_AGENT)
@@ -483,7 +591,20 @@ class TestMultiAgentIntegration:
     @pytest.mark.asyncio
     async def test_failure_triggers_debugger(self):
         """When an agent fails, a debugger should be scheduled."""
-        orch = Orchestrator()
+        from unittest.mock import MagicMock
+        from harness_core.providers.base import ModelProvider, CompletionResponse
+        import json
+        
+        mock_provider = MagicMock(spec=ModelProvider)
+        valid_json = json.dumps({
+            "summary": "Plan",
+            "tasks": [
+                {"task_id": "t1", "title": "t1", "objective": "o1", "role": "coder", "dependencies": []},
+            ]
+        })
+        mock_provider.generate.return_value = CompletionResponse(content=valid_json, model="test")
+        
+        orch = Orchestrator(provider=mock_provider)
         result = await orch.execute(
             "Task that might fail",
             mode=ExecutionMode.MULTI_AGENT,

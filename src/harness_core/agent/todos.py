@@ -279,6 +279,7 @@ def reconcile_on_evidence(
     verified: bool | None,
     did_commit: bool,
     did_push: bool,
+    tests_run: int = 0,
 ) -> list[TodoItem]:
     """Complete remaining TODOs that have matching execution evidence."""
     changed: list[TodoItem] = []
@@ -286,11 +287,15 @@ def reconcile_on_evidence(
         if item.status not in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
             continue
         cat = todo_category(item.description)
+        # "Verify" is satisfied by either explicit verification (preferred) or
+        # by a successful test run that actually ran (secondary signal).
+        test_evidence = tests_passed is True and tests_run > 0
         ok = (
             (cat == "inspect" and did_inspect)
             or (cat == "implement" and did_implement)
             or (cat == "test" and tests_passed is True)
-            or (cat == "verify" and verified is True)
+            # "verify" + verify engine passed OR "verify" + successful test run
+            or (cat == "verify" and (verified is True or test_evidence))
             or (cat == "commit" and did_commit)
             or (cat == "push" and did_push)
             or (cat == "stage" and (did_commit or did_push))
@@ -301,7 +306,7 @@ def reconcile_on_evidence(
         elif cat == "test" and tests_passed is False:
             plan.fail_id(item.id, "Tests failed")
             changed.append(item)
-        elif cat == "verify" and verified is False:
+        elif cat == "verify" and verified is False and not test_evidence:
             plan.fail_id(item.id, "Verification failed")
             changed.append(item)
     return changed

@@ -471,10 +471,19 @@ class TestEndToEndPipeline:
 
         result = await agent.run("Fix the authentication bug and make all tests pass")
 
-        # Verify pipeline completed
-        assert result.status == TaskStatus.COMPLETED
+        # Phase 10.6 contract: the mock model never emitted any tool calls —
+        # it just claimed "I've identified the bug and fixed it." without
+        # actually inspecting, implementing, or testing. All 6 required TODOs
+        # remain PENDING. The previous assertion (COMPLETED) was wrong: a
+        # model text claim is not evidence. PARTIAL is the honest terminal
+        # state; the user is shown the gap rather than a false success.
+        assert result.status == TaskStatus.PARTIAL
         assert result.result is not None
         # The mock model never emits tool calls. The zero-tool-call governor
         # nudges it MAX_NO_TOOL_NUDGES times before accepting the text answer,
         # so the loop completes in nudges + 1 iterations (bounded, not 1).
         assert result.iterations == MAX_NO_TOOL_NUDGES + 1
+        # Required TODOs are still pending — that's the evidence the work
+        # was not actually performed despite the model's claim.
+        pending = [i for i in result.task_plan.items if i.status.value == "pending"]
+        assert len(pending) > 0, "expected required TODOs to remain pending"

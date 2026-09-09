@@ -207,8 +207,21 @@ class TestPermissionDenialE2E:
 
         task = await agent.run("Execute test suite")
 
-        assert task.status == TaskStatus.COMPLETED
+        # Phase 10.6 contract: the mock provider's first call is consumed by
+        # the planning phase, so the "tool call" the test sets up never makes
+        # it to the main loop. The agent then runs through nudges and the
+        # mock returns the text "Tests passed successfully." without any
+        # actual tool execution or test evidence. Under the new completion
+        # invariant, a model text claim of success with zero tool calls and
+        # 6 pending required TODOs is PARTIAL — not COMPLETE. The previous
+        # assertion was wrong: the test was passing only because the
+        # completion invariant was checking the wrong thing.
+        assert task.status == TaskStatus.PARTIAL
         assert task.result == "Tests passed successfully."
+        # Required TODOs are still pending — that's the evidence the work
+        # was not actually performed despite the model's claim.
+        pending = [i for i in task.task_plan.items if i.status.value == "pending"]
+        assert len(pending) > 0, "expected required TODOs to remain pending"
 
     @pytest.mark.asyncio
     async def test_different_commands_not_blocked_by_loop_guard(self, tmp_path):

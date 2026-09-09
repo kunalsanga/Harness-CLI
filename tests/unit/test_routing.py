@@ -845,3 +845,35 @@ class TestIntegration429Fallback:
         result = await router.execute(req)
         assert not result.succeeded
         assert "All" in result.final_error or "failed" in result.final_error
+
+    @pytest.mark.asyncio
+    async def test_model_routing_override(self):
+        """Prove that per-request routing override ignores the global router config."""
+        p_fast = MockProvider(
+            name="p_fast",
+            response=CompletionResponse(content="Fast", model="fast-model"),
+            models=[_make_model("fast-model", provider="p_fast", is_free=False)]
+        )
+        p_free = MockProvider(
+            name="p_free",
+            response=CompletionResponse(content="Free", model="free-model"),
+            models=[_make_model("free-model", provider="p_free", is_free=True)]
+        )
+
+        # Global router set to auto (not free)
+        router = ModelRouter(
+            providers=[p_fast, p_free],
+            config=RouterConfig(routing_mode="auto")
+        )
+
+        req = CompletionRequest(messages=[{"role": "user", "content": "test"}])
+        
+        # 1. Without override, should route auto (we assume it picks fast-model depending on scoring, but let's test free override)
+        # 2. With override="free", must ONLY select free-model
+        result_free = await router.execute(req, routing_mode_override="free")
+        assert result_free.succeeded
+        assert result_free.model_used == "free-model"
+        
+        # Verify the decision mode recorded was "free"
+        decisions = router.get_routing_decisions()
+        assert decisions[-1].routing_mode == "free"

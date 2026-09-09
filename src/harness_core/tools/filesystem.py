@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from harness_core.agent.types import ToolResult, ToolResultStatus
+from harness_core.agent.types import ToolResult, ToolResults
 from harness_core.tools.base import Tool, ToolSchema
 
 
@@ -41,16 +41,14 @@ class ReadFileTool(Tool):
         try:
             path = Path(arguments["path"])
             if not path.exists():
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=f"File not found: {path}",
+                return ToolResults.error(
+                    f"File not found: {path}",
+                    retryable=False,
                 )
             if not path.is_file():
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=f"Not a file: {path}",
+                return ToolResults.error(
+                    f"Not a file: {path}",
+                    retryable=False,
                 )
 
             content = path.read_text(encoding="utf-8", errors="replace")
@@ -64,13 +62,12 @@ class ReadFileTool(Tool):
             selected = lines[start:end]
 
             output = "\n".join(selected)
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS,
-                output=output,
+            return ToolResults.success(
+                output,
                 metadata={"total_lines": len(lines), "showing_lines": f"{start+1}-{min(end, len(lines))}"},
             )
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
 
 
 class WriteFileTool(Tool):
@@ -99,12 +96,9 @@ class WriteFileTool(Tool):
             content = arguments["content"]
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS,
-                output=f"Written {len(content)} bytes to {path}",
-            )
+            return ToolResults.success(f"Written {len(content)} bytes to {path}")
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
 
 
 class EditFileTool(Tool):
@@ -132,10 +126,9 @@ class EditFileTool(Tool):
         try:
             path = Path(arguments["path"])
             if not path.exists():
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=f"File not found: {path}",
+                return ToolResults.error(
+                    f"File not found: {path}",
+                    retryable=False,
                 )
 
             content = path.read_text(encoding="utf-8")
@@ -143,21 +136,17 @@ class EditFileTool(Tool):
             new_string = arguments["new_string"]
 
             if old_string not in content:
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=f"String not found in {path}",
+                return ToolResults.error(
+                    f"String not found in {path}",
+                    retryable=False,
                 )
 
             new_content = content.replace(old_string, new_string, 1)
             path.write_text(new_content, encoding="utf-8")
 
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS,
-                output=f"Edited {path}",
-            )
+            return ToolResults.success(f"Edited {path}")
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)
 
 
 class ListFilesTool(Tool):
@@ -192,10 +181,9 @@ class ListFilesTool(Tool):
             recursive = arguments.get("recursive", False)
 
             if not path.exists():
-                return ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    output="",
-                    error=f"Path not found: {path}",
+                return ToolResults.error(
+                    f"Path not found: {path}",
+                    retryable=False,
                 )
 
             if recursive:
@@ -211,9 +199,8 @@ class ListFilesTool(Tool):
                     if not p.name.startswith(".")
                 )
 
-            return ToolResult(
-                status=ToolResultStatus.SUCCESS,
-                output="\n".join(entries) if entries else "(empty)",
+            return ToolResults.success(
+                "\n".join(entries) if entries else "(empty)",
             )
         except Exception as e:
-            return ToolResult(status=ToolResultStatus.ERROR, output="", error=str(e))
+            return ToolResults.from_exception(e, retryable=False)

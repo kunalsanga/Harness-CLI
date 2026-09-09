@@ -87,8 +87,18 @@ class ContextCompactor:
         task_msgs = [m for m in messages if m.kind in ('plan',)]
         error_msgs = [m for m in messages if m.kind == 'error']
         modified_files = self._extract_modified_files(messages)
-        recent = messages[-self._preserve_recent:] if len(messages) > self._preserve_recent else []
-        older = messages[:-self._preserve_recent] if len(messages) > self._preserve_recent else []
+        # NOTE: messages[-0:] is the whole list, not the empty list, so the
+        # slice arithmetic below must special-case preserve_recent == 0.
+        # Callers use 0 to mean "summarize everything, preserve nothing".
+        if self._preserve_recent <= 0:
+            recent = []
+            older = list(messages)
+        elif len(messages) > self._preserve_recent:
+            recent = messages[-self._preserve_recent:]
+            older = messages[:-self._preserve_recent]
+        else:
+            recent = list(messages)
+            older = []
 
         # Build summary of older messages
         summary_parts = []
