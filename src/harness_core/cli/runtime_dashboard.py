@@ -1094,12 +1094,17 @@ def render_success_summary(
 
     renderables = []
     if agent_response:
-        renderables.append(Markdown(agent_response.strip()))
-        renderables.append(Text(""))
-    renderables.append(Text(summary))
-
-    body = Group(*renderables)
-    console.print(Panel(body, title=title, border_style=border))
+        from rich.padding import Padding
+        renderables.append(Text("  Agent", style="bold cyan"))
+        renderables.append(Padding(Markdown(agent_response.strip()), (0, 0, 1, 2)))
+    
+    # We remove the heavy Panel border for the final output because it makes it look disconnected.
+    # Instead, we just print the summary neatly.
+    
+    console.print("")
+    for r in renderables:
+        console.print(r)
+    console.print(Text(summary))
 
     if graph is not None and vm.files:
         console.print("")
@@ -1187,12 +1192,14 @@ def render_failure_summary(
 
     renderables = []
     if agent_response:
-        renderables.append(Markdown(agent_response.strip()))
-        renderables.append(Text(""))
-    renderables.append(Text(summary))
+        from rich.padding import Padding
+        renderables.append(Text("  Agent", style="bold red"))
+        renderables.append(Padding(Markdown(agent_response.strip()), (0, 0, 1, 2)))
 
-    body = Group(*renderables)
-    console.print(Panel(body, title="Harness Stopped", border_style="red"))
+    console.print("")
+    for r in renderables:
+        console.print(r)
+    console.print(Text(summary))
 
 
 def render_cancelled_summary(

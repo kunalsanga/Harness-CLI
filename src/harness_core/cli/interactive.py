@@ -512,6 +512,15 @@ class InteractiveShell:
             except Exception:
                 pass
 
+            # Nvidia
+            try:
+                from harness_core.providers.nvidia import NvidiaProvider
+                nvidia = NvidiaProvider()
+                if await nvidia.health_check():
+                    providers.append(nvidia)
+            except Exception:
+                pass
+
             if not providers:
                 self.console.print("")
                 self.console.print("  [red]No providers available.[/]")
@@ -1729,19 +1738,77 @@ class InteractiveShell:
 
     # ─── Input Handling ──────────────────────────────────────────────
 
-    def _read_input(self) -> str | None:
+    def _get_real_terminal_width(self, fallback: int = 80) -> int:
+        try:
+            import ctypes
+            import struct
+            GENERIC_READ = 0x80000000
+            GENERIC_WRITE = 0x40000000
+            FILE_SHARE_READ = 0x00000001
+            FILE_SHARE_WRITE = 0x00000002
+            OPEN_EXISTING = 3
+            
+            kernel32 = ctypes.windll.kernel32
+            h_con = kernel32.CreateFileW("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
+            if h_con != -1:
+                csbi = ctypes.create_string_buffer(22)
+                res = kernel32.GetConsoleScreenBufferInfo(h_con, csbi)
+                kernel32.CloseHandle(h_con)
+                if res:
+                    (_, _, _, _, _, left, _, right, _, _, _) = struct.unpack("hhhhHhhhhhh", csbi.raw)
+                    return right - left + 1
+        except Exception:
+            pass
+        try:
+            import shutil
+            return shutil.get_terminal_size((fallback, 20)).columns
+        except Exception:
+            return fallback
+
+    def _get_bottom_toolbar(self) -> Any:
+        from prompt_toolkit.formatted_text import HTML
+        import time
+        provider = self.current_provider or "Not connected"
+        model = self.current_model or "Not set"
+        elapsed = time.time() - self.session_start if self.session_start else 0
+        from harness_core.cli.ui import fmt_elapsed
+        time_str = fmt_elapsed(elapsed)
+        width = self._get_real_terminal_width(self.console.width)
+        line = "─" * width
+        return HTML(f'<ansigray>{line}</ansigray>\n  <b>{provider} \u00b7 {model}</b> \u00b7 {self.total_tool_calls} tools \u00b7 {time_str} ')
+
+    async def _read_input(self) -> str | None:
         """Read user input with prompt."""
         try:
-            prompt = Text()
-            prompt.append("\n  / for commands • Ctrl+C to cancel\n", style="dim")
-            prompt.append("  ❯ ", style="bold cyan")
-
+            import asyncio
             if self.plain:
-                user_input = input("\nHarness > ")
-            else:
-                from rich.prompt import Prompt
-                user_input = Prompt.ask(prompt)
-            return user_input
+                return await asyncio.to_thread(input, "❯ ")
+
+            try:
+                from prompt_toolkit import PromptSession
+                from prompt_toolkit.formatted_text import HTML
+                from prompt_toolkit.styles import Style
+                
+                if not hasattr(self, "_prompt_session"):
+                    style = Style.from_dict({'bottom-toolbar': 'fg:#aaaaaa'})
+                    self._prompt_session = PromptSession(style=style)
+                
+                def get_prompt_text():
+                    term_width = self._get_real_terminal_width(self.console.width)
+                    line = "─" * term_width
+                    return HTML(f"<ansigray>{line}</ansigray>\n<ansicyan><b>❯</b></ansicyan> ")
+                
+                ans = await self._prompt_session.prompt_async(
+                    get_prompt_text,
+                    placeholder=HTML("<ansigray>Enter a coding task or / for commands</ansigray>"),
+                    bottom_toolbar=self._get_bottom_toolbar
+                )
+                
+                closing_line = "─" * self._get_real_terminal_width(self.console.width)
+                self.console.print(f"[#888888]{closing_line}[/#888888]", highlight=False)
+                return ans
+            except Exception:
+                return await asyncio.to_thread(self.console.input, "\n  [bold cyan]❯[/] ")
         except (EOFError, KeyboardInterrupt):
             return None
 
@@ -1772,13 +1839,10 @@ class InteractiveShell:
         # Print welcome screen AFTER provider setup is complete
         self._print_welcome()
 
-        self.console.print("  [dim]Ctrl+C to cancel, /exit to quit.[/]")
-        self.console.print("")
-
         # Main loop
         try:
             while True:
-                user_input = self._read_input()
+                user_input = await self._read_input()
 
                 if user_input is None:
                     break
@@ -1796,9 +1860,6 @@ class InteractiveShell:
 
                 # Execute task
                 await self._execute_task(user_input)
-
-                # Show status line
-                self._print_status_line()
 
         except KeyboardInterrupt:
             self.console.print("\n")
