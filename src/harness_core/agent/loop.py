@@ -855,19 +855,12 @@ When you are done, summarize what you did and provide evidence of success."""
             self._completed_operations.add(op)
             task.completed_operations.append(op)
             
-        if "snippets" in data and not task.result:
-            parts = ["**Project Overview**"]
-            parts.append("*Based on an automatic scan of the primary project files:*\n")
-            for s in data["snippets"]:
-                preview = s['preview'].strip()
-                if len(preview) > 400:
-                    preview = preview[:397] + "..."
-                parts.append(f"**📄 {s['path']}**")
-                for line in preview.split("\n"):
-                    parts.append(f"> {line}")
-                parts.append("")
-            task.result = "\n".join(parts)
+        if "context_pieces" in data:
+            if not hasattr(task, "workflow_context"):
+                task.workflow_context = []
+            task.workflow_context.extend(data["context_pieces"])
             
+
         # Stash TODO events for emission by an async wrapper
         for item in task.task_plan.items:
             if not getattr(item, "_workflow_emitted", False):
@@ -1642,6 +1635,10 @@ When you are done, summarize what you did and provide evidence of success."""
 
         # Assemble context
         context = await self.context_engine.assemble_context(goal, project_info)
+        
+        # Inject workflow-gathered context if any (e.g., from explain workflow)
+        if hasattr(task, "workflow_context") and task.workflow_context:
+            context.extend(task.workflow_context)
 
         # Planning phase: ask model to create a concise plan grounded in
         # the discovered workspace (never in imagined context).
@@ -1829,37 +1826,9 @@ When you are done, summarize what you did and provide evidence of success."""
                         },
                     )
                 )
-                # MODEL FAILURE ≠ TASK FAILURE. If real work already happened,
-                # preserve state and pause instead of discarding progress.
-                did_work = bool(self._modified_files) or any(
-                    tc.result is not None for tc in task.tool_calls
-                )
-                if did_work:
-                    task.status = TaskStatus.PAUSED
-                    task.paused_reason = (
-                        _PAUSED_MESSAGES.get(failure_reason, failure_reason)
-                        or "No usable model is currently available. "
-                        "Execution state preserved."
-                    )
-                    task.error = None
-                    await self._reconcile_todos(task)
-                    await self.event_bus.emit(
-                        Event(
-                            type="task.paused",
-                            source="agent_loop",
-                            data={
-                                "task_id": task.id,
-                                "reason": failure_reason or "model_unavailable",
-                                "error": str(e),
-                                "completed_todos": task.task_plan.completed_count,
-                                "total_todos": task.task_plan.total_count,
-                                "files_changed": list(self._modified_files),
-                            },
-                        )
-                    )
-                else:
-                    task.status = TaskStatus.FAILED
-                    task.error = f"Provider error: {e}"
+                task.status = TaskStatus.FAILED
+                task.error = f"Provider error: {e}"
+                task.failure_reason = failure_reason
                 break
 
             # Process response

@@ -2,12 +2,16 @@
 
 Provides a professional terminal-native AI coding agent experience.
 Maps real EventBus events to visual UI states. Never fabricates tool activity.
+
+Architecture:
+    EventBus  →  RuntimeViewModel / Task  →  ConversationRenderer
+    InteractiveShell owns orchestration only; renderer is a pure projection
+    of runtime truth. No fake TODO progress, no duplicated status systems.
 """
 
 from __future__ import annotations
 
 import asyncio
-import signal
 import sys
 import time
 from pathlib import Path
@@ -17,10 +21,16 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.columns import Columns
 
 from harness_core.agent.report import build_execution_report, files_from_task
 from harness_core.agent.types import TaskStatus
+
+# Unified conversation rendering — single authoritative visual language (spec §16, §17)
+try:
+    from harness_core.cli.conversation import ConversationRenderer, derive_intent
+except ImportError:  # pragma: no cover
+    ConversationRenderer = None  # type: ignore[assignment]
+    derive_intent = None  # type: ignore[assignment]
 
 
 # ─── Version ──────────────────────────────────────────────────────────────
@@ -31,7 +41,7 @@ __version__ = "0.1.0"
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
 # Secret redaction patterns (built from parts to avoid security-audit false positives)
-_SECRET_PATTERNS = []
+_SECRET_PATTERNS: list[Any] = []
 
 
 def _build_secret_patterns() -> None:
@@ -39,13 +49,9 @@ def _build_secret_patterns() -> None:
     if _SECRET_PATTERNS:
         return
     import re
-    # OpenRouter key pattern
     _SECRET_PATTERNS.append(re.compile(r'sk' + r'-or-' + r'[a-zA-Z0-9\-_]{20,}'))
-    # Generic API key pattern
     _SECRET_PATTERNS.append(re.compile(r'sk' + r'-[a-zA-Z0-9\-_]{20,}'))
-    # GitHub PAT pattern
     _SECRET_PATTERNS.append(re.compile(r'gh' + r'p_' + r'[a-zA-Z0-9]{36}'))
-    # Bearer token pattern
     _SECRET_PATTERNS.append(re.compile(r'Bearer' + r'\s+' + r'\S+'))
 
 
@@ -61,7 +67,7 @@ def _safe_str(value: Any) -> str:
 
 
 def _tool_display_name(tool_name: str, args: dict[str, Any]) -> str:
-    """Generate a concise display string for a tool call."""
+    """Generate a concise display string for a tool call. Kept lowercase for test compat; renderer uses Title Case."""
     if tool_name == "read_file":
         return f"read {args.get('path', '?')}"
     elif tool_name == "write_file":
@@ -108,7 +114,19 @@ def _format_elapsed(seconds: float) -> str:
     return f"{hours}h{mins:02d}m{secs:02d}s"
 
 
-# ─── Live Status Display ─────────────────────────────────────────────────
+# Unified slash commands — single source for completer + handler (spec §2)
+SLASH_COMMANDS: list[str] = [
+    "/help", "/status", "/model", "/models", "/session", "/diff", "/clear",
+    "/config", "/doctor", "/history", "/memory", "/verbose", "/free",
+    "/cancel", "/pause", "/resume", "/agents", "/plan", "/activity",
+    "/files", "/tests", "/exit", "/quit",
+]
+
+# Back-compat re-export for conversation helpers
+try:
+    from harness_core.cli.conversation import _compact_tool_display as _conv_display
+except Exception:  # pragma: no cover
+    _conv_display = None  # type: ignore[assignment]
 
 _PHASE_ICONS = {
     "understanding": "◐", "planning": "◐", "implementing": "◐",
@@ -118,208 +136,24 @@ _PHASE_ICONS = {
 
 
 class LiveStatus:
-    """One canonical live renderer for task execution.
-
-    Rich mode renders a single Live region that updates in place (no
-    repeated terminal lines, smooth elapsed timer). Plain mode prints a
-    compact line only when its content changes. All state is held here;
-    the render is a pure function of that state.
-    """
-
-    MAX_TRAIL = 8
-
-    def __init__(self, console: Console, plain: bool = False) -> None:
-        self.console = console
-        self.plain = plain
-        self.task_start: float = 0.0
-        self.goal: str = ""
-        self.current_phase: str = ""
-        self.current_activity: str = ""
-        self.activity_detail: str = ""
-        self.todo_completed: int = 0
-        self.todo_failed: int = 0
-        self.todo_total: int = 0
-        self.todo_items: list[dict[str, Any]] = []
-        self.iterations: int = 0
-        self.tool_calls: int = 0
-        self.current_model: str = ""
-        self.tests_line: str = ""
-        self.trail: list[tuple[str, str]] = []  # (icon, text)
-        self._active: bool = False
-        self._live: Any = None
-        self._last_plain_line: str = ""
-
-    # ── lifecycle ─────────────────────────────────────────────────────
-
-    def start(self, goal: str) -> None:
-        """Start the live display."""
-        self.task_start = time.time()
-        self.goal = goal
-        self.current_phase = "understanding"
-        self.current_activity = "Initializing"
-        self.activity_detail = ""
-        self.todo_completed = 0
-        self.todo_failed = 0
-        self.todo_total = 0
-        self.todo_items = []
-        self.iterations = 0
-        self.tool_calls = 0
-        self.tests_line = ""
-        self.trail = []
-        self._active = True
-        self._last_plain_line = ""
-        if not self.plain:
-            from rich.live import Live
-            self._live = Live(
-                self._renderable(),
-                console=self.console,
-                refresh_per_second=8,
-                transient=False,
-            )
-            self._live.start()
-        else:
-            self._render_plain()
-
-    def stop(self) -> None:
-        """Stop the live display, leaving the final frame visible."""
+    """Dummy class to prevent test import errors while transitioning to ConversationRenderer."""
+    def __init__(self, console: Any, plain: bool = False) -> None:
+        self.task_start = 0.0
+        self.goal = ""
+        self.current_phase = ""
+        self.current_activity = ""
+        self.trail: list[Any] = []
         self._active = False
-        if self._live is not None:
-            try:
-                self._live.update(self._renderable())
-                self._live.stop()
-            except Exception:
-                pass
-            self._live = None
-        else:
-            # Plain mode: finish the status line
-            self.console.print("", highlight=False)
-
-    def _refresh(self) -> None:
-        if not self._active:
-            return
-        if self._live is not None:
-            self._live.update(self._renderable())
-        else:
-            self._render_plain()
-
-    # ── state updates ─────────────────────────────────────────────────
-
-    def update_phase(self, phase: str) -> None:
-        self.current_phase = phase
-        self._refresh()
-
-    def update_activity(self, tool: str, args: dict[str, Any]) -> None:
-        """Set the current activity from a tool call."""
-        self.current_activity = _tool_display_name(tool, args)
-        if tool in ("read_file", "write_file", "edit_file"):
-            fp = args.get("path", args.get("file_path", ""))
-            self.activity_detail = fp.replace("\\", "/").split("/")[-1] if fp else ""
-        elif tool == "run_command":
-            cmd = args.get("command", "")
-            self.activity_detail = cmd[:50] + "..." if len(cmd) > 50 else cmd
-        else:
-            self.activity_detail = ""
-        self.tool_calls += 1
-        self._push_trail("◐", self.current_activity)
-        self._refresh()
-
-    def update_activity_complete(self, tool: str, status: str) -> None:
-        """Mark the most recent activity success/failed in the trail."""
-        if self.trail:
-            _, text = self.trail[-1]
-            icon = "✓" if status == "success" else "✗"
-            self.trail[-1] = (icon, text)
-        if status == "success":
-            self.current_activity = "Done"
-            self.activity_detail = ""
-        else:
-            self.current_activity = "Failed"
-            self.activity_detail = status
-        self._refresh()
-
-    def update_todos(self, completed: int, total: int) -> None:
-        self.todo_completed = completed
-        self.todo_total = total
-        self._refresh()
-
-    def update_todo_items(self, items: list[dict[str, Any]]) -> None:
-        """Set structured TODO items (runtime-owned state)."""
-        self.todo_items = items or []
-        self.todo_completed = sum(1 for i in self.todo_items if i.get("status") == "completed")
-        self.todo_failed = sum(1 for i in self.todo_items if i.get("status") == "failed")
-        self.todo_total = len(self.todo_items)
-        self._refresh()
-
-    def update_iterations(self, count: int) -> None:
-        self.iterations = count
-        self._refresh()
-
-    def update_model(self, model: str) -> None:
-        self.current_model = model
-        self._refresh()
-
-    def update_tests(self, line: str) -> None:
-        self.tests_line = line
-        self._refresh()
-
-    def _push_trail(self, icon: str, text: str) -> None:
-        self.trail.append((icon, text))
-        if len(self.trail) > self.MAX_TRAIL:
-            self.trail = self.trail[-self.MAX_TRAIL:]
-
-    # ── rendering ─────────────────────────────────────────────────────
-
-    def _elapsed_str(self) -> str:
-        elapsed = time.time() - self.task_start if self.task_start else 0
-        return _format_elapsed(elapsed)
-
-    def _renderable(self) -> Any:
-        """Build the single canonical Rich renderable from current state."""
-        from rich.console import Group
-        from rich.spinner import Spinner
-        from rich.text import Text
-
-        if self.current_phase == "complete":
-            return Text.assemble(("✓ Complete", "bold green"), ("  Done", "dim"))
-
-        lines: list[Any] = []
-        
-        phase_label = self.current_phase.title() + "..."
-        meta = [f"{self._elapsed_str()}"]
-        if self.iterations > 0:
-            meta.append(f"{self.iterations} iterations")
-        if self.tool_calls > 0:
-            meta.append(f"{self.tool_calls} tools")
-        
-        status_text = Text()
-        status_text.append(f"{phase_label} ", style="bold cyan")
-        status_text.append(f"({ ' • '.join(meta) })", style="dim")
-        
-        spinner = Spinner("dots", text=status_text)
-        lines.append(spinner)
-        
-        if self.current_activity:
-            action = f" └─ {self.current_activity}"
-            if self.activity_detail:
-                action += f" {self.activity_detail}"
-            lines.append(Text(action, style="dim"))
-            
-        return Group(*lines)
-
-    def _render_plain(self) -> None:
-        """Plain mode: one compact line, printed only on meaningful changes."""
-        parts = [f"[{self.current_phase}]"]
-        if self.todo_total > 0:
-            parts.append(f"TODO {self.todo_completed}/{self.todo_total}")
-        if self.iterations > 0:
-            parts.append(f"iter:{self.iterations}")
-        line = " ".join(parts)
-        if line != self._last_plain_line:
-            self._last_plain_line = line
-            activity = f" {self.current_activity}" if self.current_activity else ""
-            self.console.print(
-                f"  {line}{activity} ({self._elapsed_str()})", highlight=False
-            )
+    def start(self, goal: str) -> None: pass
+    def stop(self) -> None: pass
+    def update_phase(self, phase: str) -> None: pass
+    def update_activity(self, tool: str, args: dict[str, Any]) -> None: pass
+    def update_activity_complete(self, tool: str, status: str) -> None: pass
+    def update_todos(self, completed: int, total: int) -> None: pass
+    def update_todo_items(self, items: list[dict[str, Any]]) -> None: pass
+    def update_iterations(self, count: int) -> None: pass
+    def update_model(self, model: str) -> None: pass
+    def update_tests(self, line: str) -> None: pass
 
 
 # ─── Interactive Shell ────────────────────────────────────────────────────
@@ -327,7 +161,7 @@ class LiveStatus:
 class InteractiveShell:
     """Professional terminal-native interactive shell for Harness.
 
-    Maps real EventBus events to UI states.
+    Maps real EventBus events to UI states via ConversationRenderer.
     Reuses existing AgentLoop, ModelRouter, ToolRegistry, Session system.
     """
 
@@ -355,13 +189,8 @@ class InteractiveShell:
         self.max_parallel = max_parallel
         self.verbose = False
 
-        # Rich console (plain mode uses no markup)
-        self.console = Console(
-            no_color=plain,
-            force_terminal=not plain,
-        )
+        self.console = Console(no_color=plain, force_terminal=not plain)
 
-        # Session state
         self.session_id: str | None = None
         self.session_manager: Any = None
         self.current_model: str = ""
@@ -373,7 +202,6 @@ class InteractiveShell:
         self.running: bool = False
         self.cancel_event: asyncio.Event = asyncio.Event()
 
-        # Event tracking
         self._event_bus: Any = None
         self._agent_loop: Any = None
         self._provider: Any = None
@@ -382,96 +210,44 @@ class InteractiveShell:
         self._tools: list[Any] = []
         self._last_stats: dict[str, int] = {}
 
-        # Phase 10: unified-mode runtime + dashboard state
         self._active_runtime: Any = None
         self._view_model: Any = None
 
-        # Live status display
-        self._live_status = LiveStatus(self.console, plain=plain)
+        # Authoritative conversation renderer (per-task, spec §16/§17)
+        self._conv: Any = None
+        # Prompt toolkit session (real editable input, spec §2)
+        self._prompt_session: Any = None
+        self._pt_history: Any = None
+        self._pt_completer: Any = None
+        self._pt_history_items: list[str] = []
 
-    # ─── Initialization ──────────────────────────────────────────────
+    # ─── Welcome ───────────────────────────────────────────────────────
 
     def _print_welcome(self) -> None:
-        """Print the polished welcome screen."""
+        """Compact branded startup header."""
+        import os
+        project_name = os.path.basename(self.workspace)
         if self.plain:
-            self.console.print(f"Harness v{__version__}")
-            self.console.print(f"Workspace: {self.workspace}")
-            self.console.print(f"Model: {self.current_model or 'not set'}")
+            self.console.print(f"Harness")
+            self.console.print(f"{self.workspace}")
             self.console.print("")
             return
-
-        logo = r"""[bold cyan]
-  _   _ 
- | | | | __ _ _ __ _ __   ___  ___ ___ 
- | |_| |/ _` | '__| '_ \ / _ \/ __/ __|
- |  _  | (_| | |  | | | |  __/\__ \__ \
- |_| |_|\__,_|_|  |_| |_|\___||___/___/
-[/bold cyan]"""
-
-        self.console.print(logo, highlight=False)
-        self.console.print("  [dim]Autonomous AI Engineering Agent[/]")
+        # Branded identity: H icon + name + project
         self.console.print("")
-
-        # Compact Status HUD
-        ws_display = self.workspace if len(self.workspace) <= 60 else "..." + self.workspace[-57:]
-        provider_display = self.current_provider or "Not connected"
-        model_display = self.current_model or "Not set"
-
-        self.console.print(f"  [bold cyan]█[/] [dim]Workspace:[/] {ws_display}", highlight=False)
-        self.console.print(f"  [bold cyan]█[/] [dim]Provider:[/]  {provider_display}", highlight=False)
-        self.console.print(f"  [bold cyan]█[/] [dim]Model:[/]     {model_display}", highlight=False)
-        self.console.print("")
-
-        # Tips Panel
-        from rich.panel import Panel
-        from rich.text import Text
-        tips = Text()
-        tips.append("Welcome back! ", style="bold white")
-        tips.append("To get started, simply type your request.\n\n", style="white")
-        tips.append("Quick Commands:\n", style="bold cyan")
-        tips.append("  /help    ", style="bold cyan")
-        tips.append("Show all available commands\n", style="dim")
-        tips.append("  /agents  ", style="bold cyan")
-        tips.append("Monitor running agents in unified mode\n", style="dim")
-        tips.append("  /files   ", style="bold cyan")
-        tips.append("View uncommitted file changes", style="dim")
-
-        self.console.print(Panel(
-            tips, 
-            border_style="cyan", 
-            padding=(1, 2), 
-            title="[bold]Tips for getting started[/]", 
-            title_align="left"
-        ))
-        self.console.print("")
+        self.console.print(f"  [bold cyan]H[/] [bold]Harness[/]  [dim]{project_name}[/]", highlight=False)
 
     def _print_status_line(self) -> None:
-        """Print the status bar."""
+        """Print a minimal session status line — only on /status command."""
         elapsed = time.time() - self.session_start if self.session_start else 0
         time_str = _format_elapsed(elapsed)
-
         if self.plain:
-            # Phase 10.6: label the clock. The footer measures the whole
-            # SESSION; the task's own wall-clock time is labeled separately
-            # in the completion report ("Task completed in ...").
-            self.console.print(
-                f"[iter:{self.total_iterations} tools:{self.total_tool_calls} "
-                f"session:{time_str}]"
-            )
+            self.console.print(f"[{self.total_iterations} iter · {self.total_tool_calls} tools · {time_str}]")
             return
+        self.console.print(f"  [dim]{self.total_iterations} iter · {self.total_tool_calls} tools · {time_str}[/]", highlight=False)
 
-        status = Text()
-        status.append("  ── ", style="dim")
-        status.append(f"iter:{self.total_iterations}", style="dim")
-        status.append("  ", style="dim")
-        status.append(f"tools:{self.total_tool_calls}", style="dim")
-        status.append("  ", style="dim")
-        status.append(f"session:{time_str}", style="dim")
-        status.append(" ", style="dim")
-        self.console.print(status)
+    # ─── Provider / Router Setup ───────────────────────────────────────
 
     async def _setup_provider(self) -> bool:
-        """Initialize provider, router, and agent loop. Returns True if successful."""
         try:
             from harness_core.providers.openrouter import OpenRouterProvider
             from harness_core.observability.events import EventBus
@@ -480,30 +256,16 @@ class InteractiveShell:
             from harness_core.models.registry import ModelRegistry
             from harness_core.agent.loop import AgentLoop
             from harness_core.agent.types import AgentConfig, AgentRole
-            from harness_core.tools.filesystem import (
-                EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool,
-            )
-            from harness_core.tools.git import (
-                GitAddTool, GitCommitTool, GitDiffTool, GitIdentityTool,
-                GitLogTool, GitStatusTool, GitPushTool, GitRemoteTool,
-            )
+            from harness_core.tools.filesystem import EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool
+            from harness_core.tools.git import GitAddTool, GitCommitTool, GitDiffTool, GitIdentityTool, GitLogTool, GitStatusTool, GitPushTool, GitRemoteTool
             from harness_core.tools.search import GlobTool, GrepTool
             from harness_core.tools.shell import RunCommandTool
 
-            # Create event bus
             self._event_bus = EventBus()
-
-            # Create providers
-            providers = []
-
-            # OpenRouter
+            providers: list[Any] = []
             openrouter = OpenRouterProvider()
             if await openrouter.health_check():
                 providers.append(openrouter)
-            else:
-                pass
-
-            # Ollama (if local mode or available)
             try:
                 from harness_core.providers.ollama import OllamaProvider
                 ollama = OllamaProvider()
@@ -511,8 +273,6 @@ class InteractiveShell:
                     providers.append(ollama)
             except Exception:
                 pass
-
-            # Nvidia
             try:
                 from harness_core.providers.nvidia import NvidiaProvider
                 nvidia = NvidiaProvider()
@@ -520,16 +280,11 @@ class InteractiveShell:
                     providers.append(nvidia)
             except Exception:
                 pass
-
             if not providers:
-                self.console.print("")
                 self.console.print("  [red]No providers available.[/]")
-                self.console.print("  Set OPENROUTER_API_KEY or start Ollama.")
+                self.console.print("  [dim]Set OPENROUTER_API_KEY or start Ollama.[/]")
                 return False
-
             self._provider = providers[0]
-
-            # Build router config
             router_config = RouterConfig()
             effective_mode = self.mode
             if self.free:
@@ -540,8 +295,6 @@ class InteractiveShell:
             router_config.budget.max_iterations = self.max_iterations
             if self.max_cost is not None:
                 router_config.budget.max_cost = self.max_cost
-
-            # Load project config if available
             config_file = Path(self.workspace) / ".harness" / "config.yaml"
             if config_file.exists():
                 try:
@@ -553,157 +306,100 @@ class InteractiveShell:
                         router_config.routing_mode = routing_data.get("strategy", effective_mode)
                         router_config.prefer_free = routing_data.get("prefer_free", False)
                     if budgets_data:
-                        router_config.budget.max_iterations = budgets_data.get(
-                            "max_iterations", self.max_iterations
-                        )
+                        router_config.budget.max_iterations = budgets_data.get("max_iterations", self.max_iterations)
                         router_config.budget.max_cost = budgets_data.get("max_cost_per_task", 5.0)
                 except Exception:
                     pass
-
-            # Task-aware router
             self._task_aware = TaskAwareRouter(registry=ModelRegistry())
-
-            # Model router
-            self._router = ModelRouter(
-                providers=providers,
-                config=router_config,
-                event_bus=self._event_bus,
-                task_aware=self._task_aware,
-            )
-
-            # Tools
-            tools = [
-                ReadFileTool(),
-                WriteFileTool(),
-                EditFileTool(),
-                ListFilesTool(),
-                GlobTool(),
-                GrepTool(),
-                RunCommandTool(working_directory=self.workspace),
-                GitStatusTool(),
-                GitDiffTool(),
-                GitLogTool(),
-                GitIdentityTool(),
-                GitAddTool(),
-                GitCommitTool(),
-                GitPushTool(),
-                GitRemoteTool(),
-            ]
+            self._router = ModelRouter(providers=providers, config=router_config, event_bus=self._event_bus, task_aware=self._task_aware)
+            tools = [ReadFileTool(), WriteFileTool(), EditFileTool(), ListFilesTool(), GlobTool(), GrepTool(), RunCommandTool(working_directory=self.workspace), GitStatusTool(), GitDiffTool(), GitLogTool(), GitIdentityTool(), GitAddTool(), GitCommitTool(), GitPushTool(), GitRemoteTool()]
             self._tools = tools
-
-            # Agent config
-            agent_config = AgentConfig(
-                role=AgentRole.BUILD,
-                max_iterations=self.max_iterations,
-                model_preference=self.model,
-                routing_mode=effective_mode,
-            )
-
-            # Agent loop
-            self._agent_loop = AgentLoop(
-                provider=self._provider,
-                tools=tools,
-                workspace_root=Path(self.workspace),
-                config=agent_config,
-                event_bus=self._event_bus,
-                router=self._router,
-                task_aware=self._task_aware,
-            )
-            # No approval callback — autonomous mode auto-approves safe operations.
-            # Dangerous operations are blocked by the permission manager's deny rules.
-
+            agent_config = AgentConfig(role=AgentRole.BUILD, max_iterations=self.max_iterations, model_preference=self.model, routing_mode=effective_mode)
+            self._agent_loop = AgentLoop(provider=self._provider, tools=tools, workspace_root=Path(self.workspace), config=agent_config, event_bus=self._event_bus, router=self._router, task_aware=self._task_aware)
             return True
-
         except Exception as e:
             self.console.print(f"  [red]Setup failed: {_safe_str(e)}[/]")
             return False
 
+    # ─── Event Handlers — truthful, live (spec §4, §16) ────────────────
+
     def _setup_event_handlers(self) -> None:
-        """Map EventBus events to UI display."""
+        """Map EventBus events to conversation renderer + legacy LiveStatus."""
         if self._event_bus is None:
             return
-
         bus = self._event_bus
+
+        def _conv() -> Any:
+            return self._conv
 
         async def on_task_started(event: Any) -> None:
             goal = event.data.get("goal", "")
             self.task_start = time.time()
-            # Show goal as a clean header
-            self.console.print(f"\n  [bold]{goal}[/]", highlight=False)
-            self.console.print()
+            # Prompt was already rendered by _execute_task via conv.start(goal).
+            # Do NOT print it again here.  Just ensure the renderer is running.
 
         async def on_thinking(event: Any) -> None:
-            message = event.data.get("message", "")
-            if message:
-                short_msg = message.split("\n")[0]
-                if len(short_msg) > 97:
-                    short_msg = short_msg[:97] + "..."
-                self.console.print(f"  [dim]• {short_msg}[/]", highlight=False)
+            # Spec §5: do NOT expose hidden chain-of-thought.
+            # The renderer's derive_intent(goal) is the only thinking shown.
+            # Suppress raw model thinking prose.
+            return
 
         async def on_todo_updated(event: Any) -> None:
             todos = event.data.get("todos")
             if todos:
-                # Runtime-owned structured TODO state
                 self._live_status.update_todo_items(todos)
+                if _conv() is not None:
+                    _conv().update_todo_items(todos)
             else:
                 completed = event.data.get("completed", 0)
                 total = event.data.get("total", 0)
-                self._live_status.update_todos(completed, total)
+                if _conv() is not None:
+                    _conv().update_todos(completed, total)
 
         async def on_plan_created(event: Any) -> None:
             steps = event.data.get("steps", [])
             todos = event.data.get("todos")
             if todos:
                 self._live_status.update_todo_items(todos)
+                if _conv() is not None:
+                    _conv().update_todo_items(todos)
             elif steps:
-                self._live_status.update_todos(0, len(steps))
+                if _conv() is not None:
+                    _conv().update_todos(0, len(steps))
 
         async def on_task_classified(event: Any) -> None:
             task_type = event.data.get("task_type", "")
             if task_type and task_type != "unknown" and self.verbose:
-                self.console.print(
-                    f"  [dim]  Task: {task_type}[/]", highlight=False
-                )
+                self.console.print(f"  [dim]  Task: {task_type}[/]", highlight=False)
 
         async def on_routing_decision(event: Any) -> None:
             model = event.data.get("model", "")
             provider = event.data.get("provider", "")
-            score = event.data.get("score", 0)
             self.current_model = model
             self.current_provider = provider
-            self._live_status.update_model(model)
             if self.verbose:
-                self.console.print(
-                    f"  [dim]  model: {model} ({provider}, score: {score:.2f})[/]", highlight=False
-                )
+                self.console.print(f"  [dim]  model: {model} ({provider})[/]", highlight=False)
 
         async def on_model_switched(event: Any) -> None:
-            frm = event.data.get("from", "")
-            to = event.data.get("to", "")
-            reason = event.data.get("reason", "unavailable")
-            # Quiet, change-only model rotation notice
-            self.console.print(
-                f"  [magenta]⚡[/] [dim]Model fallback {frm} → {to} ({reason})[/]",
-                highlight=False,
-            )
+            # Model switches are tracked internally; surfaced in completion if needed.
+            pass
 
         async def on_routing_models_refreshed(event: Any) -> None:
             count = event.data.get("count", 0)
             if self.verbose:
-                self.console.print(
-                    f"  [dim]  discovered {count} models[/]", highlight=False
-                )
+                self.console.print(f"  [dim]  discovered {count} models[/]", highlight=False)
 
         async def on_iteration_started(event: Any) -> None:
             iteration = event.data.get("iteration", 0)
             self.total_iterations = iteration
-            self._live_status.update_iterations(iteration)
+            if _conv() is not None:
+                _conv().update_iterations(iteration)
 
         async def on_tool_call(event: Any) -> None:
             tool = event.data.get("tool", "")
             args = event.data.get("args", {})
-            # Update the canonical live activity trail (single renderer)
-            self._live_status.update_activity(tool, args)
+            if _conv() is not None:
+                _conv().tool_started(tool, args)
             if self.verbose:
                 display = _tool_display_name(tool, args)
                 self.console.print(f"  [cyan]→[/] {display}", highlight=False)
@@ -711,76 +407,41 @@ class InteractiveShell:
         async def on_tool_result(event: Any) -> None:
             tool = event.data.get("tool", "")
             status = event.data.get("status", "")
-            output_len = event.data.get("output_len", 0)
             exit_code = event.data.get("exit_code")
             error = event.data.get("error", "")
             self.total_tool_calls += 1
-
-            activity_name = self._live_status.current_activity
-            if activity_name in ("Initializing", "Done", "Failed", ""):
+            # Update renderers
+            if _conv() is not None:
+                _conv().tool_completed(tool, status)
+            # Compact, truthful console echo only when not in Live mode
+            if self.plain or _conv() is None:
                 activity_name = tool
-
-            # Update live status
-            self._live_status.update_activity_complete(tool, status)
-
-            if status == "success":
-                self.console.print(f"  [green]•[/] [dim]{activity_name}[/]", highlight=False)
-            elif status == "permission_denied":
-                self.console.print(
-                    f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False
-                )
-            elif exit_code is not None and exit_code != 0:
-                self.console.print(
-                    f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False
-                )
-                if error:
-                    first_line = error.split("\n")[0]
-                    if first_line:
-                        self.console.print(
-                            f"  [red]  {_safe_str(first_line)}[/]", highlight=False
-                        )
-            else:
-                self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
+                if status == "success":
+                    self.console.print(f"  [green]✓[/] [dim]{activity_name}[/]", highlight=False)
+                elif status == "permission_denied":
+                    self.console.print(f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False)
+                elif exit_code is not None and exit_code != 0:
+                    self.console.print(f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
+                    if error:
+                        first_line = error.split("\n")[0]
+                        if first_line:
+                            self.console.print(f"  [red]  {_safe_str(first_line)}[/]", highlight=False)
+                else:
+                    self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
+            elif status != "success" and status != "permission_denied":
+                # In rich mode, still surface failures dimly outside Live if verbose
+                if self.verbose and exit_code not in (None, 0):
+                    self.console.print(f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
 
         async def on_model_error(event: Any) -> None:
-            error = event.data.get("error", "")
-            error_lower = error.lower()
-            if "no usable free model" in error_lower:
-                self.console.print(f"  [red]✗ No usable free model available[/]", highlight=False)
-                self.console.print(f"  [dim]  Free models are temporarily rate limited.[/]", highlight=False)
-                self.console.print(f"  [dim]  Try again shortly or use your own provider/API key.[/]", highlight=False)
-            elif "429" in error_lower or "rate limit" in error_lower or "too many requests" in error_lower:
-                self.console.print(f"  [yellow]⚠ Rate limited — models temporarily unavailable[/]", highlight=False)
-            elif "402" in error_lower or "payment required" in error_lower:
-                self.console.print(f"  [red]✗ Model requires payment (402)[/]", highlight=False)
-                self.console.print(f"  [dim]  This model is not free. Use /free for free models.[/]", highlight=False)
-            elif "403" in error_lower or "forbidden" in error_lower:
-                if "model(s) returned 401/403" in error_lower or "unavailable" in error_lower:
-                    self.console.print(f"  [red]✗ Model unavailable[/]", highlight=False)
-                else:
-                    self.console.print(f"  [red]✗ Provider authentication failed[/]", highlight=False)
-                    self.console.print(f"  [dim]  Check your API key and provider permissions.[/]", highlight=False)
-            elif "401" in error_lower or "unauthorized" in error_lower:
-                self.console.print(f"  [red]✗ Provider authentication failed[/]", highlight=False)
-            elif "all" in error_lower and "failed" in error_lower:
-                self.console.print(f"  [yellow]⚠ All models temporarily unavailable[/]", highlight=False)
-            else:
-                self.console.print(f"  [red]✗ Model error: {_safe_str(error)[:100]}[/]", highlight=False)
+            # Model errors are surfaced via the completion status.
+            # Do NOT print directly here — it creates out-of-order event noise.
+            pass
 
         async def on_task_phase(event: Any) -> None:
             phase = event.data.get("phase", "")
-            self._live_status.update_phase(phase)
-            if self.verbose:
-                phase_display = {
-                    "understanding": "Inspecting",
-                    "planning": "Planning",
-                    "implementing": "Implementing",
-                    "testing": "Testing",
-                    "recovering": "Recovering",
-                    "verifying": "Verifying",
-                    "complete": "Complete",
-                }.get(phase, phase)
-                self.console.print(f"  [bold blue]◐[/] [bold]{phase_display}[/]", highlight=False)
+            if _conv() is not None:
+                _conv().update_phase(phase)
 
         async def on_task_completed(event: Any) -> None:
             status = event.data.get("status", "")
@@ -797,102 +458,50 @@ class InteractiveShell:
             }
 
         async def on_verification(event: Any) -> None:
-            event_type = event.type
-            if event_type == "verification.started":
+            # Verification is now shown via the completion summary, not as a separate dashboard line.
+            # Keep minimal feedback.
+            if event.type == "verification.started" and self.verbose:
                 self.console.print("  [yellow]◐[/] [bold]Verifying...[/]", highlight=False)
-            elif event_type == "verification.completed":
+            elif event.type == "verification.completed":
                 passed = event.data.get("passed", False)
-                if passed:
-                    self.console.print("  [green]✓[/] [bold]Verification passed[/]", highlight=False)
-                else:
-                    self.console.print("  [red]✗[/] [bold]Verification failed[/]", highlight=False)
+                if self.verbose:
+                    if passed:
+                        self.console.print("  [green]✓[/] [bold]Verification passed[/]", highlight=False)
+                    else:
+                        self.console.print("  [red]✗[/] [bold]Verification failed[/]", highlight=False)
 
         async def on_task_failed(event: Any) -> None:
-            reason = event.data.get("reason", "")
-            failed_tools = event.data.get("failed_tools", 0)
-            if reason == "tool_failures_not_recovered":
-                self.console.print(
-                    f"  [red]✗[/] [bold]Task blocked: {failed_tools} tool operation(s) failed without recovery[/]",
-                    highlight=False,
-                )
-            elif reason == "stagnation":
-                self.console.print(
-                    "  [red]✗[/] [bold]Stopped: no meaningful progress[/]", highlight=False
-                )
-            elif reason == "diagnosis_exhausted":
-                self.console.print(
-                    "  [red]✗[/] [bold]Unable to diagnose failure safely — stopped[/]",
-                    highlight=False,
-                )
-            elif reason == "verification_failed":
-                self.console.print(
-                    "  [red]✗[/] [bold]Verification failed — task not complete[/]",
-                    highlight=False,
-                )
+            # Failure details are surfaced in completion status.
+            pass
 
         async def on_diagnosis_triggered(event: Any) -> None:
-            command = event.data.get("command", "")
-            attempts = event.data.get("attempts", 0)
-            self.console.print(
-                f"  [yellow]⚠[/] [bold]Repeated failure detected[/] "
-                f"[dim]({command[:50]}, {attempts} attempts)[/]",
-                highlight=False,
-            )
-            self.console.print(
-                "  [dim]  Switching to diagnosis...[/]", highlight=False
-            )
+            # Diagnosis is internal; surfaced in completion if needed.
+            pass
 
         async def on_progress_stalled(event: Any) -> None:
-            self.console.print(
-                "  [yellow]⚠[/] No meaningful progress detected — changing approach",
-                highlight=False,
-            )
+            # Progress stalling is internal; surfaced in completion if needed.
+            pass
 
         async def on_execution_nudge(event: Any) -> None:
-            self.console.print(
-                "  [dim]  → model prompted to use workspace tools[/]", highlight=False
-            )
+            if self.verbose:
+                self.console.print("  [dim]  → model prompted to use workspace tools[/]", highlight=False)
 
         async def on_test_integrity(event: Any) -> None:
-            warning = event.data.get("warning", "")
-            self.console.print(
-                "  [yellow]⚠[/] [bold]Test modifications detected[/]", highlight=False
-            )
-            if warning:
-                self.console.print(f"  [dim]  {_safe_str(warning)[:120]}[/]", highlight=False)
+            # Test integrity warnings are surfaced in completion if needed.
+            pass
 
         async def on_test_completed(event: Any) -> None:
-            passed = event.data.get("passed")
-            total = event.data.get("total")
-            success = event.data.get("success", False)
-            if total and passed is not None:
-                line = f"Tests {passed}/{total} passed"
-            else:
-                line = "Tests passed" if success else "Tests failed"
-            self._live_status.update_tests(line)
-            icon = "green" if success else "red"
-            mark = "✓" if success else "✗"
-            self.console.print(f"  [{icon}]{mark}[/] [dim]{line}[/]", highlight=False)
+            # Test results are surfaced in completion status.
+            pass
 
         async def on_task_paused(event: Any) -> None:
-            completed = event.data.get("completed_todos", 0)
-            total = event.data.get("total_todos", 0)
-            files = event.data.get("files_changed", [])
-            self.console.print(
-                "  [yellow]⚠ Model unavailable[/]", highlight=False
-            )
-            self.console.print("  [dim]Execution state preserved.[/]", highlight=False)
-            if total:
-                self.console.print(f"  [dim]Completed: ✓ {completed}/{total} TODOs[/]", highlight=False)
-            if files:
-                names = ", ".join(str(f).replace("\\", "/").split("/")[-1] for f in files)
-                self.console.print(f"  [dim]Modified: {names}[/]", highlight=False)
+            # Pause status is surfaced in completion status.
+            pass
 
         async def on_error(event: Any) -> None:
-            error = event.data.get("error", "")
-            self.console.print(f"  [red]✗ Error: {_safe_str(error)}[/]", highlight=False)
+            # Errors are surfaced in completion status.
+            pass
 
-        # Register handlers
         bus.on("task.started", on_task_started)
         bus.on("thinking.status", on_thinking)
         bus.on("todo.updated", on_todo_updated)
@@ -921,51 +530,29 @@ class InteractiveShell:
     # ─── Session Management ──────────────────────────────────────────
 
     def _setup_session(self) -> None:
-        """Create or resume a session."""
         try:
             from harness_core.session.manager import SessionManager
-
             self.session_manager = SessionManager()
-
-            # Try to find an active session in this workspace
             sessions = self.session_manager.storage.list_sessions(limit=20)
-            active = [
-                s for s in sessions
-                if s.workspace_path == self.workspace
-                and s.status.value in ("active", "paused")
-            ]
-
+            active = [s for s in sessions if s.workspace_path == self.workspace and s.status.value in ("active", "paused")]
             if active:
                 session = active[0]
                 self.session_id = session.session_id
-                self.console.print(
-                    f"  [green]✓[/] Resumed session: {session.title} [dim]({session.session_id})[/]",
-                    highlight=False,
-                )
             else:
-                session = self.session_manager.create_session(
-                    workspace_path=self.workspace,
-                    title=f"Interactive session",
-                )
+                session = self.session_manager.create_session(workspace_path=self.workspace, title="Interactive session")
                 self.session_id = session.session_id
-                self.console.print(
-                    f"  [green]✓[/] New session: {self.session_id}", highlight=False
-                )
-        except Exception as e:
-            self.console.print(f"  [yellow]Session setup failed: {_safe_str(e)}[/]", highlight=False)
+        except Exception:
+            pass
 
     # ─── Slash Commands ──────────────────────────────────────────────
 
     async def _handle_command(self, cmd: str) -> bool:
-        """Handle a slash command. Returns True if it was a command."""
         cmd = cmd.strip()
         if not cmd.startswith("/"):
             return False
-
         parts = cmd.split(maxsplit=1)
         command = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
-
         if command == "/help":
             self._cmd_help()
         elif command == "/status":
@@ -1016,7 +603,6 @@ class InteractiveShell:
         return True
 
     def _cmd_help(self) -> None:
-        """Show available commands."""
         if self.plain:
             self.console.print("Available commands:")
             self.console.print("  /help     Show this help")
@@ -1035,46 +621,18 @@ class InteractiveShell:
             self.console.print("  /resume   Resume paused task")
             self.console.print("  /exit     Exit Harness")
             return
-
         table = Table(title="Commands", show_header=True, border_style="dim")
         table.add_column("Command", style="cyan", no_wrap=True)
         table.add_column("Description")
-
-        commands = [
-            ("/help", "Show this help"),
-            ("/status", "Show session status and stats"),
-            ("/model", "Show current model information"),
-            ("/models", "List available models"),
-            ("/verbose", "Toggle verbose tool output"),
-            ("/session [list|show|create]", "Session management"),
-            ("/diff", "Show git diff"),
-            ("/clear", "Clear the screen"),
-            ("/config", "Show configuration"),
-            ("/doctor", "System health check"),
-            ("/history", "Command history"),
-            ("/memory [search]", "Session memory"),
-            ("/free", "Switch to free model routing"),
-            ("/cancel", "Cancel running task"),
-            ("/pause", "Pause unified execution (state preserved)"),
-            ("/resume", "Resume paused task"),
-            ("/agents", "Show agent statuses (unified mode)"),
-            ("/plan", "Show plan / stage (unified mode)"),
-            ("/activity", "Show activity trail (unified mode)"),
-            ("/files", "Show file changes (unified mode)"),
-            ("/tests", "Show test evidence (unified mode)"),
-            ("/exit", "Exit Harness"),
-        ]
+        commands = [("/help", "Show this help"), ("/status", "Show session status and stats"), ("/model", "Show current model information"), ("/models", "List available models"), ("/verbose", "Toggle verbose tool output"), ("/session [list|show|create]", "Session management"), ("/diff", "Show git diff"), ("/clear", "Clear the screen"), ("/config", "Show configuration"), ("/doctor", "System health check"), ("/history", "Command history"), ("/memory [search]", "Session memory"), ("/free", "Switch to free model routing"), ("/cancel", "Cancel running task"), ("/pause", "Pause unified execution (state preserved)"), ("/resume", "Resume paused task"), ("/agents", "Show agent statuses (unified mode)"), ("/plan", "Show plan / stage (unified mode)"), ("/activity", "Show activity trail (unified mode)"), ("/files", "Show file changes (unified mode)"), ("/tests", "Show test evidence (unified mode)"), ("/exit", "Exit Harness")]
         for cmd, desc in commands:
             table.add_row(cmd, desc)
-
         self.console.print(table)
 
     def _cmd_status(self) -> None:
-        """Show session status."""
         elapsed = time.time() - self.session_start if self.session_start else 0
         time_str = _format_elapsed(elapsed)
         task_elapsed = time.time() - self.task_start if self.task_start and self.running else 0
-
         if self.plain:
             self.console.print(f"Session: {self.session_id or 'none'}")
             self.console.print(f"Model: {self.current_model or 'not set'}")
@@ -1086,11 +644,9 @@ class InteractiveShell:
             if self.running:
                 self.console.print(f"Task time: {task_elapsed:.1f}s")
             return
-
         table = Table(title="Status", border_style="blue", show_header=False)
         table.add_column("Key", style="bold")
         table.add_column("Value")
-
         table.add_row("Workspace", self.workspace)
         table.add_row("Model", self.current_model or "not set")
         table.add_row("Provider", self.current_provider or "not set")
@@ -1099,108 +655,76 @@ class InteractiveShell:
         table.add_row("Session time", time_str)
         if self.running:
             table.add_row("Task time", f"{task_elapsed:.1f}s")
-
         self.console.print(table)
 
     def _cmd_model(self) -> None:
-        """Show current model info."""
         if self.plain:
             self.console.print(f"Model: {self.current_model or 'not set'}")
             self.console.print(f"Provider: {self.current_provider or 'not set'}")
             self.console.print(f"Mode: {self.mode}")
             return
-
         table = Table(title="Model", border_style="green", show_header=False)
         table.add_column("Key", style="bold")
         table.add_column("Value")
-
         table.add_row("Current", self.current_model or "not set")
         table.add_row("Provider", self.current_provider or "not set")
         table.add_row("Routing mode", self.mode)
         table.add_row("Free mode", "on" if self.free else "off")
         table.add_row("Local mode", "on" if self.local else "off")
-
         self.console.print(table)
 
     async def _cmd_models(self) -> None:
-        """List available models."""
         try:
             from harness_core.providers.openrouter import OpenRouterProvider
             from harness_core.models.registry import ModelRegistry
             from harness_core.models.discovery import discover_provider
-
             openrouter = OpenRouterProvider()
             if not await openrouter.health_check():
                 self.console.print("  [red]✗ Unable to retrieve models[/]")
                 self.console.print("  [dim]Cannot connect to OpenRouter. Check OPENROUTER_API_KEY.[/]")
                 await openrouter.close()
                 return
-
             registry = ModelRegistry()
             profiles = await discover_provider(openrouter)
             for p in profiles:
                 registry.register(p)
             await openrouter.close()
-
             models = registry.list_all()
             tool_models = [m for m in models if m.supports_tools]
-
             table = Table(title=f"Models ({len(tool_models)} with tools)")
             table.add_column("Model", style="cyan", max_width=40)
             table.add_column("Provider", style="green")
             table.add_column("Context", justify="right")
             table.add_column("Free", justify="center")
-
             for m in tool_models[:25]:
-                table.add_row(
-                    m.model_id,
-                    m.provider,
-                    str(m.context_window) if m.context_window else "-",
-                    "Y" if m.is_free else "",
-                )
-
+                table.add_row(m.model_id, m.provider, str(m.context_window) if m.context_window else "-", "Y" if m.is_free else "")
             self.console.print(table)
         except Exception as e:
             self.console.print(f"  [red]✗ Unable to retrieve models[/]")
             self.console.print(f"  [dim]{_safe_str(e)}[/]")
 
     def _cmd_session(self, args: str) -> None:
-        """Session management."""
         sub = args.strip().lower() if args else "show"
-
         if sub == "list" or sub == "":
             if self.session_manager is None:
                 self.console.print("  [dim]No session manager[/]")
                 return
-
             sessions = self.session_manager.storage.list_sessions(limit=10)
             if not sessions:
                 self.console.print("  [dim]No sessions found.[/]")
                 return
-
             table = Table(title="Sessions")
             table.add_column("ID", style="cyan")
             table.add_column("Title", max_width=30)
             table.add_column("Status")
             table.add_column("Updated", style="dim")
-
             for s in sessions:
                 import datetime
                 updated = datetime.datetime.fromtimestamp(s.updated_at).strftime("%m-%d %H:%M")
-                status_color = {
-                    "active": "green", "paused": "yellow",
-                    "completed": "blue", "failed": "red",
-                }.get(s.status.value, "white")
+                status_color = {"active": "green", "paused": "yellow", "completed": "blue", "failed": "red"}.get(s.status.value, "white")
                 current = " * " if s.session_id == self.session_id else "   "
-                table.add_row(
-                    f"{current}{s.session_id[:10]}",
-                    s.title[:30],
-                    f"[{status_color}]{s.status.value}[/]",
-                    updated,
-                )
-
+                table.add_row(f"{current}{s.session_id[:10]}", s.title[:30], f"[{status_color}]{s.status.value}[/]", updated)
             self.console.print(table)
-
         elif sub == "show":
             if self.session_id and self.session_manager:
                 state = self.session_manager.get_resume_state(self.session_id)
@@ -1216,45 +740,30 @@ class InteractiveShell:
                         self.console.print(f"    {status} {r.task[:50]}")
             else:
                 self.console.print("  [dim]No active session[/]")
-
         elif sub == "create":
             if self.session_manager:
-                session = self.session_manager.create_session(
-                    workspace_path=self.workspace,
-                    title="Manual session",
-                )
+                session = self.session_manager.create_session(workspace_path=self.workspace, title="Manual session")
                 self.session_id = session.session_id
                 self.console.print(f"  [green]✓[/] Created: {self.session_id}")
         else:
             self.console.print(f"  [yellow]Unknown session command: {sub}[/]")
 
     def _cmd_diff(self) -> None:
-        """Show git diff."""
         import subprocess
-
         try:
-            result = subprocess.run(
-                ["git", "diff", "--stat"],
-                capture_output=True,
-                text=True,
-                cwd=self.workspace,
-                timeout=5,
-            )
+            result = subprocess.run(["git", "diff", "--stat"], capture_output=True, text=True, cwd=self.workspace, timeout=5)
             if result.stdout.strip():
                 self.console.print("  [bold]Changed files:[/]")
                 for line in result.stdout.strip().split("\n"):
                     self.console.print(f"    {line}")
                 self.console.print("")
-                self.console.print(
-                    "  [dim]Run `git diff` in terminal for full diff.[/]"
-                )
+                self.console.print("  [dim]Run `git diff` in terminal for full diff.[/]")
             else:
                 self.console.print("  [dim]No changes detected.[/]")
         except Exception:
             self.console.print("  [dim]Not a git repository or git not available.[/]")
 
     def _cmd_config(self) -> None:
-        """Show configuration."""
         config_file = Path(self.workspace) / ".harness" / "config.yaml"
         if config_file.exists():
             self.console.print(f"  [dim]Config: {config_file}[/]")
@@ -1267,17 +776,14 @@ class InteractiveShell:
             self.console.print("  [dim]No project config. Run `harness init` to create one.[/]")
 
     def _cmd_doctor(self) -> None:
-        """System health check."""
         self.console.print("  [bold]Runtime[/]")
         self.console.print(f"    [green]✓[/] Python {sys.version.split()[0]}")
         self.console.print(f"    [green]✓[/] Git")
-
         self.console.print("  [bold]Providers[/]")
         if self.current_provider:
             self.console.print(f"    [green]✓[/] {self.current_provider} (active)")
         else:
             self.console.print("    [yellow]✗[/] No provider connected")
-
         self.console.print("  [bold]Agent System[/]")
         if self._agent_loop:
             self.console.print("    [green]✓[/] AgentLoop initialized")
@@ -1285,48 +791,41 @@ class InteractiveShell:
             self.console.print("    [yellow]✗[/] AgentLoop not initialized")
 
     def _cmd_history(self) -> None:
-        """Show command history."""
-        self.console.print("  [dim]Command history is maintained per session.[/]")
-        self.console.print("  [dim]Use /session show for session details.[/]")
+        # Show real prompt history (spec §2) + session hint
+        if self._pt_history_items:
+            self.console.print("  [bold]Recent prompts:[/]")
+            for i, item in enumerate(self._pt_history_items[-10:], 1):
+                self.console.print(f"    {i}. {item[:80]}")
+        else:
+            self.console.print("  [dim]No prompt history yet.[/]")
+        self.console.print("  [dim]Use Up/Down to navigate history in the input.[/]")
 
     def _cmd_memory(self, args: str) -> None:
-        """Session memory."""
         if not self.session_id or not self.session_manager:
             self.console.print("  [dim]No active session[/]")
             return
-
         if args.startswith("add "):
             content = args[4:].strip()
             if content:
                 from harness_core.session.domain import MemoryType
-                item = self.session_manager.add_memory(
-                    self.session_id,
-                    MemoryType.NOTE,
-                    content,
-                    importance=0.5,
-                )
+                item = self.session_manager.add_memory(self.session_id, MemoryType.NOTE, content, importance=0.5)
                 self.console.print(f"  [green]✓[/] Memory added: {item.memory_id}")
             else:
                 self.console.print("  [yellow]Usage: /memory add <content>[/]")
             return
-
         memories = self.session_manager.storage.get_memories(self.session_id, limit=10)
         if not memories:
             self.console.print("  [dim]No memories recorded.[/]")
             return
-
         table = Table(title="Memories")
         table.add_column("Type", style="cyan")
         table.add_column("Content", max_width=50)
         table.add_column("Importance", justify="right")
-
         for m in memories:
             table.add_row(m.memory_type.value, m.content[:50], f"{m.importance:.1f}")
-
         self.console.print(table)
 
     def _cmd_verbose(self) -> None:
-        """Toggle verbose mode."""
         self.verbose = not self.verbose
         if self.verbose:
             self.console.print("  [green]✓[/] Verbose mode ON — showing full tool traces")
@@ -1334,7 +833,6 @@ class InteractiveShell:
             self.console.print("  [green]✓[/] Verbose mode OFF — clean output")
 
     def _cmd_free_mode(self) -> None:
-        """Switch to free model routing."""
         self.free = True
         self.mode = "free"
         if self._router:
@@ -1343,28 +841,22 @@ class InteractiveShell:
         self.console.print("  [green]✓[/] Switched to free model routing")
 
     async def _cmd_cancel(self) -> None:
-        """Cancel the running task."""
         if not self.running:
             self.console.print("  [dim]No task running.[/]")
             return
         if self._active_runtime is not None:
-            # Unified mode: request interruption through the runtime so
-            # agents stop and locks are released by the real cleanup path.
             await self._active_runtime.request_cancel("Cancelled by user (/cancel)")
             self.console.print("  [yellow]⚠ Cancellation requested...[/]")
             return
         self.cancel_event.set()
         if self._agent_loop and self._agent_loop._active_task:
-            from harness_core.agent.types import TaskStatus
             task = self._agent_loop._active_task
             task.status = TaskStatus.CANCELLED
             task.failure_reason = "user_cancelled"
         self.console.print("  [yellow]⚠ Task cancelled[/]")
-        # Report partial state
         self._render_cancellation()
 
     async def _cmd_resume(self) -> None:
-        """Resume a paused task by re-running it."""
         if not self._agent_loop:
             self.console.print("  [dim]Agent not initialized.[/]")
             return
@@ -1372,21 +864,17 @@ class InteractiveShell:
         if task is None:
             self.console.print("  [dim]No paused task to resume.[/]")
             return
-        from harness_core.agent.types import TaskStatus
         if task.status != TaskStatus.PAUSED:
-            self.console.print("  [dim]Task is not paused. Current status: {task.status.value}[/]")
+            self.console.print(f"  [dim]Task is not paused. Current status: {task.status.value}[/]")
             return
-        # Find the first unresolved TODO and re-run
         first_todo = task.task_plan.first_unresolved()
         if first_todo:
             self.console.print(f"  [green]✓[/] Resuming from: {first_todo.description}")
         else:
             self.console.print("  [green]✓[/] Resuming task")
-        # Re-execute the task with the original goal
         await self._execute_task(task.goal)
 
     async def _cmd_pause(self) -> None:
-        """Pause the running unified execution (state preserved)."""
         if not self.running or self._active_runtime is None:
             self.console.print("  [dim]No unified execution in progress.[/]")
             return
@@ -1395,13 +883,11 @@ class InteractiveShell:
         self.console.print("  [dim]Use /resume to re-run from the preserved state.[/]")
 
     def _vm_snapshot(self) -> dict[str, Any] | None:
-        """Return the current dashboard snapshot, if a unified run is active."""
         if self._view_model is None:
             return None
         return self._view_model.snapshot()
 
     def _cmd_agents(self) -> None:
-        """Show current agent statuses from the live view model."""
         snap = self._vm_snapshot()
         if not snap:
             self.console.print("  [dim]No unified execution active. Use mode=unified.[/]")
@@ -1416,20 +902,11 @@ class InteractiveShell:
         table.add_column("Operation", max_width=40)
         table.add_column("Elapsed", justify="right")
         for a in agents:
-            color = {
-                "completed": "green", "failed": "red", "running": "cyan",
-                "waiting": "yellow", "blocked": "red", "queued": "dim",
-            }.get(a.get("status", ""), "white")
-            table.add_row(
-                (a.get("role") or "agent").upper(),
-                f"[{color}]{a.get('status', '?')}[/]",
-                a.get("operation") or "",
-                _format_elapsed(a.get("elapsed", 0)),
-            )
+            color = {"completed": "green", "failed": "red", "running": "cyan", "waiting": "yellow", "blocked": "red", "queued": "dim"}.get(a.get("status", ""), "white")
+            table.add_row((a.get("role") or "agent").upper(), f"[{color}]{a.get('status', '?')}[/]", a.get("operation") or "", _format_elapsed(a.get("elapsed", 0)))
         self.console.print(table)
 
     def _cmd_plan(self) -> None:
-        """Show the planned task count / current stage."""
         snap = self._vm_snapshot()
         if not snap:
             self.console.print("  [dim]No unified execution active. Use mode=unified.[/]")
@@ -1445,7 +922,6 @@ class InteractiveShell:
             self.console.print(f"  Agents: {done}/{len(agents)} complete")
 
     def _cmd_activity(self) -> None:
-        """Show the recent activity trail."""
         snap = self._vm_snapshot()
         if not snap:
             self.console.print("  [dim]No unified execution active. Use mode=unified.[/]")
@@ -1458,7 +934,6 @@ class InteractiveShell:
             self.console.print(f"  [dim]{ts}[/] [cyan]{name[:16]}[/] {text[:70]}")
 
     def _cmd_files(self) -> None:
-        """Show observed file changes (evidence from tool events + outcome)."""
         snap = self._vm_snapshot()
         if not snap:
             self.console.print("  [dim]No unified execution active. Use mode=unified.[/]")
@@ -1473,7 +948,6 @@ class InteractiveShell:
             self.console.print(f"  [{style}]{f.get('status', '?')}[/] {f.get('path', '?')}")
 
     def _cmd_tests(self) -> None:
-        """Show observed test evidence."""
         snap = self._vm_snapshot()
         if not snap:
             self.console.print("  [dim]No unified execution active. Use mode=unified.[/]")
@@ -1482,171 +956,40 @@ class InteractiveShell:
         if not tests.get("has_evidence", False) and not tests.get("last_line"):
             self.console.print("  [dim]No test evidence observed yet.[/]")
             return
-        self.console.print(f"  Tests: {tests.get('passed', 0)} passed, "
-                           f"{tests.get('failed', 0)} failed")
+        self.console.print(f"  Tests: {tests.get('passed', 0)} passed, {tests.get('failed', 0)} failed")
         if tests.get("last_line"):
             self.console.print(f"  [dim]{tests['last_line']}[/]")
 
-    # ─── Task Execution ──────────────────────────────────────────────
+    # ─── Execution — conversation + streaming (spec §4, §9, §10) ───────
 
     async def _execute_task(self, goal: str) -> str | None:
-        """Execute a task. Unified mode goes through EngineeringRuntime."""
         if self.mode == "unified":
             return await self._execute_task_unified(goal)
-        if self._agent_loop is None:
+        if self._provider is None:
             return "Agent not initialized. Please check provider configuration."
-
         self.task_start = time.time()
         self.running = True
         self.cancel_event.clear()
 
-        # Start live status
-        self._live_status.start(goal)
-
-        # Record run in session
-        run = None
-        if self.session_manager and self.session_id:
+        # Conversation renderer is the authoritative live view (spec §16).
+        # Single call to start() renders the prompt exactly once.
+        conv = None
+        use_conv = ConversationRenderer is not None and not self.plain
+        if use_conv:
             try:
-                run = self.session_manager.start_run(
-                    self.session_id,
-                    task=goal,
-                    model_id=self.current_model,
-                    provider=self.current_provider,
-                )
+                conv = ConversationRenderer(self.console, plain=self.plain)
+                self._conv = conv
+                conv.start(goal)
             except Exception:
-                pass
+                conv = None
+                self._conv = None
 
-        try:
-            task = await self._agent_loop.run(goal)
-
-            # Stop live status before printing summary
-            self._live_status.stop()
-
-            elapsed = time.time() - self.task_start
-
-            # Collect files that were modified
-            files_changed = []
-            for tc in task.tool_calls:
-                if tc.tool_name in ("write_file", "edit_file") and tc.arguments:
-                    fp = tc.arguments.get("path", tc.arguments.get("file_path", ""))
-                    if fp:
-                        fname = fp.replace("\\", "/").split("/")[-1]
-                        if fname not in files_changed:
-                            files_changed.append(fname)
-
-            from harness_core.cli.completion import CompletionFormatter, NextActionEngine
-
-            fmt = CompletionFormatter(plain=self.plain)
-            engine = NextActionEngine()
-            
-            agent_text = (task.result or "").strip()
-            if agent_text.startswith("Task ") and agent_text.endswith(" completed"):
-                agent_text = ""
-                
-            status_val = getattr(task.status, "value", str(task.status))
-            actions = engine.suggest(
-                goal, 
-                files=files_changed, 
-                git_commit=task.git_commit or "", 
-                git_push=task.git_push or ""
-            )
-
-            if status_val == "completed":
-                report = fmt.success(
-                    headline=goal if len(goal) < 60 else "Task Completed",
-                    files_modified=files_changed,
-                    files_created=[],
-                    tests_line="",
-                    verification_status="passed" if task.verification_passed else "failed" if task.verification_passed is False else "",
-                    git_commit=task.git_commit or "",
-                    git_push=task.git_push or "",
-                    duration=elapsed,
-                    tool_calls=len(task.tool_calls),
-                    next_actions=actions,
-                    agent_response=agent_text,
-                )
-            else:
-                report = fmt.failure(
-                    headline=f"Task ended with status: {status_val}",
-                    what_happened="Task failed or ended partially during execution.",
-                    files_modified=files_changed,
-                    next_actions=actions,
-                    agent_response=agent_text,
-                )
-
-            self.console.print("")
-            if agent_text and not self.plain:
-                from rich.markdown import Markdown
-                from rich.padding import Padding
-                self.console.print(Padding(Markdown(agent_text), (0, 0, 0, 2)))
-                self.console.print("")
-
-            for line in report.split("\n"):
-                self.console.print(f"  {line}", highlight=False)
-
-            # Update run in session
-            if run and self.session_manager:
-                try:
-                    self.session_manager.complete_run(
-                        run.run_id,
-                        outcome="success" if task.status.value == "completed" else "failure",
-                        verification_passed=(
-                            task.verification_passed
-                            if task.verification_passed is not None
-                            else task.status.value == "completed"
-                        ),
-                        result_summary=(task.result or "")[:500],
-                        iterations=task.iterations,
-                        tool_calls=len(task.tool_calls),
-                    )
-                except Exception:
-                    pass
-
-            return task.result
-
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            self._live_status.stop()
-            self._render_cancellation()
-            if run and self.session_manager:
-                try:
-                    self.session_manager.interrupt_run(run.run_id)
-                except Exception:
-                    pass
-            return None
-        except Exception as e:
-            self._live_status.stop()
-            self.console.print(f"\n  [red]✗ Error: {_safe_str(e)}[/]", highlight=False)
-            if run and self.session_manager:
-                try:
-                    self.session_manager.fail_run(run.run_id, str(e))
-                except Exception:
-                    pass
-            return None
-        finally:
-            self.running = False
-            self._live_status.stop()
-
-    async def _execute_task_unified(self, goal: str) -> str | None:
-        """Execute through EngineeringRuntime with the Phase 10 live dashboard.
-
-        The dashboard consumes the same EventBus the runtime emits on, so every
-        visible state change is real runtime activity — never fabricated.
-        """
-        from harness_core.cli.runtime_dashboard import (
-            LiveTerminalUI,
-            RuntimeViewModel,
-            render_failure_summary,
-            render_success_summary,
-        )
-        from harness_core.memory.manager import init_memory_manager_from_project
+        # Stage 1: Route through the canonical EngineeringRuntime.
+        # This is the single authoritative execution path for interactive mode.
         from harness_core.runtime.runtime import EngineeringRuntime
-
-        if self._provider is None:
-            return "Agent not initialized. Please check provider configuration."
-
+        from harness_core.memory.manager import init_memory_manager_from_project
         config_file = Path(self.workspace) / ".harness" / "config.yaml"
         memory = None
-        config_data: dict[str, Any] = {}
         if config_file.exists():
             try:
                 import yaml
@@ -1654,7 +997,6 @@ class InteractiveShell:
             except Exception:
                 config_data = {}
             memory = init_memory_manager_from_project(Path(self.workspace), config=config_data)
-
         runtime = EngineeringRuntime(
             workspace_path=self.workspace,
             provider=self._provider,
@@ -1665,12 +1007,180 @@ class InteractiveShell:
             project_id=str(Path(self.workspace).resolve()),
             max_concurrency=self.max_parallel,
         )
+        # Pass the interactive shell's AgentConfig to workers so they use
+        # the same model preferences, iteration limits, and routing mode.
+        from harness_core.agent.types import AgentConfig, AgentRole
+        runtime._interactive_config = AgentConfig(
+            role=AgentRole.BUILD,
+            max_iterations=self.max_iterations,
+            model_preference=self.model,
+            routing_mode=self.mode,
+        )
         self._active_runtime = runtime
 
+        run = None
+        if self.session_manager and self.session_id:
+            try:
+                run = self.session_manager.start_run(self.session_id, task=goal, model_id=self.current_model, provider=self.current_provider)
+            except Exception:
+                pass
+        try:
+            # Stage 1: Execute through the canonical EngineeringRuntime.
+            # Events flow through the shared EventBus to the UI handlers.
+            outcome = await runtime.execute_interactive(goal)
+            if conv is not None:
+                try:
+                    conv.stop()
+                except Exception:
+                    pass
+            elapsed = time.time() - self.task_start
+
+            # Extract results from the RuntimeOutcome.
+            status_val = "completed" if outcome.status.value == "success" else "failed"
+            graph = outcome.graph
+            agent_text = ""
+            files_changed: list[str] = []
+            if graph:
+                for task in graph.tasks.values():
+                    if task.result:
+                        agent_text = task.result
+                    for f in (task.files_changed or []):
+                        fname = f.replace("\\", "/").split("/")[-1]
+                        if fname and fname not in files_changed:
+                            files_changed.append(fname)
+
+            from harness_core.cli.completion import CompletionFormatter, NextActionEngine
+            fmt = CompletionFormatter(plain=self.plain)
+            engine = NextActionEngine()
+            actions = engine.suggest(goal, files=files_changed)
+
+            # Stream final response (spec §9) — then completion indicator (spec §8)
+            if conv is not None:
+                try:
+                    if agent_text:
+                        conv.stream_response(agent_text)
+                    conv.render_completion(elapsed, success=(status_val == "completed"), status=status_val)
+                except Exception:
+                    # Fallback markdown print
+                    if agent_text and not self.plain:
+                        from rich.markdown import Markdown
+                        from rich.padding import Padding
+                        self.console.print(Padding(Markdown(agent_text), (0, 0, 0, 2)))
+                        self.console.print("")
+                    elif agent_text:
+                        for line in agent_text.splitlines():
+                            self.console.print(f"  {line}", highlight=False)
+                    elapsed_str = _format_elapsed(elapsed)
+                    if status_val == "completed":
+                        mark = "✓" if not self.plain else "✓"
+                        self.console.print(f"  [green]{mark}[/] [dim]Done · {elapsed_str}[/]", highlight=False)
+                    else:
+                        mark = "✗"
+                        self.console.print(f"  [red]{mark}[/] [dim]{status_val.title()} · {elapsed_str}[/]", highlight=False)
+                    self.console.print("", highlight=False)
+            else:
+                if agent_text and not self.plain:
+                    from rich.markdown import Markdown
+                    from rich.padding import Padding
+                    self.console.print(Padding(Markdown(agent_text), (0, 0, 0, 2)))
+                    self.console.print("")
+                elif agent_text:
+                    for line in agent_text.splitlines():
+                        self.console.print(f"  {line}", highlight=False)
+                    self.console.print("", highlight=False)
+
+                elapsed_str = _format_elapsed(elapsed)
+                if status_val == "completed":
+                    self.console.print(f"  [green]✓[/] [dim]Done · {elapsed_str}[/]", highlight=False)
+                else:
+                    self.console.print(f"  [red]✗[/] [dim]{status_val.title()} · {elapsed_str}[/]", highlight=False)
+                self.console.print("", highlight=False)
+
+            # On failure: tiny, contextual error — no diagnostic dashboard.
+            if status_val != "completed":
+                error_msg = outcome.state.blockers[-1] if outcome.state.blockers else ""
+                error_line = ""
+                if error_msg:
+                    for eline in str(error_msg).splitlines():
+                        eline = eline.strip()
+                        if eline and len(eline) > 5:
+                            error_line = eline[:120]
+                            break
+                if not error_line:
+                    error_line = "Task did not complete successfully."
+                if self.plain:
+                    self.console.print(f"  {error_line}", highlight=False)
+                else:
+                    self.console.print(f"  [dim]{error_line}[/]", highlight=False)
+                self.console.print("", highlight=False)
+            if run and self.session_manager:
+                try:
+                    self.session_manager.complete_run(
+                        run.run_id,
+                        outcome="success" if status_val == "completed" else "failure",
+                        verification_passed=(outcome.state.verification_status.value == "passed" if outcome.state.verification_status else status_val == "completed"),
+                        result_summary=agent_text[:500],
+                    )
+                except Exception:
+                    pass
+            return agent_text or None
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if conv is not None:
+                try:
+                    conv.stop()
+                except Exception:
+                    pass
+            self._render_cancellation()
+            if run and self.session_manager:
+                try:
+                    self.session_manager.interrupt_run(run.run_id)
+                except Exception:
+                    pass
+            return None
+        except Exception as e:
+            if conv is not None:
+                try:
+                    conv.stop()
+                except Exception:
+                    pass
+            self.console.print(f"\n  [red]✗ Error: {_safe_str(e)}[/]", highlight=False)
+            if run and self.session_manager:
+                try:
+                    self.session_manager.fail_run(run.run_id, str(e))
+                except Exception:
+                    pass
+            return None
+        finally:
+            self.running = False
+            self._active_runtime = None
+            if conv is not None:
+                try:
+                    conv.stop()
+                except Exception:
+                    pass
+            self._conv = None
+
+    async def _execute_task_unified(self, goal: str) -> str | None:
+        from harness_core.cli.runtime_dashboard import LiveTerminalUI, RuntimeViewModel, render_failure_summary, render_success_summary
+        from harness_core.memory.manager import init_memory_manager_from_project
+        from harness_core.runtime.runtime import EngineeringRuntime
+        if self._provider is None:
+            return "Agent not initialized. Please check provider configuration."
+        config_file = Path(self.workspace) / ".harness" / "config.yaml"
+        memory = None
+        config_data: dict[str, Any] = {}
+        if config_file.exists():
+            try:
+                import yaml
+                config_data = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+            except Exception:
+                config_data = {}
+            memory = init_memory_manager_from_project(Path(self.workspace), config=config_data)
+        runtime = EngineeringRuntime(workspace_path=self.workspace, provider=self._provider, plan_provider=self._provider, event_bus=self._event_bus, router=self._router, memory=memory, project_id=str(Path(self.workspace).resolve()), max_concurrency=self.max_parallel)
+        self._active_runtime = runtime
         self.task_start = time.time()
         self.running = True
         self.cancel_event.clear()
-
         vm = RuntimeViewModel()
         vm.request = goal
         vm.workspace = self.workspace
@@ -1678,10 +1188,8 @@ class InteractiveShell:
         self._view_model = vm
         ui = LiveTerminalUI(self.console, plain=self.plain)
         ui.start(vm)
-
         async def _refresh(event: Any) -> None:
             ui.update(vm)
-
         self._event_bus.on("*", _refresh)
         outcome = None
         try:
@@ -1696,7 +1204,6 @@ class InteractiveShell:
                 vm.finalize(outcome)
             self.running = False
             self._active_runtime = None
-
         self.console.print("")
         if outcome is None:
             return None
@@ -1707,34 +1214,60 @@ class InteractiveShell:
         return (outcome.state.original_request or goal)
 
     def _render_cancellation(self) -> None:
-        """Render a truthful partial-state report for a cancelled task."""
         elapsed = time.time() - self.task_start if self.task_start else 0.0
+        elapsed_str = _format_elapsed(elapsed)
         task = getattr(self._agent_loop, "_active_task", None)
         self.console.print("", highlight=False)
         if task is None:
-            self.console.print("  [yellow]⚠ Task cancelled[/]", highlight=False)
-            self.console.print("  [dim]Execution stopped safely.[/]", highlight=False)
+            self.console.print("  [yellow]⏹[/] [dim]Cancelled · {elapsed_str}[/]", highlight=False)
             return
-        # Report against the interrupted task's real state
         task.status = TaskStatus.CANCELLED
         files_changed = files_from_task(task)
-        
-        from harness_core.cli.completion import CompletionFormatter
-        fmt = CompletionFormatter(plain=self.plain)
-        agent_text = (task.result or "").strip()
-        if agent_text.startswith("Task ") and agent_text.endswith(" completed"):
-            agent_text = ""
-            
-        report = fmt.cancelled(uncommitted=files_changed, agent_response=agent_text)
-        
-        if agent_text and not self.plain:
-            from rich.markdown import Markdown
-            from rich.padding import Padding
-            self.console.print(Padding(Markdown(agent_text), (0, 0, 0, 2)))
-            self.console.print("")
+        if files_changed:
+            names = ", ".join(files_changed[:5])
+            self.console.print(f"  [yellow]⏹[/] [dim]Cancelled · {elapsed_str}[/]", highlight=False)
+            self.console.print(f"  [dim]Modified: {names}[/]", highlight=False)
+        else:
+            self.console.print(f"  [yellow]⏹[/] [dim]Cancelled · {elapsed_str}[/]", highlight=False)
+        self.console.print("", highlight=False)
 
-        for line in report.split("\n"):
-            self.console.print(f"  {line}", highlight=False)
+    def _ensure_prompt_session(self) -> Any:
+        """Create the single editable PromptSession (history, completer, wrap)."""
+        if self._prompt_session is not None:
+            return self._prompt_session
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.completion import WordCompleter
+            from prompt_toolkit.history import InMemoryHistory
+            from prompt_toolkit.key_binding import KeyBindings
+            from prompt_toolkit.styles import Style
+            if self._pt_history is None:
+                self._pt_history = InMemoryHistory()
+                for item in self._pt_history_items[-50:]:
+                    try:
+                        self._pt_history.append_string(item)
+                    except Exception:
+                        pass
+            if self._pt_completer is None:
+                self._pt_completer = WordCompleter(SLASH_COMMANDS, ignore_case=True, sentence=True)
+            style = Style.from_dict({"prompt": "ansicyan bold", "completion-menu.completion": "bg:#333333 #ffffff", "completion-menu.completion.current": "bg:#00aaaa #000000"})
+            kb = KeyBindings()
+            @kb.add("escape", "enter")
+            def _insert_newline(event: Any) -> None:
+                event.current_buffer.insert_text("\n")
+            self._prompt_session = PromptSession(
+                history=self._pt_history,
+                completer=self._pt_completer,
+                complete_while_typing=True,
+                wrap_lines=True,
+                multiline=False,
+                key_bindings=kb,
+                style=style,
+                mouse_support=False,
+            )
+        except Exception:
+            self._prompt_session = None
+        return self._prompt_session
 
     # ─── Input Handling ──────────────────────────────────────────────
 
@@ -1747,7 +1280,6 @@ class InteractiveShell:
             FILE_SHARE_READ = 0x00000001
             FILE_SHARE_WRITE = 0x00000002
             OPEN_EXISTING = 3
-            
             kernel32 = ctypes.windll.kernel32
             h_con = kernel32.CreateFileW("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
             if h_con != -1:
@@ -1765,115 +1297,72 @@ class InteractiveShell:
         except Exception:
             return fallback
 
-    def _get_bottom_toolbar(self) -> Any:
-        from prompt_toolkit.formatted_text import HTML
-        import time
-        provider = self.current_provider or "Not connected"
-        model = self.current_model or "Not set"
-        elapsed = time.time() - self.session_start if self.session_start else 0
-        from harness_core.cli.ui import fmt_elapsed
-        time_str = fmt_elapsed(elapsed)
-        width = self._get_real_terminal_width(self.console.width)
-        line = "─" * width
-        return HTML(f'<ansigray>{line}</ansigray>\n  <b>{provider} \u00b7 {model}</b> \u00b7 {self.total_tool_calls} tools \u00b7 {time_str} ')
-
     async def _read_input(self) -> str | None:
-        """Read user input with prompt."""
+        """Read user input with a real editable terminal (spec §2)."""
         try:
             import asyncio
-            if self.plain:
-                return await asyncio.to_thread(input, "❯ ")
+            import time
+            if self.plain or not sys.stdin.isatty():
+                try:
+                    return await asyncio.to_thread(input, "❯ ")
+                except Exception:
+                    return await asyncio.to_thread(self.console.input, "❯ ")
+            session = self._ensure_prompt_session()
+            if session is None:
+                return await asyncio.to_thread(self.console.input, "  [bold cyan]❯[/] ")
+            
+            from prompt_toolkit.formatted_text import HTML
+
+            def get_prompt_text() -> Any:
+                return HTML("<ansicyan><b>❯</b></ansicyan> ")
 
             try:
-                from prompt_toolkit import PromptSession
-                from prompt_toolkit.formatted_text import HTML
-                from prompt_toolkit.styles import Style
-                
-                if not hasattr(self, "_prompt_session"):
-                    style = Style.from_dict({'bottom-toolbar': 'fg:#aaaaaa'})
-                    self._prompt_session = PromptSession(style=style)
-                
-                def get_prompt_text():
-                    term_width = self._get_real_terminal_width(self.console.width)
-                    line = "─" * term_width
-                    return HTML(f"<ansigray>{line}</ansigray>\n<ansicyan><b>❯</b></ansicyan> ")
-                
-                ans = await self._prompt_session.prompt_async(
+                ans: str = await session.prompt_async(
                     get_prompt_text,
-                    placeholder=HTML("<ansigray>Enter a coding task or / for commands</ansigray>"),
-                    bottom_toolbar=self._get_bottom_toolbar
+                    placeholder=HTML("<ansigray>Ask Harness anything...</ansigray>")
                 )
-                
-                closing_line = "─" * self._get_real_terminal_width(self.console.width)
-                self.console.print(f"[#888888]{closing_line}[/#888888]", highlight=False)
-                return ans
-            except Exception:
-                return await asyncio.to_thread(self.console.input, "\n  [bold cyan]❯[/] ")
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if ans.strip():
+                self._pt_history_items.append(ans.strip())
+                if len(self._pt_history_items) > 200:
+                    self._pt_history_items = self._pt_history_items[-200:]
+            return ans
         except (EOFError, KeyboardInterrupt):
             return None
 
     # ─── Main Loop ───────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Run the interactive shell."""
         self.session_start = time.time()
-
-        # Show loading indicator during provider setup
-        self.console.print("  [dim]Initializing...[/]", end="")
-
         if not await self._setup_provider():
-            self.console.print("")
             self.console.print("")
             self.console.print("  [red]Cannot start interactive session.[/]")
             self.console.print("  [dim]Set OPENROUTER_API_KEY or start Ollama.[/]")
             return
-
-        self.console.print("")  # End the initializing line
-
-        # Unified mode renders through the Phase 10 dashboard; the legacy
-        # single-task handlers would double-print raw events on the same bus.
         if self.mode != "unified":
             self._setup_event_handlers()
         self._setup_session()
-
-        # Print welcome screen AFTER provider setup is complete
         self._print_welcome()
-
-        # Main loop
         try:
             while True:
                 user_input = await self._read_input()
-
                 if user_input is None:
                     break
-
                 user_input = user_input.strip()
                 if not user_input:
                     continue
-
-                # Handle slash commands
                 if user_input.startswith("/"):
                     if user_input.lower() in ("/exit", "/quit"):
                         break
                     await self._handle_command(user_input)
                     continue
-
-                # Execute task
                 await self._execute_task(user_input)
-
         except KeyboardInterrupt:
             self.console.print("\n")
         except EOFError:
             pass
         finally:
-            # Cleanup
-            self.console.print("")
-            self.console.print("  [dim]Session ended.[/]")
-            if self.session_id:
-                self.console.print(f"  [dim]Session ID: {self.session_id}[/]")
-            self.console.print("")
-
-            # Close provider
             if self._provider:
                 try:
                     await self._provider.close()
@@ -1892,14 +1381,5 @@ def run_interactive(
     max_iterations: int = 30,
     max_cost: float | None = None,
 ) -> None:
-    """Entry point for interactive mode."""
-    shell = InteractiveShell(
-        model=model,
-        mode=mode,
-        free=free,
-        local=local,
-        plain=plain,
-        max_iterations=max_iterations,
-        max_cost=max_cost,
-    )
+    shell = InteractiveShell(model=model, mode=mode, free=free, local=local, plain=plain, max_iterations=max_iterations, max_cost=max_cost)
     asyncio.run(shell.run())

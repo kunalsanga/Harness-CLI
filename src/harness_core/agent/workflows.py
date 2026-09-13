@@ -344,28 +344,46 @@ async def run_explain_workflow(
     plan.activate_id(todo_ids[0])
     plan.complete_id(todo_ids[0], {"file_count": len(files)})
 
-    # Pick the most informative files (top-level + common extensions)
-    interesting = [
-        f for f in files
-        if not f.startswith(".")
-        and any(f.endswith(ext) for ext in (".py", ".md", ".toml", ".yaml", ".json", ".js", ".ts", ".go", ".rs"))
-    ][:max_files]
+    # Intelligently select relevant context based on common project structure
+    # Look for README, pyproject.toml, package.json, entry points, etc.
+    important_files = []
+    for f in files:
+        fl = f.lower()
+        if fl in ("readme.md", "pyproject.toml", "package.json", "setup.py", "cargo.toml", "go.mod"):
+            important_files.append(f)
+        elif any(fl.endswith(ext) for ext in (".py", ".ts", ".js", ".go", ".rs")) and ("main" in fl or "cli" in fl or "app" in fl or "index" in fl):
+            important_files.append(f)
+
+    # Ensure we don't exceed max_files
+    interesting = important_files[:max_files]
 
     plan.activate_id(todo_ids[1])
     snippets: list[dict[str, str]] = []
+    from harness_core.context.engine import ContextPiece
+    context_pieces: list[ContextPiece] = []
+    
+    # Read up to max_files intelligent files
     for fp in interesting:
         r = await _run_tool(ctx, "read_file", path=fp)
         completed_ops.append(f"read_file:{fp}")
         if r.status == ToolResultStatus.SUCCESS:
-            content = (r.output or "")[:600]
+            content = (r.output or "")[:1500]
             snippets.append({"path": fp, "preview": content})
+            context_pieces.append(ContextPiece(
+                source=fp,
+                content=f"Contents of {fp}:\n{content}",
+                priority=100
+            ))
+            
     plan.complete_id(todo_ids[1], {"files_read": len(snippets)})
 
     plan.activate_id(todo_ids[2])
     plan.complete_id(todo_ids[2], {"snippets": snippets})
+    
     return WorkflowResult(True, None, completed_ops, {
         "files": interesting,
         "snippets": snippets,
+        "context_pieces": context_pieces,
     })
 
 

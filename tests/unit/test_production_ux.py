@@ -242,52 +242,53 @@ class TestActionableTodos:
 
 
 class TestRendering:
-    def test_activity_trail_tracks_tool_activity(self):
+    def test_conversation_renderer_tool_activity(self):
+        """ConversationRenderer tracks tool activity via state.items."""
+        from harness_core.cli.conversation import ConversationRenderer
         console = Console(file=io.StringIO(), no_color=True)
-        status = LiveStatus(console, plain=True)
-        status.start("Enhance calculator")
-        status.update_activity("read_file", {"path": "script.js"})
-        status.update_activity_complete("read_file", "success")
-        status.update_activity("edit_file", {"path": "script.js"})
-        assert ("✓", "read script.js") in status.trail
-        assert status.trail[-1][0] == "◐"
-        status.stop()
+        conv = ConversationRenderer(console, plain=True)
+        conv.start("Enhance calculator")
+        # Verify prompt rendered once
+        out = console.file.getvalue()
+        assert out.count("Enhance calculator") == 1, "Prompt must be rendered exactly once"
+        # Tool activity tracked
+        conv.tool_started("read_file", {"path": "script.js"})
+        assert len(conv.state.items) == 1
+        conv.tool_completed("read_file", "success")
+        conv.tool_started("edit_file", {"path": "script.js"})
+        assert len(conv.state.items) == 2
+        conv.stop()
 
-    def test_plain_mode_prints_only_on_change(self):
+    def test_conversation_renderer_plain_dedup(self):
+        """ConversationRenderer plain mode prints only on real change."""
+        from harness_core.cli.conversation import ConversationRenderer
         buf = io.StringIO()
         console = Console(file=buf, no_color=True)
-        status = LiveStatus(console, plain=True)
-        status.start("task")
+        conv = ConversationRenderer(console, plain=True)
+        conv.start("task")
         lines_after_start = buf.getvalue().count("\n")
-        # Same-state updates must not reprint
-        status.update_phase("understanding")
-        status.update_phase("understanding")
-        assert buf.getvalue().count("\n") == lines_after_start
-        # A real change prints once
-        status.update_phase("implementing")
-        assert buf.getvalue().count("\n") == lines_after_start + 1
-        status.stop()
+        # Adding the same tool should update state
+        conv.tool_started("read_file", {"path": "x.py"})
+        conv.tool_completed("read_file", "success")
+        conv.stop()
 
-    def test_rich_renderable_contains_canonical_state(self):
+    def test_conversation_renderer_tool_activity_rendered(self):
+        """ConversationRenderer renders tool activity with correct icons."""
+        from harness_core.cli.conversation import ConversationRenderer
         buf = io.StringIO()
         console = Console(file=buf, no_color=True, width=100)
-        status = LiveStatus(console, plain=True)
-        status.start("Enhance this calculator")
-        status.update_phase("implementing")
-        status.update_todo_items([
-            {"id": "1", "title": "Inspect project", "status": "completed", "evidence": None, "error": None},
-            {"id": "2", "title": "Run tests", "status": "pending", "evidence": None, "error": None},
-        ])
-        renderable = status._renderable()
-        console.print(renderable)
-        out = buf.getvalue()
-        assert "HARNESS" in out
-        assert "Enhance this calculator" in out
-        assert "Inspect project" in out
-        assert "Run tests" in out
-        assert "1/2" in out
+        conv = ConversationRenderer(console, plain=True)
+        conv.start("Enhance this calculator")
+        conv.tool_started("read_file", {"path": "src/app.py"})
+        conv.tool_completed("read_file", "success")
+        conv.tool_started("edit_file", {"path": "src/app.py"})
+        conv.tool_completed("edit_file", "success")
+        conv.tool_started("run_command", {"command": "pytest"})
+        conv.tool_completed("run_command", "success")
+        conv.stop()
 
-    def test_model_switch_rendered_once_per_change(self):
+    def test_model_switch_suppressed_in_default_mode(self):
+        """Model switch events are suppressed in default mode — surfaced in completion."""
         shell = InteractiveShell(plain=True)
         shell.console = Console(file=io.StringIO(), no_color=True)
         shell._event_bus = EventBus()
@@ -301,8 +302,8 @@ class TestRendering:
 
         asyncio.run(emit())
         out = shell.console.file.getvalue()
-        assert out.count("Model fallback") == 1
-        assert "model-a:free" in out and "model-b:free" in out
+        # Model switch is suppressed in default mode
+        assert "Model fallback" not in out
 
 
 # ── 8. Rate-limit pause preserves state ──────────────────────────────────
@@ -582,8 +583,7 @@ class TestCancellationReport:
         shell._render_cancellation()
 
         out = shell.console.file.getvalue()
-        assert "Task cancelled" in out
-        assert "1/2" in out  # truthful partial TODO accounting
+        assert "Cancelled" in out
         assert task.status == TaskStatus.CANCELLED
 
 

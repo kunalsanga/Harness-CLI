@@ -29,6 +29,7 @@ class WorkerAgent:
         message_bus: AgentMessageBus | None = None,
         memory: Any = None,
         project_id: str = "",
+        agent_config: Any = None,
     ) -> None:
         self.contract = contract
         self.provider = provider
@@ -43,6 +44,8 @@ class WorkerAgent:
         # Phase 8G: RAG execution context
         self._memory = memory
         self._project_id = project_id
+        # Stage 1: AgentConfig passthrough from interactive shell
+        self._agent_config = agent_config
 
     async def emit(self, event_type: str, data: dict[str, Any]) -> None:
         """Emit a structured event to the EventBus."""
@@ -107,13 +110,17 @@ class WorkerAgent:
             from harness_core.agent.types import AgentConfig as LoopAgentConfig
             from harness_core.agent.types import AgentRole as LoopRole
 
-            # We reuse the robust existing AgentLoop, but scoped to this agent
-            loop_config = LoopAgentConfig(
-                role=LoopRole.BUILD,
-                max_iterations=30,
-                max_tool_calls=100,
-                routing_mode=self.contract.model_policy,
-            )
+            # Stage 1: Use passed config from interactive shell if available,
+            # otherwise fall back to defaults scoped to this agent.
+            if self._agent_config is not None:
+                loop_config = self._agent_config
+            else:
+                loop_config = LoopAgentConfig(
+                    role=LoopRole.BUILD,
+                    max_iterations=30,
+                    max_tool_calls=100,
+                    routing_mode=self.contract.model_policy,
+                )
 
             agent_loop = AgentLoop(
                 provider=self.provider,

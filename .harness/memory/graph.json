@@ -6,6 +6,15 @@
       "src": "task_1",
       "type": "created",
       "weight": 1.0
+    },
+    {
+      "dst": "interactive_task_1",
+      "properties": {
+        "error": "Agent execution failed."
+      },
+      "src": "interactive_task_1",
+      "type": "caused_by",
+      "weight": 2.0
     }
   ],
   "nodes": [
@@ -14,6 +23,14 @@
       "label": "Create artifact",
       "properties": {
         "outcome": "success"
+      },
+      "type": "task"
+    },
+    {
+      "id": "interactive_task_1",
+      "label": "explain this project",
+      "properties": {
+        "outcome": "failure"
       },
       "type": "task"
     }

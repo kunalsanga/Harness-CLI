@@ -39,6 +39,7 @@ class Scheduler:
         memory: Any = None,
         project_id: str = "",
         message_bus: AgentMessageBus | None = None,
+        interactive_config: Any = None,
     ) -> None:
         self.event_bus = event_bus
         self.registry = registry
@@ -63,6 +64,7 @@ class Scheduler:
         # Phase 8E/8G: Memory subsystem for RAG-execution and memory writes
         self._memory = memory
         self._project_id = project_id
+        self._interactive_config = interactive_config
         self._is_running = False
 
     def set_message_bus(self, message_bus: AgentMessageBus | None) -> None:
@@ -150,6 +152,7 @@ class Scheduler:
                     message_bus=self.message_bus,
                     memory=self._memory,
                     project_id=self._project_id,
+                    agent_config=self._interactive_config,
                 )
 
                 task.assigned_agent = contract.agent_id

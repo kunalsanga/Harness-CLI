@@ -234,7 +234,7 @@ class TestFallbackEngine:
 
 
 class TestLiveStatus:
-    """Verify the live status display works correctly."""
+    """Verify the conversation renderer works correctly."""
 
     def test_format_elapsed_seconds(self):
         from harness_core.cli.interactive import _format_elapsed
@@ -242,35 +242,31 @@ class TestLiveStatus:
         assert _format_elapsed(65) == "1m05s"
         assert _format_elapsed(3661) == "1h01m01s"
 
-    def test_live_status_start(self):
+    def test_conversation_renderer_start(self):
         import io
-        from harness_core.cli.interactive import LiveStatus
+        from harness_core.cli.conversation import ConversationRenderer
         from rich.console import Console
 
         console = Console(file=io.StringIO(), no_color=True)
-        status = LiveStatus(console, plain=True)
-        status.start("test task")
-        assert status.task_start > 0
-        assert status.current_phase == "understanding"
-        assert status.current_activity == "Initializing"
-        status.stop()
+        conv = ConversationRenderer(console, plain=True)
+        conv.start("test task")
+        assert conv.state.goal == "test task"
+        assert conv.state.started_at > 0
+        conv.stop()
 
-    def test_live_status_update(self):
+    def test_conversation_renderer_tool_activity(self):
         import io
-        from harness_core.cli.interactive import LiveStatus
+        from harness_core.cli.conversation import ConversationRenderer
         from rich.console import Console
 
         console = Console(file=io.StringIO(), no_color=True)
-        status = LiveStatus(console, plain=True)
-        status.start("test")
-        status.update_phase("implementing")
-        assert status.current_phase == "implementing"
-        status.update_activity("edit_file", {"path": "src/main.py"})
-        assert status.current_activity == "edit src/main.py"
-        status.update_todos(3, 5)
-        assert status.todo_completed == 3
-        assert status.todo_total == 5
-        status.stop()
+        conv = ConversationRenderer(console, plain=True)
+        conv.start("test")
+        conv.tool_started("edit_file", {"path": "src/main.py"})
+        assert len(conv.state.items) == 1
+        conv.tool_completed("edit_file", "success")
+        assert conv.state.items[-1][2] == "success"
+        conv.stop()
 
 
 # ─── Git Push Tool ───────────────────────────────────────────────────────

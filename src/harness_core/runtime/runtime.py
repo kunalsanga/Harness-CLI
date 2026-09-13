@@ -127,6 +127,7 @@ class EngineeringRuntime:
         self.state = ProjectState(project_id=self.project_id, workspace=self.workspace_path)
         self._recovery_events: list[dict[str, Any]] = []
         self._started_at = time.time()
+        self._interactive_config: Any = None  # AgentConfig passthrough for interactive mode
 
     # ── Observability ─────────────────────────────────────────────────────
 
@@ -300,6 +301,174 @@ class EngineeringRuntime:
         await self._record_memory_references(graph, index)
 
         # ── Terminal status decision ─────────────────────────────────────
+        failed_originals = [
+            t.task_id
+            for t in graph.tasks.values()
+            if t.status == TaskStatus.FAILED and not _is_recovery_task(t.task_id)
+        ]
+        if self.state.recovery_exhausted:
+            status = RuntimeStatus.FAILED
+            detail = f"recovery exhausted ({self.state.recovery_attempts} attempts)"
+        elif failed_originals and not self._all_failures_recovered(graph, failed_originals):
+            status = RuntimeStatus.FAILED
+            detail = f"unrecovered failed tasks: {failed_originals}"
+        elif not verification_ok:
+            status = RuntimeStatus.FAILED
+            detail = f"verification failed: {summary}"
+        else:
+            status = RuntimeStatus.SUCCESS
+            detail = "all requirements verified"
+            await self._enter_stage(RuntimeStage.DELIVER, detail=detail)
+            await self._enter_stage(RuntimeStage.SUCCEEDED)
+
+        self.state.status = status
+        self.state.completed_at = time.time()
+        if status == RuntimeStatus.FAILED:
+            self.state.set_stage(RuntimeStage.FAILED, detail=detail)
+            self.state.register_blocker(detail)
+            await self._emit("runtime_failed", {"reason": detail})
+        else:
+            await self._emit("runtime_completed", {"status": status.value})
+
+        return RuntimeOutcome(
+            state=self.state,
+            status=status,
+            traceability=index,
+            message_bus=bus,
+            graph=graph,
+            duration_ms=(time.time() - started) * 1000,
+        )
+
+    # ── Interactive execution (Stage 1: canonical runtime path) ────────────
+
+    async def execute_interactive(
+        self,
+        goal: str,
+        *,
+        requirements: Requirements | None = None,
+        timeout_seconds: float = 0.0,
+    ) -> RuntimeOutcome:
+        """Execute a single interactive task through the canonical runtime.
+
+        Skips the model-driven planner: creates a single-task graph directly
+        and runs it through the Scheduler → WorkerAgent → AgentLoop chain.
+        This is the single authoritative execution path for interactive mode.
+        """
+        started = time.time()
+        self.state.original_request = goal
+        await self._emit("runtime_started", {"project_id": self.project_id})
+
+        await self._enter_stage(RuntimeStage.DISCOVER, detail="project context loaded")
+
+        if requirements is None:
+            requirements = Requirements(objective=goal)
+        if not requirements.objective:
+            requirements.objective = goal
+        self.state.requirements = requirements
+        await self._enter_stage(RuntimeStage.UNDERSTAND, detail="requirements structured")
+        await self._emit(
+            "requirements_created",
+            {"objective": requirements.objective, "requirement_count": len(requirements.to_requirements())},
+        )
+
+        # Build a single-task graph directly (no model planner needed).
+        await self._enter_stage(RuntimeStage.PLAN, detail="interactive single-task plan")
+        graph = TaskGraph()
+        task = SubTask(
+            task_id="interactive_task_1",
+            description=goal,
+            role=AgentRole.CODER,
+            dependencies=[],
+            priority=10,
+        )
+        task.runtime_context = ""
+        graph.add_task(task)
+        errors = graph.validate()
+        if errors:
+            self.state.status = RuntimeStatus.FAILED
+            self.state.register_blocker(f"Task graph validation failed: {errors}")
+            self.state.set_stage(RuntimeStage.FAILED, detail="invalid task graph")
+            await self._emit("runtime_failed", {"reason": str(errors)})
+            return RuntimeOutcome(state=self.state, status=RuntimeStatus.FAILED)
+
+        # Traceability: single requirement → single task.
+        index = build_traceability_index(requirements, [])
+        self.state.traceability = index
+        self.state.task_graph = graph
+        await self._enter_stage(RuntimeStage.DECOMPOSE, detail="1 task")
+        await self._emit("plan_created", {"total_tasks": 1})
+
+        # Attach context to the single task.
+        await self._attach_task_contexts(graph, index)
+
+        # Execute through the real Scheduler.
+        await self._enter_stage(RuntimeStage.EXECUTE, detail="scheduler dispatch")
+        bus = AgentMessageBus(self.event_bus, graph, self.registry)
+        scheduler = Scheduler(
+            event_bus=self.event_bus,
+            registry=self.registry,
+            provider=self._provider,
+            tools=self.tools,
+            workspace_path=self.workspace_path,
+            max_concurrency=self.max_concurrency,
+            router=self.router,
+            lock_manager=self.lock_manager,
+            memory=self.memory,
+            project_id=self.project_id,
+            message_bus=bus,
+            interactive_config=getattr(self, '_interactive_config', None),
+        )
+        self.scheduler = scheduler
+
+        # Attach event handlers for task lifecycle tracking.
+        task_handler = self._make_task_event_handler()
+        recovery_handler = self._make_recovery_event_handler()
+        convergence_handler = self._make_convergence_handler()
+        self.event_bus.on("task.started", task_handler)
+        self.event_bus.on("task.completed", task_handler)
+        self.event_bus.on("task.failed", task_handler)
+        self.event_bus.on("recovery_started", recovery_handler)
+        self.event_bus.on("recovery_exhausted", recovery_handler)
+        self.event_bus.on("tool.result", convergence_handler)
+
+        execution = asyncio.ensure_future(scheduler.execute(graph))
+        try:
+            if timeout_seconds and timeout_seconds > 0:
+                await asyncio.wait_for(execution, timeout=timeout_seconds)
+            else:
+                await execution
+        finally:
+            self.event_bus.off("task.started", task_handler)
+            self.event_bus.off("task.completed", task_handler)
+            self.event_bus.off("task.failed", task_handler)
+            self.event_bus.off("recovery_started", recovery_handler)
+            self.event_bus.off("recovery_exhausted", recovery_handler)
+            self.event_bus.off("tool.result", convergence_handler)
+            if not execution.done():
+                execution.cancel()
+
+        # Release any locks still held.
+        for task_id in list(getattr(self.lock_manager, "_locks", {})):
+            await self.lock_manager.release_all(task_id)
+
+        # Record artifacts and verify.
+        self._record_artifacts_from_tasks(graph)
+
+        await self._enter_stage(RuntimeStage.VERIFY, detail="requirement verification")
+        verification_ok, summary, results = self._verify_requirements(graph, index)
+        self.state.verification_status = (
+            VerificationStatus.PASSED if verification_ok else VerificationStatus.FAILED
+        )
+        self.state.verification_summary = summary
+        self.state.verification_results = results
+        await self._emit(
+            "verification_completed",
+            {"passed": verification_ok, "summary": summary, "results": results},
+        )
+
+        await self._record_memory_references(graph, index)
+
+        # Terminal status decision.
         failed_originals = [
             t.task_id
             for t in graph.tasks.values()
