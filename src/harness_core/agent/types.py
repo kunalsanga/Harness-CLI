@@ -522,6 +522,8 @@ class Task:
     failure_reason: str | None = None
     # Operations that produced real evidence (for the duplicate-op guard)
     completed_operations: list[str] = field(default_factory=list)
+    # Harness 2.0: set when budget-driven compaction trimmed tool history.
+    compaction_note: str | None = None
 
 
 class TaskPhase(Enum):

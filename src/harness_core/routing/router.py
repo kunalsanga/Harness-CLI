@@ -289,19 +289,22 @@ class ModelRouter:
         """Select an ordered chain of (model_id, provider) for fallback.
 
         Returns at least one model if any are available.
-        In free mode, only free models are considered — never falls back to paid.
+        In free mode, uses OpenRouter's dynamic free-model router as primary,
+        with individual free models as fallback.
         """
         active_routing_mode = routing_mode_override or self.config.routing_mode
         models = await self.refresh_models()
         ctx = self._build_scoring_context(request, active_routing_mode)
 
+        # ── Free mode: inject openrouter/free as primary ─────────────────
+        # OpenRouter's "openrouter/free" model dynamically selects from
+        # currently available free models with tool-calling support.
+        if active_routing_mode == "free":
+            return await self._build_free_chain(request, models)
+
         # Filter
         filtered = self._filter_models(models, ctx)
         if not filtered:
-            if active_routing_mode == "free":
-                # In free mode: DO NOT fall back to paid models
-                # Return empty chain so the error is clear
-                return []
             # Non-free fallback: use any model with tools support
             filtered = [m for m in models if m.supports_tools]
 
@@ -395,6 +398,74 @@ class ModelRouter:
                         break
                 except Exception:
                     continue
+
+        return chain
+
+    async def _build_free_chain(
+        self,
+        request: CompletionRequest,
+        models: list[ModelInfo],
+    ) -> list[tuple[str, ModelProvider]]:
+        """Build a free-model fallback chain.
+
+        Primary: "openrouter/free" — OpenRouter's dynamic free-model router.
+        Fallback: individual free models with tool-calling support.
+        """
+        chain: list[tuple[str, ModelProvider]] = []
+        chain_ids: set[str] = set()
+        provider = self.providers.get("openrouter")
+
+        # 1. Primary: openrouter/free (dynamic free-model router)
+        # Only add if the openrouter provider is available AND has a valid key
+        if provider is not None and getattr(provider, "api_key", ""):
+            chain.append(("openrouter/free", provider))
+            chain_ids.add("openrouter/free")
+            await self.event_bus.emit(Event(
+                type="routing.decision",
+                source="model_router",
+                data={
+                    "model": "openrouter/free",
+                    "provider": "openrouter",
+                    "score": 1.0,
+                    "mode": "free",
+                    "alternatives": [],
+                },
+            ))
+
+        # 2. Fallback: individual free models with tool support
+        free_models = [
+            m for m in models
+            if m.is_free and m.supports_tools and m.id not in chain_ids
+        ]
+        # Sort by context window (bigger is better for coding tasks)
+        free_models.sort(key=lambda m: m.context_window, reverse=True)
+
+        recorded_decision = bool(chain)  # already recorded if openrouter/free was added
+        for model in free_models[:3]:  # Max 3 fallbacks
+            p = self.providers.get(model.provider)
+            if p is not None:
+                chain.append((model.id, p))
+                chain_ids.add(model.id)
+                # Record decision for the first model in chain
+                if not recorded_decision:
+                    recorded_decision = True
+                    self._routing_decisions.append(RoutingDecision(
+                        selected_model=model.id,
+                        selected_provider=model.provider,
+                        score=1.0,
+                        routing_mode="free",
+                    ))
+                    await self.event_bus.emit(Event(
+                        type="routing.decision",
+                        source="model_router",
+                        data={
+                            "model": model.id,
+                            "provider": model.provider,
+                            "score": 1.0,
+                            "mode": "free",
+                            "alternatives": [],
+                        },
+                    ))
 
         return chain
 

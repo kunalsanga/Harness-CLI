@@ -217,7 +217,9 @@ class TestPermissionDenialE2E:
         # assertion was wrong: the test was passing only because the
         # completion invariant was checking the wrong thing.
         assert task.status == TaskStatus.PARTIAL
-        assert task.result == "Tests passed successfully."
+        # task.result accumulates the model's final text across nudge
+        # iterations (loop contract), so assert containment, not equality.
+        assert "Tests passed successfully." in (task.result or "")
         # Required TODOs are still pending — that's the evidence the work
         # was not actually performed despite the model's claim.
         pending = [i for i in task.task_plan.items if i.status.value == "pending"]

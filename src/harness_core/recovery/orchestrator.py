@@ -97,6 +97,31 @@ class RecoveryOrchestrator:
             except Exception:
                 pass  # Memory write failures must not block recovery
 
+        # Deterministic provider / config failures must not be "fixed" by code changes.
+        # If the classification points to model/provider, skip the entire recovery
+        # loop — a debugger that edits source cannot cure a 400/401/402/429.
+        non_retryable = {"model_failure", "timeout", "environment_failure"}
+        cat = classification.category.value
+        low_summary = (classification.summary or "").lower()
+        provider_hint = any(
+            k in low_summary
+            for k in [
+                "provider", "openrouter", "429", "402", "401", "403", "400",
+                "rate limit", "payment required", "unauthorized", "forbidden",
+                "invalid", "model", "timeout", "connection", "network",
+            ]
+        )
+        if cat in non_retryable and provider_hint:
+            await self._emit(
+                "recovery_skipped",
+                {
+                    "task_id": failed_task.task_id,
+                    "category": cat,
+                    "reason": f"Deterministic provider failure ({classification.summary[:220]}). No source fix can help — skipping recovery.",
+                },
+            )
+            return False
+
         if history.attempts >= history.max_attempts:
             await self._emit("recovery_exhausted", {
                 "task_id": failed_task.task_id,

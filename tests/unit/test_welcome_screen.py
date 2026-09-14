@@ -47,9 +47,11 @@ class TestWelcomeScreenProviderState:
         shell._print_welcome()
 
         calls = shell.console.print.call_args_list
-        # Should show 'Harness' + project name
-        harness_calls = [c for c in calls if "Harness" in str(c) and "test" in str(c)]
-        assert len(harness_calls) > 0, "Should show 'Harness' with project name"
+        # Should show 'Harness' and project name
+        harness_calls = [c for c in calls if "Harness" in str(c)]
+        project_calls = [c for c in calls if "test" in str(c)]
+        assert len(harness_calls) > 0, "Should show 'Harness'"
+        assert len(project_calls) > 0, "Should show project name"
 
     def test_welcome_no_verbose_chrome(self):
         """Welcome screen should NOT show verbose chrome."""

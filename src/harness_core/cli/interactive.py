@@ -232,9 +232,10 @@ class InteractiveShell:
             self.console.print(f"{self.workspace}")
             self.console.print("")
             return
-        # Branded identity: H icon + name + project
         self.console.print("")
-        self.console.print(f"  [bold cyan]H[/] [bold]Harness[/]  [dim]{project_name}[/]", highlight=False)
+        self.console.print("  [bold white]Harness[/]  [dim]Autonomous AI Engineering[/]", highlight=False)
+        self.console.print(f"  [dim]{project_name}[/]", highlight=False)
+        self.console.print("")
 
     def _print_status_line(self) -> None:
         """Print a minimal session status line — only on /status command."""
@@ -337,6 +338,28 @@ class InteractiveShell:
             self.task_start = time.time()
             # Prompt was already rendered by _execute_task via conv.start(goal).
             # Do NOT print it again here.  Just ensure the renderer is running.
+
+        async def on_agent_started(event: Any) -> None:
+            agent_id = str(event.data.get("agent_id", ""))
+            if _conv() is not None and agent_id:
+                _conv().update_agent(agent_id, "running")
+
+        async def on_agent_status(event: Any) -> None:
+            agent_id = str(event.data.get("agent_id", ""))
+            status = str(event.data.get("new_status", "running"))
+            if _conv() is not None and agent_id:
+                mapped = "waiting" if status == "waiting" else "running"
+                _conv().update_agent(agent_id, mapped)
+
+        async def on_agent_completed(event: Any) -> None:
+            agent_id = str(event.data.get("agent_id", ""))
+            if _conv() is not None and agent_id:
+                _conv().update_agent(agent_id, "completed")
+
+        async def on_agent_failed(event: Any) -> None:
+            agent_id = str(event.data.get("agent_id", ""))
+            if _conv() is not None and agent_id:
+                _conv().update_agent(agent_id, "failed")
 
         async def on_thinking(event: Any) -> None:
             # Spec §5: do NOT expose hidden chain-of-thought.
@@ -503,6 +526,10 @@ class InteractiveShell:
             pass
 
         bus.on("task.started", on_task_started)
+        bus.on("agent.started", on_agent_started)
+        bus.on("agent.status_changed", on_agent_status)
+        bus.on("agent.completed", on_agent_completed)
+        bus.on("agent.failed", on_agent_failed)
         bus.on("thinking.status", on_thinking)
         bus.on("todo.updated", on_todo_updated)
         bus.on("plan.created", on_plan_created)
@@ -1003,6 +1030,7 @@ class InteractiveShell:
             plan_provider=self._provider,
             event_bus=self._event_bus,
             router=self._router,
+            tools=self._tools,
             memory=memory,
             project_id=str(Path(self.workspace).resolve()),
             max_concurrency=self.max_parallel,
@@ -1176,7 +1204,7 @@ class InteractiveShell:
             except Exception:
                 config_data = {}
             memory = init_memory_manager_from_project(Path(self.workspace), config=config_data)
-        runtime = EngineeringRuntime(workspace_path=self.workspace, provider=self._provider, plan_provider=self._provider, event_bus=self._event_bus, router=self._router, memory=memory, project_id=str(Path(self.workspace).resolve()), max_concurrency=self.max_parallel)
+        runtime = EngineeringRuntime(workspace_path=self.workspace, provider=self._provider, plan_provider=self._provider, event_bus=self._event_bus, router=self._router, tools=self._tools, memory=memory, project_id=str(Path(self.workspace).resolve()), max_concurrency=self.max_parallel)
         self._active_runtime = runtime
         self.task_start = time.time()
         self.running = True
@@ -1219,16 +1247,16 @@ class InteractiveShell:
         task = getattr(self._agent_loop, "_active_task", None)
         self.console.print("", highlight=False)
         if task is None:
-            self.console.print("  [yellow]⏹[/] [dim]Cancelled · {elapsed_str}[/]", highlight=False)
+            self.console.print(f"  [yellow]![/] [dim]Cancelled - {elapsed_str}[/]", highlight=False)
             return
         task.status = TaskStatus.CANCELLED
         files_changed = files_from_task(task)
         if files_changed:
             names = ", ".join(files_changed[:5])
-            self.console.print(f"  [yellow]⏹[/] [dim]Cancelled · {elapsed_str}[/]", highlight=False)
+            self.console.print(f"  [yellow]![/] [dim]Cancelled - {elapsed_str}[/]", highlight=False)
             self.console.print(f"  [dim]Modified: {names}[/]", highlight=False)
         else:
-            self.console.print(f"  [yellow]⏹[/] [dim]Cancelled · {elapsed_str}[/]", highlight=False)
+            self.console.print(f"  [yellow]![/] [dim]Cancelled - {elapsed_str}[/]", highlight=False)
         self.console.print("", highlight=False)
 
     def _ensure_prompt_session(self) -> Any:
@@ -1252,18 +1280,25 @@ class InteractiveShell:
                 self._pt_completer = WordCompleter(SLASH_COMMANDS, ignore_case=True, sentence=True)
             style = Style.from_dict({"prompt": "ansicyan bold", "completion-menu.completion": "bg:#333333 #ffffff", "completion-menu.completion.current": "bg:#00aaaa #000000"})
             kb = KeyBindings()
+            
+            @kb.add("enter")
+            def _submit(event: Any) -> None:
+                event.current_buffer.validate_and_handle()
+                
             @kb.add("escape", "enter")
             def _insert_newline(event: Any) -> None:
                 event.current_buffer.insert_text("\n")
+                
             self._prompt_session = PromptSession(
                 history=self._pt_history,
                 completer=self._pt_completer,
                 complete_while_typing=True,
                 wrap_lines=True,
-                multiline=False,
+                multiline=True,
                 key_bindings=kb,
                 style=style,
                 mouse_support=False,
+                prompt_continuation=lambda width, line_number, is_soft_wrap: "  │ ",
             )
         except Exception:
             self._prompt_session = None
@@ -1314,7 +1349,7 @@ class InteractiveShell:
             from prompt_toolkit.formatted_text import HTML
 
             def get_prompt_text() -> Any:
-                return HTML("<ansicyan><b>❯</b></ansicyan> ")
+                return HTML("  <ansicyan><b>❯</b></ansicyan> ")
 
             try:
                 ans: str = await session.prompt_async(
@@ -1345,19 +1380,70 @@ class InteractiveShell:
         self._setup_session()
         self._print_welcome()
         try:
+            self._execution_task: asyncio.Task | None = None
+            
+            async def get_input() -> str | None:
+                return await self._read_input()
+                
+            input_task = asyncio.create_task(get_input())
+            
             while True:
-                user_input = await self._read_input()
-                if user_input is None:
-                    break
-                user_input = user_input.strip()
-                if not user_input:
-                    continue
-                if user_input.startswith("/"):
-                    if user_input.lower() in ("/exit", "/quit"):
+                if self._execution_task:
+                    done, pending = await asyncio.wait(
+                        [self._execution_task, input_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    
+                    if self._execution_task in done:
+                        try:
+                            self._execution_task.result()
+                        except Exception as e:
+                            self.console.print(f"  [red]Execution error:[/] {e}")
+                        self._execution_task = None
+                        
+                    if input_task in done:
+                        user_input = input_task.result()
+                        input_task = asyncio.create_task(get_input())
+                        
+                        if user_input is None:
+                            if self._execution_task:
+                                self._execution_task.cancel()
+                            break
+                        user_input = user_input.strip()
+                        if not user_input:
+                            continue
+                            
+                        if user_input.startswith("/"):
+                            if user_input.lower() in ("/exit", "/quit"):
+                                if self._execution_task:
+                                    self._execution_task.cancel()
+                                break
+                            await self._handle_command(user_input)
+                            continue
+                            
+                        # If execution is running, this is a steering command
+                        if self._execution_task and self._event_bus:
+                            from harness_core.observability.events import Event
+                            await self._event_bus.emit(Event(type="steering.received", source="cli", data={"message": user_input}))
+                        else:
+                            self._execution_task = asyncio.create_task(self._execute_task(user_input))
+                else:
+                    user_input = await input_task
+                    input_task = asyncio.create_task(get_input())
+                    
+                    if user_input is None:
                         break
-                    await self._handle_command(user_input)
-                    continue
-                await self._execute_task(user_input)
+                    user_input = user_input.strip()
+                    if not user_input:
+                        continue
+                        
+                    if user_input.startswith("/"):
+                        if user_input.lower() in ("/exit", "/quit"):
+                            break
+                        await self._handle_command(user_input)
+                        continue
+                        
+                    self._execution_task = asyncio.create_task(self._execute_task(user_input))
         except KeyboardInterrupt:
             self.console.print("\n")
         except EOFError:

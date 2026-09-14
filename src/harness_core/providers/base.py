@@ -77,3 +77,7 @@ class ModelProvider(abc.ABC):
     @abc.abstractmethod
     async def health_check(self) -> bool:
         """Check if provider is available."""
+
+    async def close(self) -> None:
+        """Release provider resources. Override in subclasses."""
+

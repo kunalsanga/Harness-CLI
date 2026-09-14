@@ -110,6 +110,11 @@ def _compact_tool_display(tool: str, args: dict[str, Any]) -> str:
 # ── Conversation state ────────────────────────────────────────────────────
 
 @dataclass
+class AgentState:
+    name: str
+    status: str = "running"
+
+@dataclass
 class ConversationState:
     """Live conversation state — pure data, no Rich."""
 
@@ -124,6 +129,13 @@ class ConversationState:
     phase: str = ""
     streaming_text: str = ""
     max_items: int = 12
+    agents: dict[str, AgentState] = field(default_factory=dict)
+
+    def update_agent(self, name: str, status: str) -> None:
+        if name not in self.agents:
+            self.agents[name] = AgentState(name=name, status=status)
+        else:
+            self.agents[name].status = status
 
     def add_running(self, display: str) -> None:
         self.items.append((Sym.SPINNER, display, "running"))
@@ -229,15 +241,12 @@ class ConversationRenderer:
 
     def _render_prompt(self, goal: str) -> None:
         """Render the user prompt.
-
-        In rich mode with prompt_toolkit, the prompt is already visible from
-        the input composer.  We print a blank line for spacing only.
-        In plain mode, we print the prompt since input() doesn't leave it.
+        
+        The prompt is already visible from the input composer in rich mode.
+        In plain mode, we print the prompt to keep history intact.
         """
         if self.plain:
             self.console.print(f"\n❯ {goal}", highlight=False)
-        # Rich mode: prompt_toolkit already displayed ❯ goal.
-        # Just add a blank line for visual breathing room.
 
     def _show_thinking(self) -> None:
         # No-op: intent is shown via _renderable(), not as a separate print.
@@ -325,6 +334,19 @@ class ConversationRenderer:
         No 'Working...' placeholder.  No fake progress.  Just real activity.
         """
         lines: list[Any] = []
+
+        if self.state.agents:
+            lines.append(Text("  ◌ Engineering team", style="cyan"))
+            for name, agent in self.state.agents.items():
+                if agent.status == "completed":
+                    lines.append(Text.assemble(("    ✓ ", "green"), (f"{name.capitalize():<15}", "dim"), ("completed", "dim")))
+                elif agent.status == "failed":
+                    lines.append(Text.assemble(("    ✗ ", "red"), (f"{name.capitalize():<15}", "dim"), ("failed", "dim")))
+                elif agent.status == "waiting":
+                    lines.append(Text.assemble(("    · ", "dim"), (f"{name.capitalize():<15}", "dim"), ("waiting", "dim")))
+                else:
+                    lines.append(Text.assemble(("    ◌ ", "cyan"), (f"{name.capitalize():<15}", "cyan"), ("implementing...", "cyan")))
+            lines.append(Text(""))
 
         # Intent message — short, user-safe execution intent (spec §5)
         if self.state.intent and not self._thinking_shown:
@@ -417,7 +439,7 @@ class ConversationRenderer:
         """Tiny completion indicator.  One line.  Optional error detail."""
         elapsed_str = fmt_elapsed(elapsed)
         if status == "cancelled":
-            mark, label, style = "⏹", "Cancelled", "yellow"
+            mark, label, style = "!", "Cancelled", "yellow"
         elif status == "paused":
             mark, label, style = "⏸", "Paused", "yellow"
         elif status == "blocked":

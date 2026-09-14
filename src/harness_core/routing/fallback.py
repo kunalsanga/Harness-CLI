@@ -49,8 +49,8 @@ def classify_error(error: Exception) -> ErrorClassification:
     if any(kw in error_str for kw in ["unauthorized", "forbidden", "not found", "invalid"]):
         return ErrorClassification.PERMANENT
 
-    # Retryable server errors
-    if any(code in error_str for code in ["429", "500", "502", "503", "504"]):
+    # Retryable server errors (429 already handled as RATE_LIMITED above — don't double-classify)
+    if any(code in error_str for code in ["500", "502", "503", "504"]):
         return ErrorClassification.RETRYABLE
     if any(kw in error_str for kw in ["timeout", "timed out", "connection", "network"]):
         return ErrorClassification.RETRYABLE
@@ -240,12 +240,16 @@ class FallbackEngine:
                     latency_ms = (time.time() - start) * 1000
                     classification = classify_error(e)
 
+                    raw = str(e).strip()
+                    if not raw:
+                        raw = f"{type(e).__name__}: {e.__class__.__name__} (empty message, model={model_id})"
                     result.attempts.append({
                         "model": model_id,
                         "status": "error",
                         "retry": retry_attempt,
                         "classification": classification.value,
-                        "error": str(e)[:200],
+                        "error": raw[:600],
+                        "error_short": raw[:200],
                         "latency_ms": round(latency_ms, 1),
                     })
 
@@ -297,43 +301,80 @@ class FallbackEngine:
         # All models failed
         result.total_latency_ms = (time.time() - overall_start) * 1000
         if not result.final_error:
-            # Build a more informative error message
-            auth_failures = []
-            payment_failures = []
-            other_failures = []
-            for attempt in result.attempts:
-                if attempt.get("status") == "error":
-                    error_str = attempt.get("error", "")
-                    error_lower = error_str.lower()
-                    if "401" in error_str or "403" in error_str or "forbidden" in error_lower:
-                        auth_failures.append(attempt.get("model", "unknown"))
-                    elif "402" in error_str or "payment required" in error_lower:
-                        payment_failures.append(attempt.get("model", "unknown"))
-                    else:
-                        other_failures.append(attempt.get("model", "unknown"))
+            auth_failures: list[str] = []
+            payment_failures: list[str] = []
+            other_failures: list[str] = []
+            rate_failures: list[str] = []
+            error_attempts = [a for a in result.attempts if a.get("status") == "error"]
+            skipped = [a for a in result.attempts if a.get("status") == "skipped"]
+            for attempt in error_attempts:
+                error_str = attempt.get("error", "") or ""
+                error_lower = error_str.lower()
+                if "429" in error_str or "rate limit" in error_lower or "too many requests" in error_lower:
+                    rate_failures.append(attempt.get("model", "unknown"))
+                elif "401" in error_str or "403" in error_str or "forbidden" in error_lower or "unauthorized" in error_lower:
+                    auth_failures.append(attempt.get("model", "unknown"))
+                elif "402" in error_str or "payment required" in error_lower:
+                    payment_failures.append(attempt.get("model", "unknown"))
+                else:
+                    other_failures.append(attempt.get("model", "unknown"))
 
-            if auth_failures and not other_failures:
-                # All failures were auth errors on specific models
+            # Prefer the last *error* attempt's message, not the last attempt (which may be skipped)
+            last_err = ""
+            if error_attempts:
+                last_err = (error_attempts[-1].get("error") or "").strip()
+                if not last_err:
+                    last_err = error_attempts[-1].get("error_short", "") or "empty provider error"
+            elif skipped:
+                # All models were skipped as unhealthy/unavailable — never invoked provider
+                skipped_models = ", ".join(a.get("model", "?") for a in skipped[:4])
+                result.final_error = (
+                    f"All {len(model_chain)} models failed. "
+                    f"All candidates were skipped as unavailable/unhealthy without attempting the provider: "
+                    f"{skipped_models}. Last error: {last_err or 'no provider attempt made'}"
+                )
+                return result
+
+            # Structured per-model summary for diagnostics
+            def _fmt_list(label: str, items: list[str]) -> str:
+                return f"{label}: {', '.join(items[:3])}" if items else ""
+
+            if rate_failures and not auth_failures and not payment_failures and not other_failures:
+                result.final_error = (
+                    f"All {len(rate_failures)} models are rate limited (429). "
+                    f"Models: {', '.join(rate_failures[:3])}. "
+                    f"Last error: {last_err or 'rate limited'}"
+                )
+            elif auth_failures and not other_failures and not rate_failures:
                 result.final_error = (
                     f"{len(auth_failures)} model(s) returned 401/403 and are unavailable. "
                     f"Models: {', '.join(auth_failures[:3])}. "
-                    f"Try other models or check your provider access."
+                    f"Last error: {last_err or 'auth failure'}"
                 )
-            elif payment_failures and not other_failures and not auth_failures:
+            elif payment_failures and not other_failures and not auth_failures and not rate_failures:
                 result.final_error = (
                     f"{len(payment_failures)} model(s) require payment (402). "
-                    f"Enable free mode (/free) or configure a provider with credits."
-                )
-            elif auth_failures or payment_failures:
-                result.final_error = (
-                    f"{len(auth_failures)} model(s) unavailable (401/403), "
-                    f"{len(payment_failures)} require payment (402), "
-                    f"{len(other_failures)} failed for other reasons. "
-                    f"Last error: {result.attempts[-1].get('error', 'unknown')}"
+                    f"Enable free mode (/free) or configure a provider with credits. "
+                    f"Last error: {last_err or 'payment required'}"
                 )
             else:
-                result.final_error = (
-                    f"All {len(model_chain)} models failed. "
-                    f"Last error: {result.attempts[-1].get('error', 'unknown') if result.attempts else 'no attempts'}"
-                )
+                parts: list[str] = []
+                if rate_failures:
+                    parts.append(f"{len(rate_failures)} rate limited (429)")
+                if auth_failures:
+                    parts.append(f"{len(auth_failures)} unavailable (401/403)")
+                if payment_failures:
+                    parts.append(f"{len(payment_failures)} require payment (402)")
+                if other_failures:
+                    parts.append(f"{len(other_failures)} failed")
+                summary = ", ".join(parts) if parts else f"{len(model_chain)} models failed"
+                # Never produce "Last error: unknown" — always surface something typed
+                last_display = last_err or "no error details (check provider/attempts)"
+                result.final_error = f"All {len(model_chain)} models failed ({summary}). Last error: {last_display}"
+                # Attach per-attempt breakdown for verbose diagnostics (safe, no secrets)
+                if error_attempts:
+                    def _cls(v: str) -> str:
+                        return "error" if v == "unknown" else v
+                    breakdown = "; ".join(f"{a.get('model','?')} — {_cls(a.get('classification','?'))}: {a.get('error_short', a.get('error',''))[:120]}" for a in error_attempts[:4])
+                    result.final_error += f" | Attempts: {breakdown}"
         return result

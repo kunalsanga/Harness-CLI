@@ -311,10 +311,10 @@ class EngineeringRuntime:
             detail = f"recovery exhausted ({self.state.recovery_attempts} attempts)"
         elif failed_originals and not self._all_failures_recovered(graph, failed_originals):
             status = RuntimeStatus.FAILED
-            detail = f"unrecovered failed tasks: {failed_originals}"
+            detail = self._user_facing_error(graph, failed_originals)
         elif not verification_ok:
             status = RuntimeStatus.FAILED
-            detail = f"verification failed: {summary}"
+            detail = f"Verification failed: {summary}"
         else:
             status = RuntimeStatus.SUCCESS
             detail = "all requirements verified"
@@ -479,10 +479,10 @@ class EngineeringRuntime:
             detail = f"recovery exhausted ({self.state.recovery_attempts} attempts)"
         elif failed_originals and not self._all_failures_recovered(graph, failed_originals):
             status = RuntimeStatus.FAILED
-            detail = f"unrecovered failed tasks: {failed_originals}"
+            detail = self._user_facing_error(graph, failed_originals)
         elif not verification_ok:
             status = RuntimeStatus.FAILED
-            detail = f"verification failed: {summary}"
+            detail = f"Verification failed: {summary}"
         else:
             status = RuntimeStatus.SUCCESS
             detail = "all requirements verified"
@@ -667,6 +667,30 @@ class EngineeringRuntime:
             if not any(rt.startswith(base) for rt in retest_completed):
                 return False
         return True
+
+    @staticmethod
+    def _user_facing_error(graph: TaskGraph, failed_ids: list[str]) -> str:
+        """Extract a concise, user-facing error from the first failed task.
+
+        Never exposes internal task IDs or recovery internals.
+        """
+        for tid in failed_ids:
+            task = graph.get_task(tid)
+            if task is None:
+                continue
+            # Prefer a structured error if the task has one
+            err = (task.error or "").strip()
+            # Strip internal recovery/failure prefixes
+            for prefix in ("Task failed:", "Provider error:", "Agent error:", "Runtime error:"):
+                if err.startswith(prefix):
+                    err = err[len(prefix):].strip()
+            if err and len(err) > 5:
+                # Take first meaningful line only
+                first_line = err.splitlines()[0].strip()
+                if len(first_line) > 120:
+                    first_line = first_line[:117] + "..."
+                return first_line
+        return "Task did not complete successfully."
 
     async def _publish_dependency_handoffs(self, graph: TaskGraph, bus: AgentMessageBus) -> None:
         """Publish typed handoffs from each completed task to its dependents."""

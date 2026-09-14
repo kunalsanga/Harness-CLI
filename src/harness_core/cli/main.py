@@ -25,6 +25,14 @@ if sys.platform == "win32":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 
+# Load .env file before anything reads environment variables.
+# Explicit env vars always win over .env values.
+try:
+    from harness_core.config.dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 app = typer.Typer(
     name="harness",
     help="Harness Engineering CLI — A model-agnostic, autonomous software-engineering harness.",
@@ -44,6 +52,13 @@ def _main_callback(ctx: typer.Context) -> None:
 # Sub-commands
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
+
+# Auth commands
+try:
+    from harness_core.cli.auth import auth_app
+    app.add_typer(auth_app, name="auth")
+except ImportError:
+    pass
 
 models_app = typer.Typer(help="Model intelligence commands")
 app.add_typer(models_app, name="models")

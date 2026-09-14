@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from harness_core.agent.completion import can_complete_task, completion_blockers
+from harness_core.runtime.steering import SteeringBuffer
 from harness_core.agent.todos import (
     apply_tool_result,
     apply_tool_started,
@@ -28,9 +29,21 @@ from harness_core.agent.types import (
     ToolResults,
     ToolResultStatus,
 )
+from harness_core.agent.steering import SteeringBuffer, steering_event_data
+from harness_core.agent.ask_user import (
+    AskUserManager,
+    QuestionStatus,
+    question_answered_payload,
+)
+from harness_core.agent.micro import default_micro_registry
 from harness_core.context.compaction import AgentMessage, ContextCompactor
 from harness_core.context.engine import ContextEngine
+from harness_core.context.models import ContextRequest
+from harness_core.context.pipeline import ContextPipeline
 from harness_core.context.pack import estimate_tokens
+from harness_core.context.reuse import ContextReuseManager
+from harness_core.observability import semantic
+from harness_core.observability.run_metrics import RunMetrics
 from harness_core.observability.events import Event, EventBus
 from harness_core.permissions.manager import PermissionManager
 from harness_core.providers.base import CompletionRequest, ModelProvider
@@ -59,6 +72,13 @@ STAGNATION_WARN_AT = 2
 STAGNATION_STOP_AT = 3
 # How many times we may re-prompt a model that produced zero tool calls.
 MAX_NO_TOOL_NUDGES = 2
+# Read-only tool calls without any write/edit: after this many, force text.
+_MAX_READONLY_TOOL_CALLS = 25
+# Tool names that are read-only (never modify the workspace).
+_READONLY_TOOLS = frozenset({
+    "read_file", "list_files", "glob", "grep",
+    "git_status", "git_diff", "git_log", "git_remote", "git_identity",
+})
 
 # Phase 10: typed failure messages. Keys match FailureReason values.
 _FAILURE_MESSAGES: dict[str, str] = {
@@ -208,6 +228,9 @@ class AgentLoop:
         task_aware: TaskAwareRouter | None = None,
         agent_id: str = "",
         task_id: str = "",
+        run_id: str = "",
+        steering_buffer: "SteeringBuffer | None" = None,
+        context_pipeline: ContextPipeline | None = None,
     ) -> None:
         self.provider = provider
         self.tools = {t.schema.name: t for t in tools}
@@ -220,8 +243,24 @@ class AgentLoop:
         # attribute tool/test activity to the correct agent without guessing.
         self.agent_id = agent_id
         self.task_id = task_id
+        # Harness 2.0 Phase 1: run identity + steering + context intelligence.
+        # All optional with safe defaults so existing call sites are unaffected.
+        import uuid as _uuid
+        self.run_id = run_id or _uuid.uuid4().hex[:12]
+        self.steering = steering_buffer or SteeringBuffer()
+        self.ask_user = AskUserManager()
+        self.micro_workers = default_micro_registry()
+        self.run_metrics = RunMetrics(run_id=self.run_id)
+        self._cancelled = False
         self.budget = BudgetManager() if router is None else router.budget
         self.context_engine = ContextEngine(self.workspace_root)
+        self.context_reuse = ContextReuseManager()
+        # Context intelligence pipeline reuses the SAME ContextReuseManager
+        # instance (Part 6) — one snapshot cache, no duplicate systems.
+        self._context_pipeline = context_pipeline or ContextPipeline(
+            self.workspace_root, reuse=self.context_reuse
+        )
+        self._last_context_selection: Any = None
         self.permission_manager = PermissionManager(
             self.workspace_root,
             autonomous_mode=self.config.autonomous_mode,
@@ -241,6 +280,7 @@ class AgentLoop:
         self._diagnosis_active: bool = False
         self._diagnosis_iterations: int = 0
         self._no_tool_nudges: int = 0
+        self._readonly_tool_calls: int = 0
         self._corrections: list[str] = []  # injected guidance messages
         self._modified_files: list[str] = []  # files written/edited (raw paths)
         self._had_test_failure: bool = False
@@ -248,6 +288,23 @@ class AgentLoop:
         self._active_task: Task | None = None  # currently running task (cancellation reporting)
         self._completed_operations: set[str] = set()  # successful operation keys (Phase 8)
         self._pending_workflow_events: list = []  # deferred events from workflows
+
+        # Steering: single unified buffer (Harness 2.0 Part 7). The legacy
+        # event-driven entry point (steering.received) feeds the same buffer
+        # as the programmatic submit_steering_message API.
+        if self.event_bus:
+            self.event_bus.on("steering.received", self._on_steering)
+
+    async def _on_steering(self, event: Event) -> None:
+        """Handle steering messages injected by the user during execution.
+
+        Event-driven bridge into the unified SteeringBuffer: the buffer is
+        the only steering state; this keeps the existing event API working
+        while the programmatic API and the loop drain from one queue.
+        """
+        message = event.data.get("message")
+        if message:
+            await self._enqueue_steering(str(message))
 
     def _workspace_snapshot_text(self) -> str:
         """Compact workspace snapshot for model context.
@@ -277,6 +334,51 @@ class AgentLoop:
     def _workspace_has_files(self) -> bool:
         return bool(self._project_info and self._project_info.get("files"))
 
+    def _cached_file_read(self, path: str) -> str | None:
+        """Read a file with context-reuse awareness.
+
+        Returns the file content if the file hasn't changed since the last
+        read, or None if a fresh read is needed.  When a fresh read is
+        performed the snapshot is recorded for future checks.
+
+        This prevents the model from receiving identical file content on
+        repeated reads — the ContextReuseManager tracks which files have
+        been read and whether they have changed (by hash/mtime).
+        """
+        try:
+            p = Path(path)
+            if not p.exists():
+                return None
+            stat = p.stat()
+            snap = self.context_reuse.snapshot(path)
+            if snap is not None and not self.context_reuse.is_unchanged(
+                path, size=stat.st_size, mtime_ns=int(stat.st_mtime * 1e9)
+            ):
+                # File changed — re-read and update snapshot
+                content = p.read_text(encoding="utf-8", errors="replace")
+                self.context_reuse.record_read(
+                    path, content=content, size=stat.st_size,
+                    mtime_ns=int(stat.st_mtime * 1e9),
+                )
+                return content
+            if snap is None:
+                # First read — record it
+                content = p.read_text(encoding="utf-8", errors="replace")
+                self.context_reuse.record_read(
+                    path, content=content, size=stat.st_size,
+                    mtime_ns=int(stat.st_mtime * 1e9),
+                )
+                return content
+            # File unchanged — return None to signal "no fresh read needed"
+            return None
+        except Exception:
+            return None
+
+    def invalidate_file_cache(self, path: str) -> None:
+        """Invalidate the cached snapshot for a file after a write/edit."""
+        self.context_reuse.invalidate(path)
+
+
     def _system_prompt(self) -> str:
         """Build the workspace-aware system prompt."""
         base = """You are an autonomous software engineering agent operating INSIDE a real workspace.
@@ -296,7 +398,14 @@ WORKSPACE RULES:
 - NEVER ask the user for information you can discover with tools (project type,
   tech stack, file names, test commands). Discover it yourself.
 - Inspect relevant files BEFORE modifying them.
-- Prefer acting over explaining. Do not answer a coding task with prose only."""
+- Prefer acting over explaining. Do not answer a coding task with prose only.
+
+CRITICAL: You MUST produce a text response (your final answer) after gathering
+enough information. Do NOT keep calling tools indefinitely. Once you have read
+the relevant files and have enough context, STOP calling tools and write your
+response. For explanation requests, read a few key files then explain. For
+coding requests, implement the change then verify it. Never read the same
+file more than twice."""
 
         snapshot = self._workspace_snapshot_text()
         if snapshot:
@@ -351,6 +460,25 @@ When you are done, summarize what you did and provide evidence of success."""
             args = dict(arguments)
             args["command"] = normalize_shell_command(arguments["command"])
         return f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+
+    @staticmethod
+    def _tool_summary(call: ToolCall) -> str:
+        """Safe human-readable summary of a tool call for semantic events.
+
+        Never includes file contents or raw output — only the operation shape.
+        """
+        name = call.tool_name
+        args = call.arguments
+        if name == "run_command":
+            return f"run: {str(args.get('command', ''))[:120]}"
+        if name in ("read_file", "write_file", "edit_file", "list_files"):
+            p = args.get("path") or args.get("file_path") or ""
+            return f"{name}: {str(p)[:120]}"
+        if name in ("glob", "grep"):
+            return f"{name}: {str(args.get('pattern', ''))[:80]}"
+        if name.startswith("git_"):
+            return name
+        return name
 
     @staticmethod
     def _is_test_command(command: str) -> bool:
@@ -715,6 +843,9 @@ When you are done, summarize what you did and provide evidence of success."""
             path = call.arguments.get("path", call.arguments.get("file_path", ""))
             if path and path not in self._modified_files:
                 self._modified_files.append(path)
+            # Invalidate context-reuse snapshot so next read gets fresh content
+            if path:
+                self.context_reuse.invalidate(path)
             # Code changed: earlier command failures may now be obsolete
             self._failure_counts.clear()
             await self._emit_phase("fixing" if self._diagnosis_active else "implementing")
@@ -837,6 +968,9 @@ When you are done, summarize what you did and provide evidence of success."""
             path = args.get("path", args.get("file_path", ""))
             if path and path not in self._modified_files:
                 self._modified_files.append(path)
+            # Invalidate context-reuse snapshot so next read gets fresh content
+            if path:
+                self.context_reuse.invalidate(path)
         await self._todo_result(task, call, result)
 
     def _apply_workflow_result(self, task: Task, result: Any) -> None:
@@ -1063,18 +1197,36 @@ When you are done, summarize what you did and provide evidence of success."""
         return True
 
     async def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
-        """Emit an event stamped with this loop's agent/task identity.
+        """Emit an event stamped with this loop's agent/task/run identity.
 
         Identity is provided by the WorkerAgent that owns the loop; the
         dashboard uses it to attribute activity truthfully (Phase 10).
+        Payloads are sanitized through the semantic contract (no secrets,
+        bounded text) before hitting the bus (milestone Part 17).
         """
-        payload = dict(data)
+        payload = semantic.redact_sensitive(dict(data))
         if self.task_id and not payload.get("task_id"):
             payload["task_id"] = self.task_id
         if self.agent_id and not payload.get("agent_id"):
             payload["agent_id"] = self.agent_id
+        if self.run_id and not payload.get("run_id"):
+            payload["run_id"] = self.run_id
         await self.event_bus.emit(
             Event(type=event_type, source=self.agent_id or "agent_loop", data=payload)
+        )
+
+    async def _emit_semantic(self, event_type: str, data: dict[str, Any], quiet: bool = False) -> None:
+        """Emit a canonical semantic event via the shared contract."""
+        await self.event_bus.emit(
+            semantic.make_event(
+                event_type,
+                self.agent_id or "agent_loop",
+                data,
+                run_id=self.run_id,
+                task_id=self.task_id,
+                agent_id=self.agent_id,
+                quiet=quiet,
+            )
         )
 
     async def _emit_phase(self, phase: str) -> None:
@@ -1481,10 +1633,214 @@ When you are done, summarize what you did and provide evidence of success."""
             await self._record_execution_outcome(call, error_result)
             return error_result
 
+    # ── Steering / ask-user runtime API (Parts 7, 14) ─────────────────
+
+    async def _enqueue_steering(self, text: str) -> Any:
+        """Queue a steering message WITHOUT emitting steering.received.
+
+        Used by the event bridge — the original event already announced the
+        steering to consumers, so re-emitting would recurse forever.
+        """
+        msg = await self.steering.submit_steering_message(text)
+        msg.task_id = self.task_id or (self._active_task.id if self._active_task else "")
+        return msg
+
+    async def submit_steering_message(self, text: str) -> Any:
+        """Queue a mid-run user instruction; applied at the next safe boundary."""
+        msg = await self._enqueue_steering(text)
+        await self._emit_semantic(
+            semantic.STEERING_RECEIVED,
+            steering_event_data(msg, applied=False),
+        )
+        return msg
+
+    async def drain_steering_messages(self) -> list[Any]:
+        """Drain pending steering messages (used by tests and the UI layer)."""
+        return await self.steering.drain_steering_messages()
+
+    async def has_pending_steering(self) -> bool:
+        return await self.steering.has_pending_steering()
+
+    async def ask_user_question(
+        self,
+        question: str,
+        choices: list[str] | None = None,
+        explanation: str = "",
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        """Ask the user a question and pause until answered/cancelled.
+
+        Backend contract (Part 14): emits agent.question_requested, waits,
+        emits agent.question_answered. On timeout/cancel the loop continues
+        gracefully with no answer rather than hanging or failing.
+        """
+        q = await self.ask_user.ask(question, choices=choices, explanation=explanation)
+        q.run_id = self.run_id
+        q.task_id = self.task_id or (self._active_task.id if self._active_task else "")
+        self.run_metrics.record_ask_user()
+        await self._emit_semantic(
+            semantic.AGENT_QUESTION_REQUESTED,
+            q.to_event_payload(),
+        )
+        result = await self.ask_user.wait_for_answer(q, timeout_seconds=timeout_seconds)
+        await self._emit_semantic(
+            semantic.AGENT_QUESTION_ANSWERED,
+            question_answered_payload(result),
+        )
+        self.ask_user.cleanup(q.id)
+        return result
+
+    def cancel(self, reason: str = "User cancelled") -> None:
+        """Cooperative cancellation flag checked at the iteration boundary."""
+        self._cancelled = True
+        self.steering.cancel()
+
+    # ── Context pipeline integration (Parts 2-6) ──────────────────────
+
+    async def _discover_context(self, goal: str) -> tuple[list[Any], Any | None]:
+        """Run the context intelligence pipeline for the task.
+
+        Returns (context pieces, ContextSelection | None). Deterministic
+        discovery always runs; the AI relevance stage is optional inside the
+        pipeline and falls back cleanly. Emits the canonical context.*
+        events. Any pipeline failure degrades to the legacy assemble_context
+        path — context discovery must never fail the run.
+        """
+        await self._emit_semantic(
+            semantic.CONTEXT_DISCOVERY_STARTED,
+            {"task": goal[:200]},
+        )
+        self.run_metrics.stage_start("discovery")
+        selection = None
+        context: list[Any] = []
+        try:
+            request = ContextRequest(
+                task=goal,
+                run_id=self.run_id,
+                task_id=self.task_id,
+                agent_id=self.agent_id,
+            )
+            selection = await self._context_pipeline.discover(
+                request,
+                project_files=(self._project_info or {}).get("files", []),
+            )
+            context = selection.to_context_pieces()
+        except Exception:
+            # Deterministic degradation: legacy context assembly still runs.
+            selection = None
+        if selection is None or not context:
+            context = await self.context_engine.assemble_context(goal, self._project_info)
+        self._last_context_selection = selection
+
+        # Accounting + events.
+        ctx_tokens = 0
+        if selection is not None:
+            ctx_tokens = selection.snapshot.tokens_used
+            self.run_metrics.record_context(
+                ctx_tokens, files=selection.snapshot.file_paths()
+            )
+            ai = selection.snapshot.ai_ranking_used
+            failed = selection.snapshot.ai_ranking_failed
+            self.run_metrics.record_ai_relevance(used=ai, failed=failed, skipped=not (ai or failed))
+            for cand in selection.snapshot.selected:
+                await self._emit_semantic(
+                    semantic.CONTEXT_FILE_SELECTED,
+                    {"path": cand.path, "score": cand.score, "freshness": cand.freshness.value},
+                    quiet=True,
+                )
+        self.run_metrics.stage_end("discovery")
+        await self._emit_semantic(
+            semantic.CONTEXT_DISCOVERY_COMPLETED,
+            {
+                "files": selection.snapshot.file_paths() if selection else [],
+                "tokens": ctx_tokens,
+                "candidates": selection.snapshot.candidates_considered if selection else 0,
+                "ai_ranking_used": bool(selection and selection.snapshot.ai_ranking_used),
+                "ai_ranking_failed": bool(selection and selection.snapshot.ai_ranking_failed),
+            },
+        )
+        return context, selection
+
+    async def _maybe_compact(self, task: Task) -> bool:
+        """Compact conversation context when the budget demands it.
+
+        Uses the existing ContextCompactor (deterministic) with an optional
+        model-assisted summary via ModelSummarizer. Emits
+        context.compaction_started/completed. Never fails the run.
+        """
+        from harness_core.context.budgets import BudgetClass, ContextBudgetManager
+
+        manager = getattr(self, "_ctx_budget_manager", None)
+        if manager is None:
+            manager = ContextBudgetManager()
+            self._ctx_budget_manager = manager
+        manager.reset()
+        # Account current assembled history by class.
+        for tc in task.tool_calls:
+            if tc.result is None:
+                continue
+            raw = (tc.result.output or "") + (tc.result.error or "")
+            manager.record(BudgetClass.TOOL_OUTPUT, estimate_tokens(raw))
+        if task.goal:
+            manager.record(BudgetClass.USER_CRITICAL, estimate_tokens(task.goal))
+        if task.result:
+            manager.record(BudgetClass.ASSISTANT, estimate_tokens(task.result))
+
+        if not manager.compaction_recommended:
+            return False
+
+        await self._emit_semantic(semantic.CONTEXT_COMPACTION_STARTED, manager.status())
+        self.run_metrics.stage_start("compaction")
+
+        # Compact older tool history via the existing deterministic compactor.
+        calls_with_results = [tc for tc in task.tool_calls if tc.result]
+        preserve = 10
+        older = calls_with_results[:-preserve] if len(calls_with_results) > preserve else []
+        summary_text = ""
+        if older:
+            agent_msgs = self._as_agent_messages(older)
+            # Optional cheap-model summary; None → deterministic path.
+            from harness_core.context.summarizer import ModelSummarizer
+
+            summarizer = ModelSummarizer(
+                model=getattr(self.router, "_summary_model", None) or self.provider
+                if self.router is None else getattr(self.router, "_summary_model", None),
+            )
+            model_summary = await summarizer.summarize(agent_msgs, protected_intent=task.goal)
+            deterministic = ContextCompactor(preserve_recent=0).compact(agent_msgs)
+            summary_text = model_summary or deterministic.content
+            task.compaction_note = (
+                f"[compacted {len(older)} older tool call(s) before iteration "
+                f"{task.iterations + 1}]"
+            )
+            task.tool_calls = list(calls_with_results[-preserve:])
+
+        saved = sum(
+            estimate_tokens((tc.result.output or "") + (tc.result.error or ""))
+            for tc in older
+        )
+        self.run_metrics.record_compaction(saved)
+        self.run_metrics.stage_end("compaction")
+        status = manager.status()
+        status["tokens_saved"] = saved
+        status["compacted_calls"] = len(older)
+        status["summary_mode"] = "model" if summary_text and not summary_text.startswith("Tool calls made") else "deterministic"
+        await self._emit_semantic(semantic.CONTEXT_COMPACTION_COMPLETED, status)
+        return True
+
     async def run(self, goal: str) -> Task:
         """Run the agent loop for a given goal."""
         task = Task(goal=goal, max_iterations=self.config.max_iterations)
         self._active_task = task
+        self._cancelled = False
+        self.steering.reset()
+        self.run_metrics = RunMetrics(run_id=self.run_id)
+
+        # Canonical run lifecycle (Part 8): run.started first.
+        await self._emit_semantic(
+            semantic.RUN_STARTED,
+            {"goal": goal[:200], "run_id": self.run_id},
+        )
 
         # Reset per-task governor state (loops may be reused across tasks)
         self._corrections = []
@@ -1510,6 +1866,19 @@ When you are done, summarize what you did and provide evidence of success."""
             Event(type="task.started", source="agent_loop", data={"goal": goal})
         )
         await self._emit_phase("understanding")
+
+        # Intent detection event (canonical intent.detected) — deterministic
+        # classification reused from the existing intent module.
+        try:
+            from harness_core.agent.intent import classify_intent
+
+            intent = classify_intent(goal)
+            await self._emit_semantic(
+                semantic.INTENT_DETECTED,
+                {"intent": "read_only" if intent.read_only else "engineering", "goal": goal[:120]},
+            )
+        except Exception:
+            pass
 
         # Phase 16: intent fast paths — deterministic workflows run without
         # unbounded LLM iteration when the intent matches.
@@ -1633,8 +2002,9 @@ When you are done, summarize what you did and provide evidence of success."""
         project_info = await self.context_engine.discover_project()
         self._project_info = project_info
 
-        # Assemble context
-        context = await self.context_engine.assemble_context(goal, project_info)
+        # Harness 2.0: intelligent context pipeline (deterministic + optional
+        # AI relevance + reuse integration). Falls back to legacy assembly.
+        context, _selection = await self._discover_context(goal)
         
         # Inject workflow-gathered context if any (e.g., from explain workflow)
         if hasattr(task, "workflow_context") and task.workflow_context:
@@ -1741,6 +2111,16 @@ When you are done, summarize what you did and provide evidence of success."""
         await self._emit_phase("implementing")
 
         while task.iterations < task.max_iterations:
+            # ── Safe step boundary (Part 7) ────────────────────────────
+            # Cooperative cancellation check before re-arming a request.
+            if self._cancelled or self.steering.cancelled:
+                task.status = TaskStatus.CANCELLED
+                task.error = task.error or "Cancelled by user"
+                await self._emit_semantic(
+                    semantic.RUN_CANCELLED, {"reason": "user_requested"}
+                )
+                break
+
             task.iterations += 1
             task.status = TaskStatus.EXECUTING
             self.budget.record_iteration()
@@ -1748,6 +2128,30 @@ When you are done, summarize what you did and provide evidence of success."""
             await self._emit_event(
                 "iteration.started", {"iteration": task.iterations, "task_id": task.id}
             )
+
+            # Steering injection at the safe step boundary: queued user
+            # messages become corrections for the next request. The in-flight
+            # provider request is never mutated; FIFO order is preserved.
+            if self.steering.has_pending_steering_sync():
+                pending = await self.steering.drain_steering_messages()
+                for steering_msg in pending:
+                    # Stamp run identity at drain time — the submitter may
+                    # predate the run (message queued before run started).
+                    steering_msg.run_id = self.run_id
+                    steering_msg.task_id = (
+                        self.task_id or (self._active_task.id if self._active_task else "")
+                    )
+                    self._corrections.append(steering_msg.render())
+                    await self._emit_semantic(
+                        semantic.STEERING_APPLIED,
+                        steering_event_data(steering_msg, applied=True),
+                    )
+
+            # Budget-driven compaction (Parts 4/5) at the boundary.
+            try:
+                await self._maybe_compact(task)
+            except Exception:
+                pass  # compaction must never fail the run
 
             # Build messages
             messages = self._build_messages(task, context)
@@ -1766,6 +2170,11 @@ When you are done, summarize what you did and provide evidence of success."""
                 tools=self._tool_schemas() if self.tools else None,
             )
 
+            self.run_metrics.record_model_call()
+            await self._emit_semantic(
+                semantic.MODEL_STARTED,
+                {"model": self.config.model_preference or "auto", "iteration": task.iterations},
+            )
             try:
                 if self.router is not None:
                     response = None
@@ -1826,9 +2235,37 @@ When you are done, summarize what you did and provide evidence of success."""
                         },
                     )
                 )
-                task.status = TaskStatus.FAILED
-                task.error = f"Provider error: {e}"
-                task.failure_reason = failure_reason
+                # Phase 11: transient model failures after real progress
+                # should PAUSE (state preserved, resumable), not FAIL.
+                # "Real progress" = files modified or actual tool calls
+                # executed (not just auto-completed read-only planning TODOs).
+                has_progress = (
+                    bool(self._modified_files)
+                    or len(task.tool_calls) > 0
+                )
+                transient = failure_reason in (
+                    "model_unavailable", "model_rate_limited",
+                    "provider_auth_failure", "payment_required",
+                )
+                if transient and has_progress:
+                    task.status = TaskStatus.PAUSED
+                    task.paused_reason = _PAUSED_MESSAGES.get(
+                        failure_reason, f"Model error: {failure_reason}"
+                    )
+                    task.error = task.paused_reason
+                    await self.event_bus.emit(
+                        Event(
+                            type="task.paused",
+                            source="agent_loop",
+                            data={
+                                "reason": failure_reason,
+                                "error": err_str,
+                            },
+                        )
+                    )
+                else:
+                    task.status = TaskStatus.FAILED
+                    task.error = f"Provider error: {e}"
                 break
 
             # Process response
@@ -1853,8 +2290,28 @@ When you are done, summarize what you did and provide evidence of success."""
                     iter_calls.append(call)
                     self.budget.record_tool_call()
 
+                    quiet = call.tool_name in _READONLY_TOOLS
+                    if quiet:
+                        self.run_metrics.record_tool_call(quiet=True)
                     await self._emit_event(
-                        "tool.call", {"tool": call.tool_name, "args": call.arguments}
+                        "tool.call", {"tool": call.tool_name, "args": call.arguments, "quiet": quiet}
+                    )
+                    # Canonical tool lifecycle (Part 10): tool.started carries a
+                    # safe summary, not raw arguments; ghost/read-only tools are
+                    # marked quiet so the UI can collapse them (Part 13).
+                    await self._emit_semantic(
+                        semantic.TOOL_STARTED,
+                        semantic.tool_lifecycle_payload(
+                            tool_name=call.tool_name,
+                            call_id=call.id,
+                            status="started",
+                            summary=self._tool_summary(call),
+                            affected_files=[
+                                str(v) for k, v in call.arguments.items()
+                                if k in ("path", "file_path") and isinstance(v, str)
+                            ],
+                        ),
+                        quiet=quiet,
                     )
 
                     # Runtime-owned TODO state: mark matching item in progress
@@ -1899,6 +2356,31 @@ When you are done, summarize what you did and provide evidence of success."""
                         event_data["metadata"] = dict(result.metadata)
 
                     await self._emit_event("tool.result", event_data)
+                    # Canonical tool lifecycle (Part 10): completed/failed with
+                    # bounded metadata — no raw output dumps in the event stream.
+                    _failed = result.execution_failed
+                    await self._emit_semantic(
+                        semantic.TOOL_FAILED if _failed else semantic.TOOL_COMPLETED,
+                        semantic.tool_lifecycle_payload(
+                            tool_name=call.tool_name,
+                            call_id=call.id,
+                            status="failed" if _failed else "completed",
+                            summary=self._tool_summary(call),
+                            duration_ms=call.duration_ms,
+                            error_class=(
+                                result.failure_category if _failed else ""
+                            ),
+                            affected_files=[
+                                str(v) for k, v in call.arguments.items()
+                                if k in ("path", "file_path") and isinstance(v, str)
+                            ],
+                            extra={
+                                "exit_code": result.exit_code,
+                                "error": (result.error or "")[:300] if _failed else None,
+                            },
+                        ),
+                        quiet=quiet,
+                    )
 
                     # Check if we've hit tool call limit
                     if len(task.tool_calls) >= self.config.max_tool_calls:
@@ -2111,6 +2593,33 @@ When you are done, summarize what you did and provide evidence of success."""
                     )
                     break
 
+            # Read-only tool call budget: prevent infinite file-reading loops.
+            # If the model keeps reading files without writing/modifying anything,
+            # force it to produce a text answer.
+            if iter_calls:
+                readonly_in_iter = sum(
+                    1 for tc in iter_calls
+                    if tc.tool_name in _READONLY_TOOLS
+                )
+                wrote_in_iter = sum(
+                    1 for tc in iter_calls
+                    if tc.tool_name in ("write_file", "edit_file")
+                )
+                if readonly_in_iter > 0 and wrote_in_iter == 0:
+                    self._readonly_tool_calls += readonly_in_iter
+                elif wrote_in_iter > 0:
+                    # Any write resets the read-only counter
+                    self._readonly_tool_calls = 0
+
+                if self._readonly_tool_calls >= _MAX_READONLY_TOOL_CALLS:
+                    self._corrections.append(
+                        f"You have made {self._readonly_tool_calls} read-only tool calls "
+                        "without modifying any files. STOP calling tools and produce "
+                        "your final text response NOW. Summarize what you found and "
+                        "answer the user's question. Do not call any more tools."
+                    )
+                    self._readonly_tool_calls = 0  # Reset so we don't spam
+
             # Diagnosis mode budget: never loop forever in diagnosis
             if self._diagnosis_active:
                 self._diagnosis_iterations += 1
@@ -2168,7 +2677,32 @@ When you are done, summarize what you did and provide evidence of success."""
                 )
             else:
                 task.status = TaskStatus.FAILED
-                task.error = task.error or "Max iterations reached"
+                task.error = task.error or (
+                    "The model did not produce a final answer within the iteration "
+                    "budget. Try rephrasing your request or using a different model."
+                )
+
+        # ── Canonical run terminal events (Part 8) ─────────────────────
+        terminal = task.status in (
+            TaskStatus.COMPLETED, TaskStatus.PARTIAL,
+        )
+        if task.status == TaskStatus.FAILED:
+            await self._emit_semantic(
+                semantic.RUN_FAILED,
+                {"reason": task.failure_reason or "unknown", "error": (task.error or "")[:300]},
+            )
+        elif task.status == TaskStatus.CANCELLED:
+            await self._emit_semantic(
+                semantic.RUN_CANCELLED, {"reason": "user_requested"}
+            )
+        elif terminal:
+            metrics = self.run_metrics.finish(
+                failure_reason="" if task.status == TaskStatus.COMPLETED else (task.failure_reason or "")
+            )
+            await self._emit_semantic(
+                semantic.RUN_COMPLETED,
+                {"status": task.status.value, "metrics": metrics},
+            )
 
         # Record performance if task_aware is available
         if self.task_aware is not None and self.router is not None:

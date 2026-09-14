@@ -175,8 +175,8 @@ class TestGitIdentityTool:
             )
             await proc.communicate()
 
-        # Verify it works (reads from whatever cwd — global or local)
-        result = await git_identity_tool.execute({})
+        # Pass cwd so the tool reads identity from the tmp_path repo
+        result = await git_identity_tool.execute({"cwd": str(tmp_path)})
         assert result.status == ToolResultStatus.SUCCESS
         assert "configured" in result.output.lower() or "user.name" in result.output
         assert result.metadata.get("configured") is True

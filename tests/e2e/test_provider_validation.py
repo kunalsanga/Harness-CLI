@@ -189,8 +189,13 @@ class TestOpenRouterTimeout:
             messages=[{"role": "user", "content": "test"}],
             max_tokens=10,
         )
-        with pytest.raises((httpx.TimeoutException, httpx.ReadTimeout)):
+        # The provider normalizes transport errors into RuntimeError with a
+        # bounded message (loop-classifiable); a raw httpx.TimeoutException
+        # may also surface. Accept both.
+        with pytest.raises((httpx.TimeoutException, httpx.ReadTimeout, RuntimeError)) as excinfo:
             await provider.generate(req)
+        if isinstance(excinfo.value, RuntimeError):
+            assert "timeout" in str(excinfo.value).lower()
         await provider.close()
 
 
