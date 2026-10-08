@@ -240,6 +240,9 @@ class RuntimeViewModel:
         self.tool_calls: int = 0
         self.model_calls: int = 0
         self.failed_tool_calls: int = 0
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        self.total_tokens: int = 0
         self._plan_tasks: int = 0
         self._bus: EventBus | None = None
 
@@ -435,8 +438,22 @@ class RuntimeViewModel:
         if etype == "routing.decision":
             self.model_calls += 1
             return
+        if etype == "model.usage":
+            self.input_tokens += int(data.get("input_tokens", 0) or 0)
+            self.output_tokens += int(data.get("output_tokens", 0) or 0)
+            self.total_tokens += int(data.get("total_tokens", 0) or 0)
+            return
         if etype == "model.error":
             self.warnings.append(str(data.get("error", ""))[:120])
+            return
+        if etype == "model.cooldown":
+            model = str(data.get("model", "?"))
+            cooldown = data.get("cooldown_seconds", 0)
+            category = str(data.get("category", "error"))
+            self.activity.append((
+                time.strftime("%H:%M:%S"), "router",
+                f"{model} {category} · cooldown {cooldown}s"[:90],
+            ))
             return
         if etype == "test_integrity.warning":
             self.warnings.append(str(data.get("warning", "test integrity"))[:120])
@@ -609,7 +626,7 @@ class LiveTerminalUI:
             self._render_plain(vm)
             return
         from rich.live import Live
-        self._live = Live(self._renderable(vm), console=self.console, refresh_per_second=self.refresh_per_second, transient=False)
+        self._live = Live(get_renderable=lambda: self._renderable(vm), console=self.console, refresh_per_second=self.refresh_per_second, transient=False)
         self._live.start()
 
     def stop(self, vm: RuntimeViewModel) -> None:
@@ -632,8 +649,7 @@ class LiveTerminalUI:
         if now - self._last_refresh < self._min_interval:
             return
         self._last_refresh = now
-        if self._live is not None:
-            self._live.update(self._renderable(vm))
+        # Live thread handles the rendering automatically via get_renderable
 
     def _current_operation(self, vm: RuntimeViewModel) -> tuple[str, str]:
         running = [a for a in vm.agents.values() if a.status in ("running", "waiting", "blocked")]
@@ -659,82 +675,76 @@ class LiveTerminalUI:
         from rich.console import Group
         from rich.text import Text
         lines: list[Any] = []
-        # Small header keeps legacy test green and preserves conversation feel
-        header = Text.assemble((f"HARNESS", "bold"), ("  " + format_elapsed(time.time() - vm.started_at), "dim")) if not vm.terminal else Text.assemble((f"HARNESS", "bold green"), ("  done", "dim"))
-        lines.append(header)
-        # Task line — what we are doing (keeps "Build a task manager" in output)
-        if vm.request and not vm.terminal:
-            lines.append(Text.assemble(("  Task  ", "dim"), (vm.request[:90], "bold")))
-        # Thinking intent (user-safe, from intent classifier) — conversation style
+        
         if vm.request:
-            try:
-                from harness_core.cli.conversation import derive_intent
-                intent = derive_intent(vm.request)
-                lines.append(Text(f"  • Thinking", style="dim"))
-                lines.append(Text(f"    {intent}", style="dim"))
-                lines.append(Text(""))
-            except Exception:
-                pass
-        # Live tool activity from agents (compact, like conversation)
-        agents = sorted(vm.agents.values(), key=lambda a: (a.latest_at, a.task_id), reverse=True)[: self.max_agents]
-        if agents:
-            for a in agents:
-                if a.status in ("completed", "failed") and a.operation == "done":
-                    continue
-                icon, style = self.STATUS_ICONS.get(a.status, ("•", "dim"))
-                op = a.operation or a.detail or a.status
-                lines.append(Text.assemble((f"  {icon} ", style), (op[:70], "dim")))
+            lines.append(Text.assemble(("> ", "#3b82f6"), (vm.request, "bold white")))
+            lines.append(Text(""))
+            
+        stage_map = {
+            "understanding": "Considering…",
+            "exploring": "Exploring…",
+            "planning": "Planning…",
+            "implementing": "Building…",
+            "testing": "Testing…",
+            "diagnosing": "Diagnosing…",
+            "fixing": "Fixing…",
+            "verifying": "Verifying…",
+            "waiting": "Waiting for model…",
+        }
+        
+        is_waiting = any(a.status == "waiting" for a in vm.agents.values())
+        if is_waiting:
+            display_stage = stage_map["waiting"]
+        else:
+            stage = vm.stage.lower() if vm.stage else "understanding"
+            display_stage = stage_map.get(stage, "Considering…")
+        
+        self._frame = getattr(self, "_frame", 0) + 1
+        spinner_chars = ["◐", "◓", "◑", "◒"]
+        spinner = spinner_chars[self._frame % len(spinner_chars)]
+        
+        if vm.terminal:
+            if vm.status == "failed":
+                lines.append(Text.assemble(("✗ ", "red"), ("Failed", "bold white"), (f" · {format_elapsed(time.time() - vm.started_at)}", "dim")))
+            elif vm.status == "cancelled":
+                lines.append(Text.assemble(("■ ", "yellow"), ("Cancelled", "bold white"), (f" · {format_elapsed(time.time() - vm.started_at)}", "dim")))
+            else:
+                lines.append(Text.assemble(("✓ ", "green"), ("Completed", "bold white"), (f" · {format_elapsed(time.time() - vm.started_at)}", "dim")))
+        else:
+            lines.append(Text.assemble((f"{spinner} ", "#3b82f6"), (display_stage, "bold white"), (f"                         {format_elapsed(time.time() - vm.started_at)}", "dim")))
+            
+        if vm.total_tokens > 0:
+            in_k = vm.input_tokens / 1000.0
+            out_k = vm.output_tokens / 1000.0
+            tot_k = vm.total_tokens / 1000.0
+            if vm.terminal:
+                lines.append(Text.assemble((f"  {in_k:.1f}k input · {out_k:.1f}k output · {tot_k:.1f}k total", "dim")))
+            else:
+                lines.append(Text.assemble((f"  {in_k:.1f}k in · {out_k:.1f}k out · {tot_k:.1f}k total", "dim")))
+            
+        lines.append(Text(""))
+        
         activity = self._dedup_activity(list(vm.activity))[-5:]
         if activity:
-            lines.append(Text("  Recent", style="dim"))
-            for ts, name, text in activity:
-                lines.append(Text.assemble(("  ", ""), (name[:12], "cyan"), (" ", ""), (text[:58], "")))
-        latest = vm.latest_validation()
-        baseline = vm.baseline_validation()
-        if latest is not None or vm.verification_status != "not_started" or (vm.tests.has_evidence and not vm.validation_runs):
-            lines.append(Text("  Validation", style="dim"))
-            if latest is None and vm.tests.has_evidence and not vm.validation_runs:
-                if vm.tests.total:
-                    icon = "✓" if vm.tests.failed == 0 else "✗"
-                    style = "green" if vm.tests.failed == 0 else "red"
-                    lines.append(Text.assemble((f"  {icon} ", style), (f"{vm.tests.passed}/{vm.tests.total} passed", "bold")))
-                else:
-                    lines.append(Text(f"  {vm.tests.last_line}", style="dim"))
-            else:
-                if baseline is not None and baseline.total:
-                    lines.append(Text.assemble(("  ✓ baseline ", "green"), (f"{baseline.passed}/{baseline.total} passed", "bold")))
-                elif baseline is not None and baseline.success:
-                    lines.append(Text("  ✓ baseline tests passed", style="green"))
-                if latest is not None:
-                    if latest.is_failure:
-                        cmd = latest.command or "test command"
-                        lines.append(Text.assemble(("  ✗ latest ", "red"), (f"{cmd[:44]} ", "bold"), (f"exit {latest.exit_code}", "dim") if latest.exit_code not in (None, 0) else ("failed", "dim")))
-                    elif latest.success and latest.total:
-                        lines.append(Text.assemble(("  ✓ latest ", "green"), (f"{latest.passed}/{latest.total} passed", "bold")))
-            if vm.verification_status != "not_started":
-                icon = "✓" if vm.verification_status == "passed" else "✗"
-                style = "green" if vm.verification_status == "passed" else "red"
-                lines.append(Text.assemble((f"  {icon} verification ", style), (vm.verification_status, "bold")))
-        if vm.files:
-            lines.append(Text("  Files", style="dim"))
-            for change in list(vm.files.values())[-6:]:
-                style = {"M": "yellow", "A": "green", "D": "red"}.get(change.status, "white")
-                lines.append(Text.assemble((f"  {change.status} ", style), (change.path[:64], "")))
-        if vm.git["operations"]:
-            lines.append(Text("  Git", style="dim"))
-            if vm.git["commit"]:
-                lines.append(Text(f"  ✓ commit {vm.git['commit'][:12]}", style="green"))
-            if vm.git["push"]:
-                lines.append(Text(f"  ✓ pushed {vm.git['push']}", style="green"))
-            elif vm.git["dirty"]:
-                lines.append(Text("  changes present (not pushed)", style="yellow"))
-        if vm.recovery_active:
-            lines.append(Text.assemble(("  ⚠ recovery ", "yellow"), (f"{vm.recovery_attempts} attempt(s)", "bold")))
-        if vm.warnings:
-            lines.append(Text.assemble(("  ⚠ ", "yellow"), (vm.warnings[-1][:90], "dim")))
-        # Elapsed lives in the prompt's top line; keep footer minimal
-        footer = Text("  Ctrl+C cancel  ·  /help for commands", style="dim")
-        return Group(*lines, Text(""), footer)
+            for i, (ts, name, text) in enumerate(activity):
+                is_last = (i == len(activity) - 1)
+                prefix = "└─ " if is_last else "├─ "
+                icon = spinner if is_last and not vm.terminal else "✓"
+                if vm.terminal and vm.status == "failed" and is_last:
+                    icon = "✗"
+                color = "cyan" if icon == spinner else ("red" if icon == "✗" else "green")
+                
+                op_str = name
+                if text:
+                    op_str = f"{name} {text}"
+                    
+                lines.append(Text.assemble(("    " + prefix, "dim"), (f"{icon} ", color), (op_str[:70], "dim")))
+        
+        if vm.terminal and vm.status == "failed" and vm.warnings:
+            lines.append(Text(""))
+            lines.append(Text.assemble(("    ", ""), (vm.warnings[-1], "red")))
+        
+        return Group(*lines)
 
     def _render_plain(self, vm: RuntimeViewModel) -> None:
         line = f"[{vm.stage}] {vm.status} {len(vm.agents)} agents {vm.tool_calls} tools"
@@ -769,7 +779,7 @@ def render_startup_panel(console: Console, workspace: str, checks: dict[str, boo
 
 
 def render_success_summary(console: Console, vm: RuntimeViewModel, outcome: Any, *, plain: bool = False) -> None:
-    from harness_core.cli.completion import CompletionFormatter, NextActionEngine
+    from harness_core.cli.completion import _fmt_elapsed
     graph = getattr(outcome, "graph", None)
     agent_response = ""
     if graph is not None:
@@ -779,129 +789,53 @@ def render_success_summary(console: Console, vm: RuntimeViewModel, outcome: Any,
                 agent_response = res
                 break
     duration = (vm.completed_at - vm.started_at) if vm.completed_at else 0.0
-    created = sum(1 for f in vm.files.values() if f.status == "A")
-    modified = sum(1 for f in vm.files.values() if f.status == "M")
-    tests_line = f"✓ {vm.tests.passed} passed" if vm.tests.has_evidence and vm.tests.total else ("✓ tests passed" if vm.tests.has_evidence else "— not reported")
-    verified_ok = vm.verification_status in ("passed", "not_started")
-    latest = vm.latest_validation()
-    if latest is not None and latest.is_failure:
-        console.print("")
-        console.print("⚠ Implementation completed, but the latest validation command failed.")
-        console.print(f"  {latest.command[:100]} → exit {latest.exit_code}")
-    files_modified = [f.path for f in vm.files.values() if f.status == "M"]
-    files_created = [f.path for f in vm.files.values() if f.status == "A"]
-    files_deleted = [f.path for f in vm.files.values() if f.status == "D"]
-    suggestions = NextActionEngine().suggest(vm.request or "", files=files_modified + files_created, verification_status=vm.verification_status, git_commit=vm.git.get("commit", ""), git_push=vm.git.get("push", ""), recovery_exhausted=vm.recovery_exhausted)
-    formatter = CompletionFormatter(plain=plain)
-    summary = formatter.success(headline="Project implemented", files_modified=files_modified, files_created=files_created, files_deleted=files_deleted, tests_line=tests_line, verification_status=vm.verification_status, git_commit=vm.git.get("commit", ""), git_push=vm.git.get("push", ""), recovery_attempts=vm.recovery_attempts, duration=duration, agents=len(vm.agents), tool_calls=vm.tool_calls, next_actions=suggestions, summary=getattr(getattr(outcome, "state", None), "verification_summary", "") or "", agent_response=agent_response)
+
     if plain:
-        console.print("")
-        console.print("Harness Complete")
-        for line in summary.splitlines():
-            if line.startswith("✓ Done") or line.startswith("Next") or line.startswith("  →"):
-                continue
-            console.print(line)
-        console.print(f"  Changes: {modified} modified, {created} created")
-        console.print(f"  Tests: {tests_line}")
-        console.print(f"  Verification: {vm.verification_status}")
-        console.print("  Status: VERIFIED" if verified_ok else "  Status: COMPLETE")
-        if suggestions:
-            console.print("  Next")
-            for s in suggestions:
-                console.print(f"    → {s.label}")
+        console.print(f"✓ Completed · {_fmt_elapsed(duration)}")
+        if agent_response:
+            console.print("")
+            console.print(agent_response.strip())
         return
-    from rich.text import Text as _T
-    renderables = []
-    if agent_response:
-        from rich.padding import Padding
-        from rich.markdown import Markdown
-        renderables.append(_T("  Agent", style="bold cyan"))
-        renderables.append(Padding(Markdown(agent_response.strip()), (0, 0, 1, 2)))
+
     console.print("")
-    for r in renderables:
-        console.print(r)
-    console.print(_T(summary))
-    if graph is not None and vm.files:
-        console.print("")
-        console.print("  [dim]Next:[/] git status shows uncommitted changes in this workspace.")
+    console.print(f"    [bold green]✓ Completed[/] · [dim]{_fmt_elapsed(duration)}[/]")
+    console.print("")
+    if agent_response:
+        from rich.markdown import Markdown
+        from rich.padding import Padding
+        console.print(Padding(Markdown(agent_response.strip()), (0, 0, 1, 4)))
 
 
 def render_failure_summary(console: Console, vm: RuntimeViewModel, outcome: Any, *, plain: bool = False) -> None:
-    from harness_core.cli.completion import CompletionClassifier, CompletionFormatter, NextActionEngine
+    from harness_core.cli.completion import _fmt_elapsed
     state = getattr(outcome, "state", None)
-    graph = getattr(outcome, "graph", None)
-    agent_response = ""
-    if graph is not None:
-        for task in reversed(list(graph.tasks.values())):
-            res = (task.result or "").strip()
-            if res and not (res.startswith("Task ") and res.endswith(" completed")) and not res.startswith("Stopped:"):
-                agent_response = res
-                break
+    duration = (vm.completed_at - vm.started_at) if vm.completed_at else 0.0
     blockers = list(getattr(state, "blockers", []) or [])
     category = blockers[0] if blockers else "EXECUTION_FAILURE"
-    completion = CompletionClassifier.classify(vm, outcome)
-    latest = vm.latest_validation()
-    evidence: list[str] = []
-    if latest is not None and latest.is_failure:
-        evidence.append(f"exit code: {latest.exit_code or '?'}")
-        if latest.command:
-            evidence.append(f"command: {latest.command[:100]}")
-    elif vm.failed_tool_calls:
-        evidence.append(f"{vm.failed_tool_calls} failed operation(s)")
-    evidence.append(f"completion state: {completion.value}")
-    files_modified = [f.path for f in vm.files.values() if f.status in ("M", "A")]
-    suggestions = NextActionEngine().suggest(vm.request or "", files=files_modified, verification_status=vm.verification_status, recovery_exhausted=vm.recovery_exhausted, partial=True)
-    formatter = CompletionFormatter(plain=plain)
-    summary = formatter.failure(headline=f"Could not safely complete the requested task ({category})", what_happened=str(getattr(state, "detail", "") or "") or category, evidence_lines=evidence, tried=[], why_stopped=f"Recovery exhausted after {vm.recovery_attempts} attempt(s)" if vm.recovery_exhausted else "Runtime terminated with an unrecovered failure.", files_modified=files_modified[:8], verification_status=vm.verification_status, recovery_attempts=vm.recovery_attempts, recovery_exhausted=vm.recovery_exhausted, next_actions=suggestions, agent_response=agent_response)
+    
     if plain:
+        console.print(f"✗ Task failed · {_fmt_elapsed(duration)}")
         console.print("")
-        console.print("Harness Stopped")
-        console.print(f"  Failure: {category}")
-        console.print(f"  Recovery attempts: {vm.recovery_attempts}")
-        console.print("  No false success was reported.")
-        if suggestions:
-            console.print("  Next")
-            for s in suggestions:
-                console.print(f"    → {s.label}")
+        console.print(f"{category}")
         return
-    from rich.text import Text as _T2
-    renderables = []
-    if agent_response:
-        from rich.padding import Padding
-        from rich.markdown import Markdown
-        renderables.append(_T2("  Agent", style="bold red"))
-        renderables.append(Padding(Markdown(agent_response.strip()), (0, 0, 1, 2)))
+
     console.print("")
-    for r in renderables:
-        console.print(r)
-    console.print(_T2(summary))
+    console.print(f"    [bold red]✗ Task failed[/] · [dim]{_fmt_elapsed(duration)}[/]")
+    console.print("")
+    console.print(f"    {category}")
+    console.print("")
 
 
 def render_cancelled_summary(console: Console, vm: RuntimeViewModel | None = None, *, plain: bool = False) -> None:
-    from harness_core.cli.completion import CompletionFormatter, NextActionEngine
-    completed: list[str] = []
-    interrupted: list[str] = []
-    uncommitted: list[str] = []
-    agent_response = ""
-    if vm is not None:
-        completed = [a.role.upper() or a.name for a in vm.agents.values() if a.status == "completed"]
-        interrupted = [a.role.upper() or a.name for a in vm.agents.values() if a.status in ("running", "waiting", "blocked")]
-        uncommitted = [f.path for f in vm.files.values()]
-    suggestions = NextActionEngine().suggest("", files=uncommitted, verification_status=vm.verification_status if vm is not None else "") if vm is not None else []
-    formatter = CompletionFormatter(plain=plain)
-    summary = formatter.cancelled(completed=completed, interrupted=interrupted, uncommitted=uncommitted[:8], next_actions=suggestions or None, agent_response=agent_response)
     if plain:
         console.print("")
-        console.print(summary)
+        console.print("⚠ Task paused")
+        console.print("")
+        console.print("The task was cancelled. Your progress has been preserved.")
         return
-    from rich.console import Group
-    from rich.markdown import Markdown
-    from rich.panel import Panel
-    from rich.text import Text as _T3
-    renderables: list[Any] = []
-    if agent_response:
-        renderables.append(Markdown(agent_response.strip()))
-        renderables.append(_T3(""))
-    renderables.append(_T3(summary))
-    body = Group(*renderables)
-    console.print(Panel(body, title="Harness Cancelled", border_style="yellow"))
+        
+    console.print("")
+    console.print("    [bold yellow]⚠ Task paused[/]")
+    console.print("")
+    console.print("    [dim]The task was cancelled. Your progress has been preserved.[/]")
+    console.print("")

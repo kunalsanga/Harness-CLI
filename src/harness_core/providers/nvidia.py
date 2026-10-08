@@ -19,9 +19,15 @@ from harness_core.providers.base import (
 class NvidiaProvider(ModelProvider):
     """NVIDIA NIM provider."""
 
-    def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
-        self.api_key = api_key or os.environ.get("NVIDIA_API_KEY", "")
+    def __init__(self, api_key: str | None = None, base_url: str | None = None, default_model: str | None = None) -> None:
+        if api_key:
+            self.api_key = api_key
+        else:
+            from harness_core.config.credentials import CredentialResolver
+            credential = CredentialResolver().resolve("nvidia")
+            self.api_key = credential.api_key if credential else ""
         self.base_url = base_url or os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+        self.default_model = default_model or os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k3")
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -45,7 +51,7 @@ class NvidiaProvider(ModelProvider):
         client = await self._get_client()
 
         body: dict[str, Any] = {
-            "model": request.model or os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k3"),
+            "model": request.model or self.default_model,
             "messages": request.messages,
         }
         if request.tools:
@@ -81,7 +87,7 @@ class NvidiaProvider(ModelProvider):
         client = await self._get_client()
 
         body: dict[str, Any] = {
-            "model": request.model or os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k3"),
+            "model": request.model or self.default_model,
             "messages": request.messages,
             "stream": True,
         }
@@ -120,18 +126,15 @@ class NvidiaProvider(ModelProvider):
             models = []
             for m in data.get("data", []):
                 model_id = m.get("id", "")
-                
-                # Assume standard NIM support tools unless it's a very specific old model.
-                # In the absence of supported_parameters like OpenRouter, we default to True
-                # for chat completion endpoints on modern LLMs.
-                
+                if not model_id:
+                    continue
                 models.append(
                     ModelInfo(
                         id=model_id,
                         name=model_id,
                         provider=self.name,
-                        context_window=128000, # default large
-                        supports_tools=True,
+                        supports_tools=None,
+                        supports_streaming=True,
                         cost_per_1k_input=0.0,
                         cost_per_1k_output=0.0,
                         is_free=False,
@@ -139,38 +142,22 @@ class NvidiaProvider(ModelProvider):
                 )
             
             # If the /models endpoint doesn't return the configured model, inject it.
-            configured_model = os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k3")
+            configured_model = self.default_model
             if not any(m.id == configured_model for m in models):
                 models.append(
                     ModelInfo(
                         id=configured_model,
                         name=configured_model,
                         provider=self.name,
-                        context_window=128000,
-                        supports_tools=True,
+                        supports_tools=None,
+                        supports_streaming=True,
                     )
                 )
 
             return models
         except Exception:
             # Fallback to a hardcoded list if /models endpoint is not available or fails
-            configured_model = os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k3")
-            return [
-                ModelInfo(
-                    id=configured_model,
-                    name=configured_model,
-                    provider=self.name,
-                    context_window=128000,
-                    supports_tools=True,
-                ),
-                ModelInfo(
-                    id="nvidia/nemotron-3-super-120b-a12b",
-                    name="nvidia/nemotron-3-super-120b-a12b",
-                    provider=self.name,
-                    context_window=128000,
-                    supports_tools=True,
-                )
-            ]
+            return []
 
     async def health_check(self) -> bool:
         """Check if provider is available by verifying auth and endpoint.

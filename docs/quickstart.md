@@ -1,5 +1,8 @@
 # Quick Start
 
+> Current task execution uses OpenRouter. Other provider examples in older
+> documentation may describe inactive adapters.
+
 ## 1. Install
 
 ```bash
@@ -18,9 +21,6 @@ Or configure a provider manually:
 # OpenRouter (recommended — free models available)
 export OPENROUTER_API_KEY="sk-or-v1-..."
 
-# Or Ollama (local, no key needed)
-ollama serve
-ollama pull codellama
 ```
 
 ## 3. Initialize a project

@@ -140,7 +140,9 @@ class TestRuntimeTodoState:
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector)
 
-        task = await loop.run("Tell me about this project")
+        # Engineering goal: read-only requests intentionally skip the planning
+        # phase, so plan-backed TODO reconciliation needs a modifying goal.
+        task = await loop.run("Enhance this project")
 
         statuses = {i.description: i.status for i in task.task_plan.items}
         assert statuses["Inspect project files"] == TodoStatus.COMPLETED

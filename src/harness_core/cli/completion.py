@@ -285,30 +285,57 @@ class CompletionFormatter:
         next_actions: list[NextAction] | None = None,
         summary: str = "",
         agent_response: str = "",
+        checks_run: int = 0,
+        checks_passed: int = 0,
     ) -> str:
-        """Render a successful completion summary (Part 35)."""
+        """Render a successful completion summary.
+
+        Answers: What did Harness do? What changed? Did verification pass?
+        """
         out: list[str] = []
-        out.append(f"✓ Done — {headline}")
+        elapsed_str = _fmt_elapsed(duration) if duration > 0 else ""
+        out.append(f"✓ Done{' · ' + elapsed_str if elapsed_str else ''}")
         out.append("")
+
+        # WHAT DID HARNESS DO?
+        if headline and headline != "Completed":
+            out.append(headline)
+            out.append("")
 
         if agent_response and self.plain:
             out.extend(agent_response.strip().splitlines())
             out.append("")
 
         if summary:
-            out.append("Summary")
             out.append(f"  {summary[:400]}")
             out.append("")
 
-        if files_modified or files_created or files_deleted:
-            out.append("Changed")
-            out.extend(_bullets([f"M {f}" for f in files_modified[:8]]).splitlines())
-            out.extend(_bullets([f"A {f}" for f in files_created[:8]]).splitlines())
-            out.extend(_bullets([f"D {f}" for f in (files_deleted or [])[:8]]).splitlines())
+        # WHAT CHANGED?
+        all_files = files_modified or files_created or (files_deleted or [])
+        if all_files:
+            out.append("Changes")
+            for f in (files_created or [])[:8]:
+                out.append(f"  + {f}")
+            for f in (files_modified or [])[:8]:
+                out.append(f"  ✎ {f}")
+            for f in (files_deleted or [])[:8]:
+                out.append(f"  - {f}")
             out.append("")
 
-        if tests_line:
-            out.append("Validation")
+        # DID VERIFICATION PASS?
+        if checks_run > 0:
+            out.append("Verification")
+            out.append(f"  ✓ {checks_passed}/{checks_run} checks passed")
+            out.append("")
+        elif verification_status:
+            out.append("Verification")
+            if verification_status in ("passed", "not_started"):
+                out.append(f"  ✓ {verification_status.replace('_', ' ').title()}")
+            else:
+                out.append(f"  ✗ {verification_status.replace('_', ' ').title()}")
+            out.append("")
+        elif tests_line:
+            out.append("Verification")
             out.append(f"  {tests_line}")
             out.append("")
 
@@ -319,33 +346,10 @@ class CompletionFormatter:
             if git_push:
                 out.append(f"  ✓ Pushed {git_push}")
             out.append("")
-        elif verification_status == "failed":
-            out.append("Git")
-            out.append("  Not requested")
-            out.append("")
-
-        if verification_status:
-            if verification_status in ("passed", "not_started"):
-                out.append("Verification")
-                out.append(f"  ✓ {verification_status.replace('_', ' ').title()}")
-            else:
-                out.append("Verification")
-                out.append(f"  ✗ {verification_status.replace('_', ' ').title()}")
-            out.append("")
 
         if recovery_attempts:
             out.append("Recovery")
             out.append(f"  ✓ {recovery_attempts} issue(s) automatically repaired")
-            out.append("")
-
-        if duration > 0:
-            parts = [f"{_fmt_elapsed(duration)}"]
-            if agents:
-                parts.append(f"{agents} agent(s)")
-            if tool_calls:
-                parts.append(f"{tool_calls} tool call(s)")
-            out.append("Execution")
-            out.append(f"  {' · '.join(parts)}")
             out.append("")
 
         if next_actions:
@@ -372,8 +376,12 @@ class CompletionFormatter:
         recovery_exhausted: bool = False,
         next_actions: list[NextAction] | None = None,
         agent_response: str = "",
+        remaining_tasks: list[str] | None = None,
     ) -> str:
-        """Render an honest failure summary (Parts 10, 36)."""
+        """Render an honest failure summary.
+
+        Answers: What happened? What changed? What remains? What to do next?
+        """
         out: list[str] = []
         out.append(f"✗ {headline}")
         out.append("")
@@ -382,6 +390,7 @@ class CompletionFormatter:
             out.extend(agent_response.strip().splitlines())
             out.append("")
 
+        # WHAT HAPPENED?
         if what_happened:
             out.append("What happened")
             out.append(f"  {what_happened[:300]}")
@@ -391,20 +400,30 @@ class CompletionFormatter:
             out.extend(f"  {e}" for e in evidence_lines[:6])
             out.append("")
         if tried:
-            out.append("What I tried")
+            out.append("What Harness tried")
             out.extend(_bullets(tried[:6]).splitlines())
             out.append("")
         if why_stopped:
-            out.append("Why I stopped")
+            out.append("Why it stopped")
             out.append(f"  {why_stopped[:300]}")
             out.append("")
+
+        # WHAT CHANGED?
         if files_modified:
             out.append("Changes")
             out.extend(_bullets(files_modified[:8]).splitlines())
             out.append("")
+
+        # WHAT REMAINS?
+        if remaining_tasks:
+            out.append("Remaining")
+            for t in remaining_tasks[:6]:
+                out.append(f"  ○ {t}")
+            out.append("")
+
         if verification_status == "failed":
             out.append("Verification")
-            out.append("  ✗ Final verification failed")
+            out.append("  ✗ Checks failed")
             out.append("")
         if recovery_attempts:
             state = "exhausted" if recovery_exhausted else f"{recovery_attempts} attempt(s)"
@@ -412,8 +431,6 @@ class CompletionFormatter:
             out.append(f"  {state}")
             out.append("")
 
-        out.append("No false success was reported.")
-        out.append("")
         if next_actions:
             out.append("Next")
             for a in next_actions:

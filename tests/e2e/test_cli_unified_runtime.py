@@ -32,6 +32,13 @@ class _FakeProvider:
 
     name = "fake-openrouter"
 
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def routing_hints(self, *args, **kwargs):
+        from harness_core.providers.base import ModelInfo
+        return [ModelInfo(id="fake", name="fake", provider="fake-openrouter", supports_tools=True, is_free=True, is_local=True)]
+
     async def health_check(self) -> bool:
         return True
 
@@ -55,13 +62,20 @@ class _FakeProvider:
         )
 
     async def list_models(self):
-        return []
+        from harness_core.providers.base import ModelInfo
+        return [ModelInfo(id="fake", name="Fake Model", architecture="fake", parameter_size="1B")]
 
 
 class _FakeOllama:
     """Stand-in for OllamaProvider: not running."""
 
     name = "ollama"
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def routing_hints(self, *args, **kwargs):
+        return []
 
     async def health_check(self) -> bool:
         return False

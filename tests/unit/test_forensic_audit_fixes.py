@@ -40,7 +40,7 @@ async def test_402_failure_does_not_become_paused():
     agent_loop._project_info = {}
     
     # Simulate some work being done (tools ran but no mutations)
-    task = Task(goal="explain this project")
+    task = Task(goal="implement a calculator")
     agent_loop._active_task = task
     # We fake that a tool was called and returned something
     from harness_core.agent.types import ToolCall
@@ -56,7 +56,7 @@ async def test_402_failure_does_not_become_paused():
         with patch.object(agent_loop.budget, "check_all", return_value=(True, "")):
             # This calls the inner execution loop part directly since run() calls the whole workflow
             # We can mock the run loop to test the exception handler
-            task = await agent_loop.run("explain this project")
+            task = await agent_loop.run("implement a calculator")
             
     assert task.status == TaskStatus.FAILED
     assert "402 Payment Required" in task.error

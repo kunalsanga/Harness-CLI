@@ -612,8 +612,10 @@ class TestModelRouter:
     @pytest.mark.asyncio
     async def test_select_models_filters_no_tools(self):
         provider = MockProvider(models=[
-            _make_model("no-tools", provider="mock", supports_tools=False),
-            _make_model("has-tools", provider="mock", supports_tools=True),
+            # Free so the paid-model opt-in policy is not the variable here:
+            # this test protects tool-capability filtering.
+            _make_model("no-tools", provider="mock", supports_tools=False, is_free=True),
+            _make_model("has-tools", provider="mock", supports_tools=True, is_free=True),
         ])
         router = ModelRouter(providers=[provider])
         req = CompletionRequest(
@@ -641,7 +643,7 @@ class TestModelRouter:
     async def test_execute_uses_router(self):
         provider = MockProvider(
             response=CompletionResponse(content="routed!", model="m1"),
-            models=[_make_model("m1", provider="mock", supports_tools=True)],
+            models=[_make_model("m1", provider="mock", supports_tools=True, is_free=True)],
         )
         router = ModelRouter(providers=[provider])
         req = CompletionRequest(messages=[{"role": "user", "content": "test"}])
@@ -654,12 +656,12 @@ class TestModelRouter:
         p1 = MockProvider(
             name="p1",
             raise_error=Exception("429 Too Many Requests"),
-            models=[_make_model("m1", provider="p1")],
+            models=[_make_model("m1", provider="p1", is_free=True)],
         )
         p2 = MockProvider(
             name="p2",
             response=CompletionResponse(content="fallback!", model="m2"),
-            models=[_make_model("m2", provider="p2")],
+            models=[_make_model("m2", provider="p2", is_free=True)],
         )
 
         router = ModelRouter(
@@ -736,7 +738,7 @@ class TestIntegration429Fallback:
         p_a = MockProvider(
             name="provider-a",
             raise_error=Exception("429 Too Many Requests"),
-            models=[_make_model("model-a", provider="provider-a")],
+            models=[_make_model("model-a", provider="provider-a", is_free=True)],
         )
 
         # Model B: succeeds with tool call
@@ -755,7 +757,7 @@ class TestIntegration429Fallback:
                     },
                 }],
             ),
-            models=[_make_model("model-b", provider="provider-b", supports_tools=True)],
+            models=[_make_model("model-b", provider="provider-b", supports_tools=True, is_free=True)],
         )
 
         router = ModelRouter(
@@ -802,12 +804,12 @@ class TestIntegration429Fallback:
         p_a = MockProvider(
             name="slow",
             raise_error=asyncio.TimeoutError("Request timed out"),
-            models=[_make_model("slow-model", provider="slow")],
+            models=[_make_model("slow-model", provider="slow", is_free=True)],
         )
         p_b = MockProvider(
             name="fast",
             response=CompletionResponse(content="Done", model="fast-model"),
-            models=[_make_model("fast-model", provider="fast", supports_tools=True)],
+            models=[_make_model("fast-model", provider="fast", supports_tools=True, is_free=True)],
         )
 
         router = ModelRouter(
@@ -830,7 +832,7 @@ class TestIntegration429Fallback:
             p = MockProvider(
                 name=f"p{i}",
                 raise_error=Exception("429 Too Many Requests"),
-                models=[_make_model(f"m{i}", provider=f"p{i}")],
+                models=[_make_model(f"m{i}", provider=f"p{i}", is_free=True)],
             )
             providers.append(p)
 

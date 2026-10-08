@@ -1,6 +1,10 @@
 # Harness Engineering CLI
 
-A model-agnostic, autonomous AI software-engineering agent that runs in your terminal.
+An autonomous AI software-engineering agent that runs in your terminal.
+
+> **Current CLI provider:** interactive tasks and `harness run` use OpenRouter.
+> Other provider adapters remain in source, but their presence does not make
+> them active in the normal task runtime. See [Provider status](docs/providers.md).
 
 ## What is Harness?
 
@@ -48,13 +52,14 @@ harness session list
 harness session resume <id>
 ```
 
-## Supported Providers
+## Current Provider Setup
 
-| Provider | API Key | Free Models | Local |
-|----------|---------|-------------|-------|
-| [OpenRouter](https://openrouter.ai) | Required | 20+ free models | No |
-| [Ollama](https://ollama.com) | None | All local | Yes |
-| [LiteLLM](https://litellm.ai) | Required | Depends on backend | No |
+| Provider | Normal task runtime | Credential |
+|----------|---------------------|------------|
+| [OpenRouter](https://openrouter.ai) | Active | `OPENROUTER_API_KEY` |
+
+Other provider adapter modules remain in the source tree for compatibility and
+isolated tests; they are not selected by the default interactive runtime.
 
 ### Free Models
 
@@ -65,14 +70,8 @@ harness models list --free
 harness models recommend --task "Fix failing tests"
 ```
 
-### Local Models (Ollama)
-
-```bash
-ollama serve
-ollama pull codellama
-harness models local
-harness run --model codellama "Fix the tests"
-```
+`harness models local` reports provider status. It currently does not activate
+or discover Ollama models.
 
 ## Commands
 
@@ -123,7 +122,8 @@ USER → ORCHESTRATOR → SPECIALIZED AGENTS → MODEL ROUTER → TOOLS → VERI
                     SESSION PERSISTENCE
 ```
 
-- **Model-agnostic**: Works with OpenRouter, Ollama, LiteLLM, or any OpenAI-compatible API
+- **Provider abstraction**: provider adapters share a common interface; the
+  current normal task path activates OpenRouter
 - **Persistent sessions**: Resume work across interruptions
 - **Empirical intelligence**: Learns which models work best for which tasks
 - **Verification-first**: Always runs tests/checks before reporting success

@@ -27,6 +27,7 @@ from harness_core.routing.fallback import (
     classify_error,
 )
 from harness_core.routing.health import HealthEvent, ModelHealthTracker
+from harness_core.providers.base import CompletionResponse
 
 
 # ─── Permission Auto-Approval ─────────────────────────────────────────────
@@ -164,7 +165,8 @@ class TestFallbackEngine:
 
     @pytest.mark.asyncio
     async def test_permanent_error_skips_immediately(self):
-        """401/403/402 errors should skip to next model with no delay."""
+        """401 on a shared OpenRouter credential stops rotation immediately
+        (no retry delay, no model-to-model rotation) — matches Case D policy."""
         health = ModelHealthTracker()
         config = FallbackConfig(
             max_fallback_models=3,
@@ -179,10 +181,9 @@ class TestFallbackEngine:
 
         provider2 = MagicMock()
         provider2.name = "p2"
-        provider2.generate = AsyncMock(return_value=MagicMock(
+        provider2.generate = AsyncMock(return_value=CompletionResponse(
             content="success",
             usage={"prompt_tokens": 10, "completion_tokens": 5},
-            tool_calls=None,
         ))
 
         from harness_core.providers.base import CompletionRequest
@@ -193,8 +194,11 @@ class TestFallbackEngine:
         result = await engine.execute(request, chain)
         elapsed = time.time() - start
 
-        assert result.succeeded
-        assert result.model_used == "model-b"
+        # 401 is a shared-credential failure: no rotation to model-b, fast stop.
+        assert not result.succeeded
+        assert result.model_used == ""
+        assert "401" in (result.final_error or "")
+        provider2.generate.assert_not_called()
         # Should be fast — no retry delay for permanent errors
         assert elapsed < 2.0
 

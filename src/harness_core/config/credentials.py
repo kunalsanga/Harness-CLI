@@ -28,12 +28,14 @@ from pathlib import Path
 from typing import Any
 
 
-# Provider-specific environment variable names
 _PROVIDER_ENV_KEYS: dict[str, list[str]] = {
     "openrouter": ["OPENROUTER_API_KEY"],
     "openai": ["OPENAI_API_KEY"],
     "anthropic": ["ANTHROPIC_API_KEY"],
+    "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     "nvidia": ["NVIDIA_API_KEY"],
+    "groq": ["GROQ_API_KEY"],
+    "9router": ["NINE_ROUTER_API_KEY"],
     "ollama": [],  # No key needed, just host
 }
 

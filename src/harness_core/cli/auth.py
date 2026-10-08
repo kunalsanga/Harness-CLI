@@ -32,12 +32,12 @@ auth_app = typer.Typer(help="Authentication and provider configuration")
 def auth_setup(
     provider: str = typer.Option(
         "openrouter", "--provider", "-p",
-        help="Provider to configure (openrouter, openai, anthropic, nvidia)"
+        help="Provider to configure (openrouter, openai, anthropic, nvidia, gemini)"
     ),
 ) -> None:
     """Configure provider API credentials."""
     provider = provider.lower().strip()
-    valid_providers = ["openrouter", "openai", "anthropic", "nvidia"]
+    valid_providers = ["openrouter", "openai", "anthropic", "nvidia", "gemini"]
     if provider not in valid_providers:
         console.print(f"[red]Unknown provider: {provider}[/]")
         console.print(f"[dim]Valid providers: {', '.join(valid_providers)}[/]")
@@ -87,7 +87,7 @@ def auth_status() -> None:
     table.add_column("Key", style="dim")
     table.add_column("Source")
 
-    providers = ["openrouter", "openai", "anthropic", "nvidia", "ollama"]
+    providers = ["openrouter", "openai", "anthropic", "nvidia", "gemini", "groq", "ollama", "9router", "litellm"]
     for prov in providers:
         cred = resolver.resolve(prov)
         if cred and cred.is_valid:
@@ -142,6 +142,8 @@ def _validate_provider(provider: str, api_key: str) -> tuple[bool, str]:
             return await _validate_openai(api_key)
         elif provider == "anthropic":
             return True, "Anthropic validation not yet implemented (saved anyway)"
+        elif provider == "gemini":
+            return await _validate_gemini(api_key)
         return True, "Validation not implemented"
 
     try:
@@ -222,6 +224,27 @@ async def _validate_openai(api_key: str) -> tuple[bool, str]:
                 return False, f"Authentication failed ({resp.status_code})"
             else:
                 return False, f"HTTP {resp.status_code}"
+        except httpx.TimeoutException:
+            return True, "Timeout during validation (key may still be valid)"
+        except httpx.ConnectError:
+            return True, "Network unreachable (key saved, will retry on use)"
+
+
+async def _validate_gemini(api_key: str) -> tuple[bool, str]:
+    """Validate a Google AI Studio credential without exposing it."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            response = await client.get(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                params={"key": api_key},
+            )
+            if response.status_code == 200:
+                return True, "Gemini credential accepted"
+            if response.status_code in (401, 403):
+                return False, f"Authentication failed ({response.status_code})"
+            return False, f"HTTP {response.status_code}"
         except httpx.TimeoutException:
             return True, "Timeout during validation (key may still be valid)"
         except httpx.ConnectError:

@@ -20,6 +20,7 @@ from harness_core.agent.todos import (
 )
 from harness_core.agent.types import (
     AgentConfig,
+    ExecutionState,
     Task,
     TaskStatus,
     TodoItem,
@@ -60,6 +61,7 @@ from harness_core.verification.engine import VerificationEngine
 from harness_core.verification.integrity import check_test_integrity
 
 if TYPE_CHECKING:
+    from harness_core.intelligence import ProjectIntelligence
     from harness_core.routing.task_aware import TaskAwareRouter
 
 
@@ -231,6 +233,7 @@ class AgentLoop:
         run_id: str = "",
         steering_buffer: "SteeringBuffer | None" = None,
         context_pipeline: ContextPipeline | None = None,
+        intelligence: "ProjectIntelligence | None" = None,
     ) -> None:
         self.provider = provider
         self.tools = {t.schema.name: t for t in tools}
@@ -255,10 +258,13 @@ class AgentLoop:
         self.budget = BudgetManager() if router is None else router.budget
         self.context_engine = ContextEngine(self.workspace_root)
         self.context_reuse = ContextReuseManager()
+        # Project intelligence facade (optional): shared by the context
+        # pipeline (SYMBOL/DEPENDENCY sources) and the tools that accept one.
+        self.intelligence = intelligence
         # Context intelligence pipeline reuses the SAME ContextReuseManager
         # instance (Part 6) — one snapshot cache, no duplicate systems.
         self._context_pipeline = context_pipeline or ContextPipeline(
-            self.workspace_root, reuse=self.context_reuse
+            self.workspace_root, reuse=self.context_reuse, intelligence=intelligence
         )
         self._last_context_selection: Any = None
         self.permission_manager = PermissionManager(
@@ -288,6 +294,9 @@ class AgentLoop:
         self._active_task: Task | None = None  # currently running task (cancellation reporting)
         self._completed_operations: set[str] = set()  # successful operation keys (Phase 8)
         self._pending_workflow_events: list = []  # deferred events from workflows
+        # Read-only mode: when True, write_file/edit_file are blocked.
+        # Set at task start from intent classification.
+        self._is_read_only_task: bool = False
 
         # Steering: single unified buffer (Harness 2.0 Part 7). The legacy
         # event-driven entry point (steering.received) feeds the same buffer
@@ -643,6 +652,19 @@ When you are done, summarize what you did and provide evidence of success."""
                     {"role": "system", "content": f"[Context: {piece.source}]\n{piece.content}"}
                 )
 
+        # Keep system messages before the task across OpenAI-compatible APIs.
+        if task.task_plan.items:
+            plan_lines = [
+                f"{index}. [{item.status.value.upper()}] {item.description}"
+                for index, item in enumerate(task.task_plan.items, 1)
+            ]
+            prefix.append({
+                "role": "system",
+                "content": "ACTIVE PLAN / CURRENT TODO STATUS:\n"
+                + "\n".join(plan_lines)
+                + "\nContinue this plan, updating progress only through real work and evidence.",
+            })
+
         # Add task
         prefix.append({"role": "user", "content": task.goal})
 
@@ -876,6 +898,9 @@ When you are done, summarize what you did and provide evidence of success."""
     def _classify_failure_reason(self, err: str) -> str:
         """Map an error string to a typed FailureReason value."""
         low = (err or "").lower()
+        # Fail-fast summary from the fallback engine (all models cooling down)
+        if "no configured free model" in low or "no free model" in low:
+            return "model_unavailable"
         if "429" in low or "rate limit" in low or "too many requests" in low:
             return "model_rate_limited"
         if "402" in low or "payment required" in low:
@@ -906,7 +931,11 @@ When you are done, summarize what you did and provide evidence of success."""
         )
 
     async def _record_workflow_tool(
-        self, tool_name: str, args: dict[str, Any], result: ToolResult
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        result: ToolResult,
+        duration_seconds: float = 0.0,
     ) -> None:
         """Record one workflow-driven tool execution as a real ToolCall.
 
@@ -924,18 +953,21 @@ When you are done, summarize what you did and provide evidence of success."""
             tool_name=tool_name,
             arguments=dict(args),
             result=result,
+            duration_ms=max(0.0, duration_seconds) * 1000,
         )
+        task.execution_timeline.record_tool(duration_seconds)
         task.tool_calls.append(call)
         task.iterations += 1
         self.budget.record_iteration()
         self.budget.record_tool_call()
         self._seen_actions.add(self._action_key(tool_name, args))
 
-        await self._emit_event("tool.call", {"tool": tool_name, "args": args})
+        await self._emit_event("tool.call", {"tool": tool_name, "args": args, "workflow": True})
         event_data: dict[str, Any] = {
             "tool": tool_name,
             "status": result.status.value,
             "output_len": len(result.output or ""),
+            "workflow": True,
         }
         if tool_name == "run_command":
             # Phase 10.5: the exact command rides on the result event so the
@@ -1234,6 +1266,38 @@ When you are done, summarize what you did and provide evidence of success."""
         if phase != self._current_phase:
             self._current_phase = phase
             await self._emit_event("task.phase", {"phase": phase})
+            state = {
+                "understanding": ExecutionState.UNDERSTANDING,
+                "planning": ExecutionState.PLANNING,
+                "implementing": ExecutionState.WORKING,
+                "testing": ExecutionState.WORKING,
+                "diagnosing": ExecutionState.REPAIRING,
+                "fixing": ExecutionState.REPAIRING,
+                "recovering": ExecutionState.REPAIRING,
+                "verifying": ExecutionState.VERIFYING,
+                "workflow": ExecutionState.WORKING,
+            }.get(phase)
+            if state is not None:
+                await self._transition_execution(state)
+
+    async def _transition_execution(self, state: ExecutionState) -> None:
+        """Update the task's canonical state and publish its monotonic clock."""
+        task = self._active_task
+        if task is None or not task.execution_timeline.transition(state):
+            return
+        snapshot = task.execution_timeline.snapshot()
+        snapshot["monotonic_timestamp"] = task.execution_timeline.transitioned_at
+        await self._emit_event("execution.state", snapshot)
+
+    async def _finish_execution(self, task: Task) -> None:
+        state = {
+            TaskStatus.COMPLETED: ExecutionState.COMPLETED,
+            TaskStatus.FAILED: ExecutionState.FAILED,
+            TaskStatus.PARTIAL: ExecutionState.FAILED,
+            TaskStatus.CANCELLED: ExecutionState.CANCELLED,
+            TaskStatus.PAUSED: ExecutionState.PAUSED,
+        }.get(task.status, ExecutionState.FAILED)
+        await self._transition_execution(state)
 
     async def _emit_thinking(self, message: str, task: Task | None = None) -> None:
         """Emit a thinking status event (high-level execution intent)."""
@@ -1512,6 +1576,63 @@ When you are done, summarize what you did and provide evidence of success."""
 
         return None
 
+    # Files explicitly flagged as off-limits for the current task.
+    # Populated by the runtime or steering before execution begins.
+    _scope_exclusions: set[str] = field(default_factory=set) if False else set()
+
+    def _check_task_scope(self, call: ToolCall) -> ToolResult | None:
+        """Directive 4: task scope protection.
+
+        Before every mutation, verify:
+        1. Is this file inside the workspace? (handled by _confine_call)
+        2. Is this file relevant to the current task?
+        3. Is this operation allowed?
+        4. Is this path safe?
+        5. Does the operation correspond to a requirement?
+
+        Returns a denial ToolResult if the mutation is out of scope, else None.
+        Read-only tools are never blocked by scope checks.
+        """
+        name = call.tool_name
+        # Read-only tools pass scope checks -- they never mutate
+        if name in _READONLY_TOOLS:
+            return None
+
+        # Only check mutations (write_file, edit_file)
+        if name not in ("write_file", "edit_file"):
+            return None
+
+        raw_path = call.arguments.get("path") or call.arguments.get("file_path", "")
+        if not raw_path:
+            return None
+
+        # Normalize the path for comparison
+        try:
+            resolved = Path(raw_path).resolve()
+        except (ValueError, OSError):
+            return None
+
+        # Check against scope exclusions
+        resolved_str = str(resolved)
+        if resolved_str in self._scope_exclusions:
+            return ToolResults.permission_denied(
+                f"Scope protection: {resolved_str} is excluded from the current task scope."
+            )
+
+        # Check if the file is in an unrelated directory (heuristic: if the
+        # workspace root is known, block writes to directories that look
+        # unrelated to the task goal).
+        workspace = Path(self.workspace_root)
+        try:
+            resolved.relative_to(workspace)
+        except ValueError:
+            # Already handled by _confine_call, but double-check
+            return ToolResults.permission_denied(
+                f"Scope protection: {resolved_str} is outside the workspace."
+            )
+
+        return None
+
     async def _execute_tool_checked(self, call: ToolCall) -> ToolResult:
         """Execute a tool call with permission checking.
 
@@ -1536,6 +1657,22 @@ When you are done, summarize what you did and provide evidence of success."""
         if confinement_denial is not None:
             self._record_denial(call.tool_name, call.arguments)
             return confinement_denial
+
+        # Task-scope relevance check for mutations (Directive 4).
+        # Before every mutation: is this file inside the workspace?
+        # Is it relevant to the current task? Is the operation allowed?
+        scope_denial = self._check_task_scope(call)
+        if scope_denial is not None:
+            self._record_denial(call.tool_name, call.arguments)
+            return scope_denial
+
+        # Read-only task enforcement: block write/edit tools for EXPLAIN/INSPECT/QUESTION tasks.
+        if self._is_read_only_task and call.tool_name in ("write_file", "edit_file"):
+            self._record_denial(call.tool_name, call.arguments)
+            return ToolResults.permission_denied(
+                f"Read-only task (intent: explain/inspect/question) — "
+                f"{call.tool_name} is not permitted. Use read-only tools only."
+            )
 
         # Check if this exact call was already denied
         if self._check_repeated_deny(call):
@@ -1594,10 +1731,10 @@ When you are done, summarize what you did and provide evidence of success."""
         # Execute with a bounded timeout so a hung tool can't freeze the CLI.
         call_timeout = float(call.arguments.get("timeout") or tool.schema.timeout_seconds or 30.0)
         call_timeout = min(max(call_timeout, 1.0), 300.0)
-        start = time.time()
+        start = time.monotonic()
         try:
             result = await asyncio.wait_for(tool.execute(call.arguments), timeout=call_timeout)
-            call.duration_ms = (time.time() - start) * 1000
+            call.duration_ms = (time.monotonic() - start) * 1000
             call.result = result
             self._reset_denial_tracking()
             if result.execution_failed:
@@ -1611,7 +1748,7 @@ When you are done, summarize what you did and provide evidence of success."""
             await self._record_execution_outcome(call, result)
             return result
         except TimeoutError:
-            call.duration_ms = (time.time() - start) * 1000
+            call.duration_ms = (time.monotonic() - start) * 1000
             self._reset_denial_tracking()
             self._record_failure(call.tool_name, call.arguments, -1)
             timeout_result = ToolResults.timeout(
@@ -1622,7 +1759,7 @@ When you are done, summarize what you did and provide evidence of success."""
             await self._record_execution_outcome(call, timeout_result)
             return timeout_result
         except Exception as e:
-            call.duration_ms = (time.time() - start) * 1000
+            call.duration_ms = (time.monotonic() - start) * 1000
             self._reset_denial_tracking()
             self._record_failure(call.tool_name, call.arguments, -1)
             # Unexpected exceptions at the loop level stay retryable: the loop
@@ -1697,6 +1834,33 @@ When you are done, summarize what you did and provide evidence of success."""
 
     # ── Context pipeline integration (Parts 2-6) ──────────────────────
 
+    def _search_matches_for(self, goal: str) -> dict[str, list[str]] | None:
+        """Best-effort content-match evidence for the discovery pipeline.
+
+        Uses the ProjectIntelligence search layer (cached, native-backed)
+        when available; returns None otherwise so discovery degrades to the
+        deterministic path/rank sources. Any failure returns None — evidence
+        gathering must never fail the run.
+        """
+        intel = getattr(self, "intelligence", None)
+        if intel is None or not goal.strip():
+            return None
+        try:
+            if not intel.file_list(limit=1):
+                return None
+            tokens = [t for t in goal.replace(":", " ").split() if len(t) >= 4][:6]
+            if not tokens:
+                return None
+            matches: dict[str, list[str]] = {}
+            for token in tokens:
+                for m in intel.search(token, max_results=10):
+                    matches.setdefault(m["file"], []).append(
+                        f"{m.get('line', '')}: {m.get('content', '')[:120]}"
+                    )
+            return matches or None
+        except Exception:
+            return None
+
     async def _discover_context(self, goal: str) -> tuple[list[Any], Any | None]:
         """Run the context intelligence pipeline for the task.
 
@@ -1723,6 +1887,7 @@ When you are done, summarize what you did and provide evidence of success."""
             selection = await self._context_pipeline.discover(
                 request,
                 project_files=(self._project_info or {}).get("files", []),
+                search_matches=self._search_matches_for(goal),
             )
             context = selection.to_context_pieces()
         except Exception:
@@ -1873,12 +2038,13 @@ When you are done, summarize what you did and provide evidence of success."""
             from harness_core.agent.intent import classify_intent
 
             intent = classify_intent(goal)
+            self._is_read_only_task = intent.read_only
             await self._emit_semantic(
                 semantic.INTENT_DETECTED,
                 {"intent": "read_only" if intent.read_only else "engineering", "goal": goal[:120]},
             )
         except Exception:
-            pass
+            self._is_read_only_task = False
 
         # Phase 16: intent fast paths — deterministic workflows run without
         # unbounded LLM iteration when the intent matches.
@@ -1913,7 +2079,12 @@ When you are done, summarize what you did and provide evidence of success."""
                 # Every workflow must pass can_complete_task before finishing.
                 await self._reconcile_todos(task)
                 if can_complete_task(task):
-                    if workflow_name != "explain":
+                    if workflow_name == "explain":
+                        # Explain workflow gathered context.  The LLM loop
+                        # will produce the summary — skip planning so no
+                        # new implementation TODOs are created.
+                        task._skip_planning = True
+                    else:
                         await self._emit_phase("complete")
                         task.status = TaskStatus.COMPLETED
                 else:
@@ -1940,9 +2111,19 @@ When you are done, summarize what you did and provide evidence of success."""
                 task.error = wf_result.failure_reason
                 task.failure_reason = wf_result.failure_reason
                 
-            # Emit final event and return ONLY if we are fully done.
-            # Explain falls through to the LLM loop so it can summarize the gathered context.
-            if workflow_name != "explain" or task.status == TaskStatus.FAILED:
+            # Emit final event and return — all workflows complete here.
+            # The explain workflow reads files + produces context; the LLM
+            # summary is generated by the runtime after the task completes.
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                await self._finish_execution(task)
+                try:
+                    from harness_core.agent.intent import classify_intent as _ci
+                    _wf_intent = _ci(goal)
+                    _wf_intent_str = _wf_intent.intent.value
+                    _wf_is_ro = _wf_intent.read_only
+                except Exception:
+                    _wf_intent_str = "other"
+                    _wf_is_ro = False
                 await self.event_bus.emit(
                     Event(
                         type="task.completed",
@@ -1951,16 +2132,22 @@ When you are done, summarize what you did and provide evidence of success."""
                             "task_id": task.id,
                             "status": task.status.value,
                             "failure_reason": task.failure_reason,
+                            "intent": _wf_intent_str,
+                            "is_read_only": _wf_is_ro,
                             "iterations": task.iterations,
                             "tool_calls": len(task.tool_calls),
+                            "duration_ms": round((time.time() - task.created_at) * 1000, 1),
                             "stats": task.execution_stats.summary(),
                             "attempted": task.execution_stats.attempted,
                             "succeeded": task.execution_stats.succeeded,
                             "failed": task.execution_stats.failed,
                             "recovered": task.execution_stats.recovered,
                             "unresolved": task.execution_stats.unresolved,
-                            "verification_passed": task.verification_passed,
-                            "verification_summary": task.verification_summary,
+                            "verification": {
+                                "passed": task.verification_passed,
+                                "summary": task.verification_summary,
+                                "skipped": _wf_is_ro,
+                            },
                             "files_changed": list(self._modified_files),
                             "completed_operations": list(self._completed_operations),
                             "todos": task.task_plan.to_event_items(),
@@ -1971,6 +2158,7 @@ When you are done, summarize what you did and provide evidence of success."""
                             "tests_passed": task.tests_passed,
                             "models_used": list(task.models_used),
                             "model_fallbacks": task.model_fallbacks,
+                            "execution": task.execution_timeline.snapshot(),
                             "git_commit": task.git_commit,
                             "git_push": task.git_push,
                             "paused_reason": task.paused_reason,
@@ -2012,8 +2200,21 @@ When you are done, summarize what you did and provide evidence of success."""
 
         # Planning phase: ask model to create a concise plan grounded in
         # the discovered workspace (never in imagined context).
-        await self._emit_phase("planning")
-        try:
+        #
+        # READ-ONLY SHORTCUT: when the explain workflow already gathered
+        # context and completed all TODOs, skip planning entirely.
+        # The LLM loop produces the summary without new implementation TODOs.
+        from harness_core.planning.domain import TaskComplexity, classify_request as classify_task_request
+        task_contract = classify_task_request(goal)
+        needs_agent_plan = (
+            not getattr(task, "_skip_planning", False)
+            and not task_contract.is_read_only
+            and task_contract.complexity != TaskComplexity.TRIVIAL
+        )
+        if needs_agent_plan:
+         await self._emit_phase("planning")
+         planning_request_started: float | None = None
+         try:
             plan_user_content = goal
             snapshot = self._workspace_snapshot_text()
             if snapshot:
@@ -2023,11 +2224,21 @@ When you are done, summarize what you did and provide evidence of success."""
                     "Base the plan on these real files. Do not ask the user for "
                     "information that is discoverable with tools."
                 )
+            if task_contract.complexity == TaskComplexity.SIMPLE:
+                plan_instruction = (
+                    "Create a short plan of 2-3 executable steps for this small code change.\n"
+                )
+                max_steps = 3
+            else:
+                plan_instruction = (
+                    "Create a structured plan of 3-6 executable steps for this engineering task.\n"
+                )
+                max_steps = 6
             plan_messages = [
                 {"role": "system", "content": (
                     "You are planning an engineering task. Respond with a numbered list of steps.\n"
-                    "Be concise: 3-6 steps maximum. Each step must be one short, EXECUTABLE line\n"
-                    "(an action the agent will perform), e.g. 'Inspect calculator.js'.\n"
+                    + plan_instruction
+                    + f"Each step must be one short, EXECUTABLE line (maximum {max_steps}; an action the agent will perform), e.g. 'Inspect calculator.js'.\n"
                     "No questions. No explanations. No requests for more information.\n"
                     "Example:\n"
                     "1. Inspect current code\n"
@@ -2038,6 +2249,7 @@ When you are done, summarize what you did and provide evidence of success."""
                 {"role": "user", "content": plan_user_content},
             ]
             plan_request = CompletionRequest(messages=plan_messages)
+            planning_request_started = time.monotonic()
             if self.router is not None:
                 plan_result = await self.router.execute(
                     plan_request,
@@ -2050,6 +2262,10 @@ When you are done, summarize what you did and provide evidence of success."""
             else:
                 plan_response = await self.provider.generate(plan_request)
                 plan_text = plan_response.content or ""
+            task.execution_timeline.record_model_attempt(
+                time.monotonic() - planning_request_started
+            )
+            planning_request_started = None
             # Parse plan steps from response
             plan_steps = []
             for line in plan_text.strip().split("\n"):
@@ -2064,8 +2280,9 @@ When you are done, summarize what you did and provide evidence of success."""
             # Validate: TODOs must be actionable engineering tasks (verb-first).
             # Conversational prose is rejected and never displayed.
             plan_steps = self._validate_plan_steps(plan_steps)
+            plan_steps = plan_steps[:max_steps]
             if not plan_steps:
-                plan_steps = self._default_plan_steps(goal)
+                plan_steps = self._default_plan_steps(goal)[:max_steps]
 
             # INTENT GUARD (Phase 10.6): a read-only request ("explain this
             # project") must never acquire REQUIRED modification/test/fix
@@ -2103,7 +2320,11 @@ When you are done, summarize what you did and provide evidence of success."""
                     )
                 )
                 await self._emit_todo_update(task)
-        except Exception:
+         except Exception:
+            if planning_request_started is not None:
+                task.execution_timeline.record_model_attempt(
+                    time.monotonic() - planning_request_started
+                )
             pass  # Planning is best-effort; don't fail the task
 
         # Emit initial thinking
@@ -2124,6 +2345,14 @@ When you are done, summarize what you did and provide evidence of success."""
             task.iterations += 1
             task.status = TaskStatus.EXECUTING
             self.budget.record_iteration()
+
+            # Classify intent once per iteration for intent-aware completion.
+            try:
+                from harness_core.agent.intent import classify_intent as _ci_iter
+                _iter_intent = _ci_iter(goal)
+                _is_read_only_task: bool = _iter_intent.read_only
+            except Exception:
+                _is_read_only_task = False
 
             await self._emit_event(
                 "iteration.started", {"iteration": task.iterations, "task_id": task.id}
@@ -2171,57 +2400,56 @@ When you are done, summarize what you did and provide evidence of success."""
             )
 
             self.run_metrics.record_model_call()
+            if not task.tool_calls and task.execution_timeline.state == ExecutionState.WORKING:
+                await self._transition_execution(ExecutionState.THINKING)
+            model_attempt_started = time.monotonic()
             await self._emit_semantic(
                 semantic.MODEL_STARTED,
                 {"model": self.config.model_preference or "auto", "iteration": task.iterations},
             )
             try:
                 if self.router is not None:
-                    response = None
-                    for attempt in range(2):
-                        fallback_result = await self.router.execute(
-                            request,
-                            routing_mode_override=self.config.routing_mode
-                        )
-                        if fallback_result.succeeded:
-                            response = fallback_result.response
-                            prev_model = self._last_model_used
-                            self._last_model_used = fallback_result.model_used
-                            # Account models + switches (quiet, change-only)
-                            if fallback_result.model_used and fallback_result.model_used not in task.models_used:
-                                task.models_used.append(fallback_result.model_used)
-                            if prev_model and fallback_result.model_used and fallback_result.model_used != prev_model:
-                                task.model_fallbacks += 1
-                                await self.event_bus.emit(
-                                    Event(
-                                        type="model.switched",
-                                        source="agent_loop",
-                                        data={
-                                            "from": prev_model,
-                                            "to": fallback_result.model_used,
-                                            "reason": "unavailable",
-                                        },
-                                    )
-                                )
-                            break
-                        if attempt == 0:
-                            # Failed models were marked unhealthy (402/401/429);
-                            # a rebuilt chain skips them and reaches viable models.
-                            await self.event_bus.emit(
-                                Event(
-                                    type="model.error",
-                                    source="agent_loop",
-                                    data={
-                                        "error": fallback_result.final_error or "All models failed",
-                                        "retrying": True,
-                                    },
-                                )
+                    fallback_result = await self.router.execute(
+                        request,
+                        routing_mode_override=self.config.routing_mode
+                    )
+                    if not fallback_result.succeeded:
+                        error = fallback_result.final_error or "All compatible configured models failed"
+                        await self.event_bus.emit(
+                            Event(
+                                type="model.error",
+                                source="agent_loop",
+                                data={"error": error, "retrying": False},
                             )
-                            continue
-                        raise RuntimeError(fallback_result.final_error or "All models failed")
+                        )
+                        raise RuntimeError(error)
+                    response = fallback_result.response
+                    prev_model = self._last_model_used
+                    self._last_model_used = fallback_result.model_used
+                    if fallback_result.model_used and fallback_result.model_used not in task.models_used:
+                        task.models_used.append(fallback_result.model_used)
+                    if prev_model and fallback_result.model_used and fallback_result.model_used != prev_model:
+                        task.model_fallbacks += 1
+                        await self.event_bus.emit(
+                            Event(
+                                type="model.switched",
+                                source="agent_loop",
+                                data={
+                                    "from": prev_model,
+                                    "to": fallback_result.model_used,
+                                    "reason": "unavailable",
+                                },
+                            )
+                        )
                 else:
                     response = await self.provider.generate(request)
             except Exception as e:
+                model_duration = time.monotonic() - model_attempt_started
+                task.execution_timeline.record_model_attempt(model_duration)
+                await self._emit_semantic(
+                    semantic.MODEL_COMPLETED,
+                    {"duration_ms": round(model_duration * 1000, 1), "failed": True},
+                )
                 err_str = str(e)
                 failure_reason = self._classify_failure_reason(err_str)
                 task.failure_reason = failure_reason
@@ -2268,6 +2496,13 @@ When you are done, summarize what you did and provide evidence of success."""
                     task.error = f"Provider error: {e}"
                 break
 
+            model_duration = time.monotonic() - model_attempt_started
+            task.execution_timeline.record_model_attempt(model_duration)
+            await self._emit_semantic(
+                semantic.MODEL_COMPLETED,
+                {"duration_ms": round(model_duration * 1000, 1), "failed": False},
+            )
+
             # Process response
             if response.content:
                 await self._emit_thinking(response.content, task)
@@ -2280,6 +2515,7 @@ When you are done, summarize what you did and provide evidence of success."""
             if response.tool_calls:
                 # Execute tool calls
                 for tool_call_data in response.tool_calls:
+                    await self._transition_execution(ExecutionState.WORKING)
                     func = tool_call_data.get("function", {})
                     call = ToolCall(
                         id=tool_call_data.get("id", ""),
@@ -2318,6 +2554,7 @@ When you are done, summarize what you did and provide evidence of success."""
                     await self._todo_started(task, call)
 
                     result = await self._execute_tool(call)
+                    task.execution_timeline.record_tool(call.duration_ms / 1000.0)
 
                     # Enrich with diagnosis / test accounting / git state
                     await self._postprocess_result(task, call, result)
@@ -2397,6 +2634,7 @@ When you are done, summarize what you did and provide evidence of success."""
                     and self.tools
                     and self._workspace_has_files()
                     and self._no_tool_nudges < MAX_NO_TOOL_NUDGES
+                    and not _is_read_only_task
                 ):
                     self._no_tool_nudges += 1
                     files_preview = ", ".join(
@@ -2448,16 +2686,21 @@ When you are done, summarize what you did and provide evidence of success."""
                             continue
                         # Nudge exhaustion does NOT authorize skipping required
                         # work — only the absence of a tool surface does.
-                        if item.required and not cannot_work:
+                        # READ-ONLY EXCEPTION: for explain/analyze/research
+                        # tasks, the text response IS the deliverable. Skip
+                        # remaining PENDING TODOs so completion can succeed.
+                        if item.required and not cannot_work and not _is_read_only_task:
                             continue  # keep required work pending for invariant check
                         if cannot_work and item.required:
                             skip_reason = "No tool surface / empty workspace; work not performable"
+                        elif _is_read_only_task and item.required:
+                            skip_reason = "Read-only task: text response is the deliverable"
                         else:
                             skip_reason = "Optional work not performed; model finished with text response"
                         task.task_plan.skip_id(
                             item.id,
                             skip_reason,
-                            authorized=cannot_work,
+                            authorized=cannot_work or _is_read_only_task,
                         )
 
                 # HARD INVARIANT: TOOL FAILURE ≠ TASK SUCCESS
@@ -2612,13 +2855,16 @@ When you are done, summarize what you did and provide evidence of success."""
                     self._readonly_tool_calls = 0
 
                 if self._readonly_tool_calls >= _MAX_READONLY_TOOL_CALLS:
-                    self._corrections.append(
-                        f"You have made {self._readonly_tool_calls} read-only tool calls "
-                        "without modifying any files. STOP calling tools and produce "
-                        "your final text response NOW. Summarize what you found and "
-                        "answer the user's question. Do not call any more tools."
-                    )
-                    self._readonly_tool_calls = 0  # Reset so we don't spam
+                    # Read-only tasks (explain/analyze/research) are expected to
+                    # read many files — do not force them to stop reading.
+                    if not _is_read_only_task:
+                        self._corrections.append(
+                            f"You have made {self._readonly_tool_calls} read-only tool calls "
+                            "without modifying any files. STOP calling tools and produce "
+                            "your final text response NOW. Summarize what you found and "
+                            "answer the user's question. Do not call any more tools."
+                        )
+                        self._readonly_tool_calls = 0  # Reset so we don't spam
 
             # Diagnosis mode budget: never loop forever in diagnosis
             if self._diagnosis_active:
@@ -2718,6 +2964,17 @@ When you are done, summarize what you did and provide evidence of success."""
                 iterations=task.iterations,
             )
 
+        # Classify intent for structured completion event
+        try:
+            from harness_core.agent.intent import classify_intent
+            _intent_result = classify_intent(goal)
+            _intent_str = _intent_result.intent.value
+            _is_read_only = _intent_result.read_only
+        except Exception:
+            _intent_str = "other"
+            _is_read_only = False
+
+        await self._finish_execution(task)
         await self.event_bus.emit(
             Event(
                 type="task.completed",
@@ -2726,14 +2983,24 @@ When you are done, summarize what you did and provide evidence of success."""
                     "task_id": task.id,
                     "status": task.status.value,
                     "failure_reason": task.failure_reason,
+                    "intent": _intent_str,
+                    "is_read_only": _is_read_only,
                     "iterations": task.iterations,
                     "tool_calls": len(task.tool_calls),
+                    "duration_ms": round((time.time() - task.created_at) * 1000, 1),
                     "stats": task.execution_stats.summary(),
                     "attempted": task.execution_stats.attempted,
                     "succeeded": task.execution_stats.succeeded,
                     "failed": task.execution_stats.failed,
                     "recovered": task.execution_stats.recovered,
                     "unresolved": task.execution_stats.unresolved,
+                    # Structured verification (TUI renders this)
+                    "verification": {
+                        "passed": task.verification_passed,
+                        "summary": task.verification_summary,
+                        "skipped": _is_read_only,
+                    },
+                    # Backward-compatible flat key (existing consumers)
                     "verification_passed": task.verification_passed,
                     "verification_summary": task.verification_summary,
                     "files_changed": list(self._modified_files),
@@ -2746,6 +3013,7 @@ When you are done, summarize what you did and provide evidence of success."""
                     "tests_passed": task.tests_passed,
                     "models_used": list(task.models_used),
                     "model_fallbacks": task.model_fallbacks,
+                    "execution": task.execution_timeline.snapshot(),
                     "git_commit": task.git_commit,
                     "git_push": task.git_push,
                     "paused_reason": task.paused_reason,

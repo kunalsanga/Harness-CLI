@@ -291,13 +291,14 @@ class TestZeroToolCallGuard:
         target.write_text("x = 1", encoding="utf-8")
         provider = ScriptedProvider([
             plan_response(),
-            tool_response("read_file", {"path": str(target)}, "c1"),
-            text("The project defines x = 1."),
+            tool_response("write_file", {"path": str(target), "content": "x = 2\n"}, "c1"),
+            text("Updated app.py so x = 2."),
         ])
         collector = EventCollector()
         loop = make_loop(provider, tmp_path, collector=collector)
 
-        task = await loop.run("Tell me about this project")
+        # Engineering (non-explain) goal so the LLM tool loop runs.
+        task = await loop.run("Change app.py so that x equals 2")
 
         assert collector.of_type("execution.nudge") == []
         assert len(task.tool_calls) == 1
@@ -779,32 +780,35 @@ def _router_with_models(models: list[ModelInfo], mode: str) -> ModelRouter:
 class TestFreeSafetyNet:
     @pytest.mark.asyncio
     async def test_auto_chain_includes_free_models(self):
-        # 5 high-context paid models outrank the free ones; safety net must
-        # still place free models in the chain (accounts without credits 402).
+        # Paid models are opt-in; with allow_paid_models=False the chain is
+        # free-only. With allow_paid_models=True the free safety net still
+        # keeps free models reachable alongside high-scoring paid ones.
         models = (
             [_model(f"paid-{i}", is_free=False, ctx=1_000_000 - i) for i in range(5)]
             + [_model("free-a", is_free=True, ctx=32000),
                _model("free-b", is_free=True, ctx=32000)]
         )
         router = _router_with_models(models, "auto")
+        router.config.allow_paid_models = True
         req = CompletionRequest(
             messages=[{"role": "user", "content": "Fix the bug"}],
             tools=[{"type": "function", "function": {"name": "t"}}],
         )
         chain = await router.select_models(req)
         ids = [mid for mid, _ in chain]
-        assert any(mid.startswith("free-") for mid in ids), (
-            f"auto chain must include a free model safety net, got {ids}"
-        )
+        assert "free-a" in ids or "free-b" in ids, f"free safety net missing from {ids}"
+        assert any(mid.startswith("paid-") for mid in ids), f"expected paid candidates in {ids}"
 
     @pytest.mark.asyncio
     async def test_free_mode_chain_only_free(self):
         models = [
             _model("paid-a", is_free=False, ctx=1_000_000),
             _model("free-a", is_free=True, ctx=32000),
+            _model("free-b", is_free=True, ctx=16000),
         ]
         router = _router_with_models(models, "free")
         req = CompletionRequest(messages=[{"role": "user", "content": "Fix"}])
         chain = await router.select_models(req)
         ids = [mid for mid, _ in chain]
-        assert ids == ["free-a"]
+        assert "paid-a" not in ids
+        assert ids == ["free-a", "free-b"]

@@ -1,5 +1,9 @@
 # Harness Engineering CLI — Model Routing
 
+> This page contains the broader routing design and legacy provider notes. The
+> current normal task runtime uses OpenRouter and its configured free-model
+> pool; see [current architecture](../.agent-context/ARCHITECTURE.md).
+
 ## Architecture
 
 ```
@@ -138,13 +142,14 @@ budgets:
 
 ## Providers
 
-### Supported Providers
+### Provider adapters versus active task providers
 
-| Provider | Status | Notes |
-|----------|--------|-------|
-| OpenRouter | ✅ Active | Primary multi-model gateway |
-| Ollama | ✅ Active | Local inference |
-| LiteLLM | ✅ Added | Unified interface to 100+ providers |
+| Provider | Current task runtime | Notes |
+|----------|-----------------------|-------|
+| OpenRouter | Active | Used by interactive tasks and `harness run` |
+| Ollama | Inactive | Adapter remains; current CLI does not select it |
+| LiteLLM | Inactive | Adapter/documentation remains; not selected by CLI |
+| NVIDIA, Groq, 9router | Inactive | Source modules/tests exist; not selected by normal task runtime |
 
 ### Adding a Provider
 

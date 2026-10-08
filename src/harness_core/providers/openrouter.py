@@ -13,7 +13,60 @@ from harness_core.providers.base import (
     CompletionResponse,
     ModelInfo,
     ModelProvider,
+    ProviderErrorCategory,
+    ProviderRequestError,
 )
+
+
+def _retry_after(response) -> float | None:
+    try:
+        return float(response.headers.get("Retry-After", ""))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _error_code(response):
+    try:
+        error = response.json().get("error", {})
+        return error.get("code") if isinstance(error, dict) else None
+    except Exception:
+        return None
+
+
+def _error_retry_after(error: dict) -> float | None:
+    metadata = error.get("metadata", {}) if isinstance(error, dict) else {}
+    if not isinstance(metadata, dict):
+        return None
+    try:
+        return float(metadata.get("retry_after"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _openrouter_error_category(code, error_type: str, message: str) -> ProviderErrorCategory:
+    from harness_core.providers.http_adapters import _error_category
+    try:
+        status = int(code)
+    except (TypeError, ValueError):
+        status = 0
+    if error_type in {"provider_unavailable", "model_not_found"}:
+        return ProviderErrorCategory.MODEL_UNAVAILABLE
+    if error_type in {"rate_limit", "rate_limited"}:
+        return ProviderErrorCategory.RATE_LIMIT
+    return _error_category(status, message)
+
+
+def _normalize_openrouter_usage(raw) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized = dict(raw)
+    details = raw.get("prompt_tokens_details") or {}
+    completion_details = raw.get("completion_tokens_details") or {}
+    if isinstance(details, dict) and "cached_tokens" in details:
+        normalized["cached_tokens"] = details["cached_tokens"]
+    if isinstance(completion_details, dict) and "reasoning_tokens" in completion_details:
+        normalized["reasoning_tokens"] = completion_details["reasoning_tokens"]
+    return normalized
 
 
 class OpenRouterProvider(ModelProvider):
@@ -21,7 +74,7 @@ class OpenRouterProvider(ModelProvider):
 
     BASE_URL = "https://openrouter.ai/api/v1"
 
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(self, api_key: str | None = None, base_url: str | None = None, default_model: str | None = None) -> None:
         # Use CredentialResolver if no explicit key provided
         if api_key:
             self.api_key = api_key
@@ -31,18 +84,39 @@ class OpenRouterProvider(ModelProvider):
                 resolver = CredentialResolver()
                 cred = resolver.resolve("openrouter")
                 self.api_key = cred.api_key if cred else ""
+                if base_url is None and cred and cred.base_url:
+                    base_url = cred.base_url
+                if default_model is None and cred and cred.default_model:
+                    default_model = cred.default_model
             except Exception:
                 self.api_key = os.environ.get("OPENROUTER_API_KEY", "")
         self._client: httpx.AsyncClient | None = None
+        self.base_url = (base_url or self.BASE_URL).rstrip("/")
+        self.default_model = default_model or "openrouter/free"
 
     @property
     def name(self) -> str:
         return "openrouter"
 
+    async def routing_hints(self, mode: str) -> list[ModelInfo]:
+        """Expose OpenRouter's dynamic free route as a normalized catalog entry.
+
+        Lives at the provider boundary — core routing never hardcodes this ID.
+        """
+        return [ModelInfo(
+            id="openrouter/free",
+            name="OpenRouter free router",
+            provider=self.name,
+            supports_tools=True,
+            supports_streaming=True,
+            is_free=True,
+            tags=["dynamic-route"],
+        )]
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                base_url=self.BASE_URL,
+                base_url=self.base_url,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -82,7 +156,7 @@ class OpenRouterProvider(ModelProvider):
         client = await self._get_client()
 
         body: dict[str, Any] = {
-            "model": request.model or "openrouter/auto",
+            "model": request.model or self.default_model,
             "messages": request.messages,
         }
         if request.tools:
@@ -101,16 +175,23 @@ class OpenRouterProvider(ModelProvider):
             status = e.response.status_code if hasattr(e, "response") and e.response is not None else 0
             detail = self._extract_provider_detail(e.response) if hasattr(e, "response") and e.response is not None else str(e)
             model_id = request.model or body.get("model", "")
-            raise RuntimeError(f"OpenRouter {status} {detail} (model={model_id})" if detail else f"OpenRouter {status} error (model={model_id})") from e
+            from harness_core.providers.http_adapters import _error_category
+            raise ProviderRequestError(_error_category(status, detail), detail or f"OpenRouter HTTP {status}", provider=self.name, model=model_id, status_code=status, retry_after=_retry_after(e.response), provider_code=_error_code(e.response)) from e
         except httpx.TimeoutException as e:
-            raise RuntimeError(f"OpenRouter timeout after {client.timeout.read or 120}s (model={request.model or body.get('model','')})") from e
+            raise ProviderRequestError(ProviderErrorCategory.TIMEOUT, "OpenRouter request timed out", provider=self.name, model=request.model or body.get("model", "")) from e
         except httpx.NetworkError as e:
-            raise RuntimeError(f"OpenRouter network error: {type(e).__name__} (model={request.model or body.get('model','')})") from e
+            raise ProviderRequestError(ProviderErrorCategory.NETWORK, "Could not connect to OpenRouter", provider=self.name, model=request.model or body.get("model", "")) from e
 
         try:
             data = response.json()
         except Exception as e:
-            raise RuntimeError(f"OpenRouter invalid response (non-JSON) status={response.status_code} (model={request.model or body.get('model','')})") from e
+            raise ProviderRequestError(
+                ProviderErrorCategory.PROVIDER,
+                f"OpenRouter invalid response (non-JSON) status={response.status_code}",
+                provider=self.name,
+                model=request.model or body.get("model", ""),
+                status_code=response.status_code,
+            ) from e
 
         choice = data.get("choices", [{}])[0] if isinstance(data.get("choices"), list) and data.get("choices") else {}
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
@@ -118,15 +199,26 @@ class OpenRouterProvider(ModelProvider):
         tool_calls = message.get("tool_calls") or []
         if not content and not tool_calls and isinstance(data.get("error"), dict):
             err_msg = data["error"].get("message", "")[:500]
-            if err_msg:
-                raise RuntimeError(f"OpenRouter error: {err_msg} (model={request.model or body.get('model','')})")
+            # OpenRouter wraps provider failures in HTTP 200. The structured
+            # code and error_type are the only reliable failover signals —
+            # dropping them makes the failure unclassifiable (UNKNOWN), which
+            # terminated the whole fallback chain (observed live with
+            # nvidia/nemotron-3-nano: code 502, error_type provider_unavailable).
+            err_code = data["error"].get("code", "")
+            err_meta = data["error"].get("metadata") if isinstance(data["error"].get("metadata"), dict) else {}
+            err_type = err_meta.get("error_type", "")
+            parts = [p for p in (f"code {err_code}" if err_code != "" else "", err_type) if p]
+            prefix = f" ({', '.join(parts)})" if parts else ""
+            if err_msg or prefix:
+                category = _openrouter_error_category(err_code, err_type, err_msg)
+                raise ProviderRequestError(category, err_msg or "OpenRouter returned a provider error", provider=self.name, model=request.model or body.get("model", ""), status_code=int(err_code) if str(err_code).isdigit() else None, provider_code=err_code or err_type, retry_after=_error_retry_after(data["error"]))
 
         return CompletionResponse(
             content=content,
             tool_calls=tool_calls,
             model=data.get("model", ""),
             provider=self.name,
-            usage=data.get("usage", {}) if isinstance(data.get("usage"), dict) else {},
+            usage=_normalize_openrouter_usage(data.get("usage")),
             finish_reason=choice.get("finish_reason", "") if isinstance(choice, dict) else "",
         )
 
@@ -134,7 +226,7 @@ class OpenRouterProvider(ModelProvider):
         client = await self._get_client()
 
         body: dict[str, Any] = {
-            "model": request.model or "openrouter/auto",
+            "model": request.model or self.default_model,
             "messages": request.messages,
             "stream": True,
         }
@@ -152,7 +244,7 @@ class OpenRouterProvider(ModelProvider):
                 except httpx.HTTPStatusError as e:
                     status = e.response.status_code if hasattr(e, "response") and e.response is not None else 0
                     detail = self._extract_provider_detail(e.response) if hasattr(e, "response") and e.response is not None else str(e)
-                    raise RuntimeError(f"OpenRouter {status} {detail} (model={request.model or body.get('model','')})" if detail else f"OpenRouter {status} error (model={request.model or body.get('model','')})") from e
+                    raise ProviderRequestError(_openrouter_error_category(status, "", detail), detail or f"OpenRouter HTTP {status}", provider=self.name, model=request.model or body.get("model", ""), status_code=status, retry_after=_retry_after(e.response)) from e
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
                         data = line[6:]
@@ -164,31 +256,62 @@ class OpenRouterProvider(ModelProvider):
                             if isinstance(chunk, dict) and chunk.get("error"):
                                 err = chunk["error"]
                                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                                raise RuntimeError(f"OpenRouter stream error: {str(msg)[:500]}")
+                                code = err.get("code", "") if isinstance(err, dict) else ""
+                                metadata = err.get("metadata", {}) if isinstance(err, dict) else {}
+                                error_type = metadata.get("error_type", "") if isinstance(metadata, dict) else ""
+                                raise ProviderRequestError(_openrouter_error_category(code, error_type, str(msg)), str(msg)[:500], provider=self.name, model=request.model or body.get("model", ""), status_code=int(code) if str(code).isdigit() else None, provider_code=code or error_type)
                             delta = chunk.get("choices", [{}])[0].get("delta", {}) if isinstance(chunk.get("choices"), list) else {}
                             content = delta.get("content", "") if isinstance(delta, dict) else ""
                             if content:
                                 yield content
-                        except RuntimeError:
+                        except ProviderRequestError:
                             raise
                         except Exception:
                             continue
         except httpx.TimeoutException as e:
-            raise RuntimeError(f"OpenRouter stream timeout (model={request.model or body.get('model','')})") from e
+            raise ProviderRequestError(ProviderErrorCategory.TIMEOUT, "OpenRouter stream timed out", provider=self.name, model=request.model or body.get("model", "")) from e
         except httpx.NetworkError as e:
-            raise RuntimeError(f"OpenRouter stream network error: {type(e).__name__} (model={request.model or body.get('model','')})") from e
+            raise ProviderRequestError(ProviderErrorCategory.NETWORK, "Could not connect to OpenRouter", provider=self.name, model=request.model or body.get("model", "")) from e
 
     async def list_models(self) -> list[ModelInfo]:
         client = await self._get_client()
-        response = await client.get("/models")
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = await client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else 0
+            detail = self._extract_provider_detail(e.response) if e.response is not None else ""
+            from harness_core.providers.http_adapters import _error_category
+            raise ProviderRequestError(
+                _error_category(status, detail),
+                f"OpenRouter model discovery failed: {detail or status}",
+                provider=self.name,
+                status_code=status,
+                retry_after=_retry_after(e.response),
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ProviderRequestError(
+                ProviderErrorCategory.TIMEOUT, "OpenRouter model discovery timed out",
+                provider=self.name,
+            ) from e
+        except httpx.NetworkError as e:
+            raise ProviderRequestError(
+                ProviderErrorCategory.NETWORK, "Could not connect to OpenRouter for model discovery",
+                provider=self.name,
+            ) from e
+        except ValueError as e:
+            raise ProviderRequestError(
+                ProviderErrorCategory.PROVIDER, "OpenRouter returned an invalid model catalog",
+                provider=self.name,
+            ) from e
 
         models = []
         for m in data.get("data", []):
             pricing = m.get("pricing", {})
             prompt_price = float(pricing.get("prompt", "0"))
             completion_price = float(pricing.get("completion", "0"))
+            supported = m.get("supported_parameters")
 
             models.append(
                 ModelInfo(
@@ -196,7 +319,13 @@ class OpenRouterProvider(ModelProvider):
                     name=m.get("name", ""),
                     provider=self.name,
                     context_window=m.get("context_length", 0),
-                    supports_tools="tool" in str(m.get("supported_parameters", [])),
+                    supports_tools=(
+                        any(p in supported for p in ("tools", "tool_choice"))
+                        if isinstance(supported, (list, tuple, set)) else None
+                    ),
+                    supports_streaming=True,
+                    supports_vision=None,
+                    supports_structured_output=None,
                     cost_per_1k_input=prompt_price * 1000,
                     cost_per_1k_output=completion_price * 1000,
                     is_free=prompt_price == 0 and completion_price == 0,

@@ -33,11 +33,18 @@ class _FakeProvider:
 
     name = "fake-openrouter"
 
+    def __init__(self, *args, **kwargs):
+        pass
+
     async def health_check(self) -> bool:
         return True
 
     async def close(self) -> None:
         return None
+
+    async def routing_hints(self, *args, **kwargs):
+        from harness_core.providers.base import ModelInfo
+        return [ModelInfo(id="fake", name="fake", provider="fake-openrouter", supports_tools=True, is_free=True, is_local=True)]
 
     async def generate(self, request):
         # The only real generate() call in this flow is the Planner's
@@ -58,7 +65,8 @@ class _FakeProvider:
         )
 
     async def list_models(self):
-        return []
+        from harness_core.providers.base import ModelInfo
+        return [ModelInfo(id="fake", name="fake", provider="fake-openrouter", supports_tools=True, is_free=True, is_local=True)]
 
 
 class _FakeOllama:

@@ -10,9 +10,36 @@
     {
       "dst": "interactive_task_1",
       "properties": {
-        "error": "Agent execution failed."
+        "error": "Task ended without completing all required work: 1 required TODO(s) still pending: Identify languages, package manager, and test suite status."
       },
       "src": "interactive_task_1",
+      "type": "caused_by",
+      "weight": 2.0
+    },
+    {
+      "dst": "interactive_task_1_recovery_1",
+      "properties": {
+        "error": "Provider error: Provider error: All 4 models failed. Last error: Client error '429 Too Many Requests' for url 'https://openrouter.ai/api/v1/chat/completions'"
+      },
+      "src": "interactive_task_1_recovery_1",
+      "type": "caused_by",
+      "weight": 2.0
+    },
+    {
+      "dst": "interactive_task_1_recovery_2",
+      "properties": {
+        "error": "Provider error: Provider error: 0 model(s) unavailable (401/403), 1 require payment (402), 4 failed for other reasons. Last error: Client error '429 Too Many Requests' for url 'https://openrouter.ai/api/v1/chat/compl"
+      },
+      "src": "interactive_task_1_recovery_2",
+      "type": "caused_by",
+      "weight": 2.0
+    },
+    {
+      "dst": "interactive_task_1_recovery_3",
+      "properties": {
+        "error": "Provider error: Provider error: 0 model(s) unavailable (401/403), 2 require payment (402), 2 failed for other reasons. Last error: Client error '402 Payment Required' for url 'https://openrouter.ai/api/v1/chat/comple"
+      },
+      "src": "interactive_task_1_recovery_3",
       "type": "caused_by",
       "weight": 2.0
     }
@@ -29,6 +56,30 @@
     {
       "id": "interactive_task_1",
       "label": "explain this project",
+      "properties": {
+        "outcome": "failure"
+      },
+      "type": "task"
+    },
+    {
+      "id": "interactive_task_1_recovery_1",
+      "label": "RECOVERY ATTEMPT 1: Diagnose and fix unknown",
+      "properties": {
+        "outcome": "failure"
+      },
+      "type": "task"
+    },
+    {
+      "id": "interactive_task_1_recovery_2",
+      "label": "RECOVERY ATTEMPT 2: Diagnose and fix unknown",
+      "properties": {
+        "outcome": "failure"
+      },
+      "type": "task"
+    },
+    {
+      "id": "interactive_task_1_recovery_3",
+      "label": "RECOVERY ATTEMPT 3: Diagnose and fix unknown",
       "properties": {
         "outcome": "failure"
       },

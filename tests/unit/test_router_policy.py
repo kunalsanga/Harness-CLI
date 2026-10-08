@@ -96,8 +96,12 @@ def test_role_policy_is_recorded_in_routing_decision():
         async def stream(self, request):
             yield CompletionResponse(content="ok", model="fast-mini")
 
+    # allow_paid_models=True isolates the variable under test: role-policy
+    # ordering. The paid-opt-in routing gate has its own dedicated tests.
     router = ModelRouter(
-        providers=[_P()], config=RouterConfig(), event_bus=EventBus()
+        providers=[_P()],
+        config=RouterConfig(allow_paid_models=True),
+        event_bus=EventBus(),
     )
 
     async def _select(policy: str) -> list:

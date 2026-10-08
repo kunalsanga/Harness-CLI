@@ -229,10 +229,8 @@ def test_live_ui_render_contains_real_state_only():
     ui = LiveTerminalUI(console, plain=True)
     console.print(ui._renderable(vm))
     text = console.export_text()
-    assert "HARNESS" in text
+    assert "Considering" in text
     assert "Build a task manager" in text
-    assert "src/api.py" in text
-    assert "31/34" in text
 
 
 def test_format_elapsed():

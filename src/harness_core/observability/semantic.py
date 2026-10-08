@@ -80,12 +80,43 @@ MODEL_SWITCHED = "model.switched"    # pre-existing name — reused
 
 TODO_UPDATED = "todo.updated"        # pre-existing name — reused
 
+# ── Task lifecycle events (Directive 15) ────────────────────────────────
+TASK_STARTED = "task.started"
+TASK_INTENT_DETECTED = "task.intent_detected"
+TASK_SCOPED = "task.scoped"
+TASK_PLANNED = "task.planned"
+TASK_COMPLETED = "task.completed"
+TASK_FAILED = "task.failed"
+TASK_PAUSED = "task.paused"
+TASK_RESUMED = "task.resumed"
+
+# ── Todo lifecycle events (Directive 15) ────────────────────────────────
+TODO_STARTED = "todo.started"
+TODO_COMPLETED = "todo.completed"
+TODO_FAILED = "todo.failed"
+TODO_BLOCKED = "todo.blocked"
+
+# ── Verification check event (Directive 15) ─────────────────────────────
+VERIFICATION_CHECK = "verification.check"
+
+# ── Recovery attempt event (Directive 15) ────────────────────────────────
+RECOVERY_ATTEMPT = "recovery.attempt"
+
+# ── Context events (Directive 15) ───────────────────────────────────────
+CONTEXT_LOADED = "context.loaded"
+CONTEXT_REUSED = "context.reused"
+CONTEXT_COMPACTED = "context.compacted"
+
+# ── Runtime stage change (Directive 15) ──────────────────────────────────
+RUNTIME_STAGE_CHANGED = "runtime.stage_changed"
+
 # Events that are safe to mark "quiet" for ghost/background exploration UI
 # (Part 13). Deterministic read-only operations only.
 QUIET_EVENT_TYPES = frozenset({
     "tool.call", "tool.result",
     TOOL_STARTED, TOOL_COMPLETED,
-    CONTEXT_FILE_SELECTED,
+    CONTEXT_FILE_SELECTED, CONTEXT_LOADED, CONTEXT_REUSED,
+    VERIFICATION_CHECK,
 })
 
 # Credential-shaped keys that must never appear in event payloads.

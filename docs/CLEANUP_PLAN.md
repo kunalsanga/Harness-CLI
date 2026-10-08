@@ -38,3 +38,7 @@
 | `tests/unit/test_canonical_runtime.py` | Test file | Contains tests for canonical runtime | LOW RISK |
 | `tests/unit/test_forensic_audit_fixes.py` | Test file | Contains tests for forensic audit | LOW RISK |
 | `tests/unit/test_ux_interaction.py` | Test file | Contains tests for UX interactions | LOW RISK |
+# Historical cleanup plan
+
+> This plan comes from an earlier repository snapshot. It is not an instruction
+> to delete the files listed today; re-check references and worktree ownership.

@@ -33,6 +33,7 @@ class LiteLLMProvider(ModelProvider):
         self,
         api_key: str | None = None,
         base_url: str | None = None,
+        default_model: str | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("LITELLM_API_KEY", "")
         self.base_url = (
@@ -41,6 +42,7 @@ class LiteLLMProvider(ModelProvider):
             or (self.LOCAL_BASE_URL if not self.api_key else self.DEFAULT_BASE_URL)
         )
         self._client: httpx.AsyncClient | None = None
+        self.default_model = default_model or "gpt-4o-mini"
 
     @property
     def name(self) -> str:
@@ -62,7 +64,7 @@ class LiteLLMProvider(ModelProvider):
         client = await self._get_client()
 
         body: dict[str, Any] = {
-            "model": request.model or "gpt-4o-mini",
+            "model": request.model or self.default_model,
             "messages": request.messages,
         }
         if request.tools:
@@ -94,7 +96,7 @@ class LiteLLMProvider(ModelProvider):
         client = await self._get_client()
 
         body: dict[str, Any] = {
-            "model": request.model or "gpt-4o-mini",
+            "model": request.model or self.default_model,
             "messages": request.messages,
             "stream": True,
         }

@@ -71,6 +71,8 @@ def _make_shell(workspace: Path):
     shell._event_bus = EventBus()
     shell._agent_loop = None
     shell._provider = _FakeProvider()
+    shell._shown_failovers = set()
+    shell._last_model_error = ""
     shell._router = MagicMock()
     shell._task_aware = None
     shell._tools = []

@@ -295,4 +295,9 @@ class TestProvidersList:
         assert result.exit_code == 0
         import json
         data = json.loads(result.output)
-        assert len(data) >= 2
+        names = [provider["name"] for provider in data]
+        # Provider-neutral registry: OpenRouter stays the default, but every
+        # configured adapter must be discoverable without source changes.
+        assert "openrouter" in names
+        assert "openai" in names and "anthropic" in names
+        assert len(names) >= 5

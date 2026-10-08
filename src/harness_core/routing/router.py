@@ -8,6 +8,7 @@ Supports multiple providers.
 
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
@@ -27,6 +28,7 @@ from harness_core.routing.scoring import (
     ScoringWeights,
     rank_models,
 )
+
 
 if TYPE_CHECKING:
     from harness_core.routing.task_aware import TaskAwareRouter
@@ -51,6 +53,7 @@ class RouterConfig:
 
     routing_mode: str = "auto"  # auto, free, best, fast, local, cheap
     prefer_free: bool = False
+    allow_paid_models: bool = False
     scoring_weights: ScoringWeights = field(default_factory=ScoringWeights)
     fallback: FallbackConfig = field(default_factory=FallbackConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
@@ -67,10 +70,15 @@ class RouterConfig:
         return cls(
             routing_mode=data.get("routing_mode", "auto"),
             prefer_free=data.get("prefer_free", False),
+            allow_paid_models=data.get("allow_paid_models", False),
             scoring_weights=ScoringWeights(**weights_data) if weights_data else ScoringWeights(),
             budget=BudgetConfig.from_dict(budget_data) if budget_data else BudgetConfig(),
             fallback=FallbackConfig(
                 max_fallback_models=fallback_data.get("max_fallback_models", 3),
+                model_attempt_timeout_seconds=fallback_data.get(
+                    "model_attempt_timeout_seconds", 90.0
+                ),
+                total_timeout_seconds=fallback_data.get("total_timeout_seconds", 120.0),
             ) if fallback_data else FallbackConfig(),
             max_fallback_chain=data.get("max_fallback_chain", 4),
         )
@@ -101,42 +109,83 @@ class ModelRouter:
             self.providers[p.name] = p
         self.config = config or RouterConfig()
         self.health = ModelHealthTracker()
+        self.event_bus = event_bus or EventBus()
         self.budget = BudgetManager(self.config.budget)
         self.fallback_engine = FallbackEngine(
             health_tracker=self.health,
             fallback_config=self.config.fallback,
+            event_bus=self.event_bus,
         )
-        self.event_bus = event_bus or EventBus()
         self.task_aware = task_aware
         self._model_cache: list[ModelInfo] = []
         self._last_refresh: float = 0.0
         self._routing_decisions: list[RoutingDecision] = []
+        self._discovery_errors: list[dict[str, str]] = []
+        self.current_model: str = ""
+        self.attempt_count: int = 0
+        self.failed_models_for_current_request: list[str] = []
+        self.failover_reason: str = ""
 
     async def refresh_models(self, force: bool = False) -> list[ModelInfo]:
-        """Discover models from all providers. Caches for 5 minutes."""
+        """Discover models from all providers. Caches for 5 minutes.
+
+        Discovery failures are recorded and never silently rewritten as
+        "the provider has zero models." Configured static models still merge
+        in so providers without live discovery keep working.
+        """
         now = time.time()
         if not force and self._model_cache and (now - self._last_refresh) < 300:
             return self._model_cache
 
         all_models: list[ModelInfo] = []
+        discovery_errors: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
         for name, provider in self.providers.items():
+            discovered = 0
             try:
                 models = await provider.list_models()
-                all_models.extend(models)
-            except Exception:
-                pass  # provider failure doesn't block routing
+                for model in models:
+                    key = (model.provider or name, model.id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    all_models.append(model)
+                    discovered += 1
+            except Exception as exc:
+                category = getattr(getattr(exc, "category", None), "value", None) or "unknown"
+                detail = str(exc)[:300]
+                discovery_errors.append({
+                    "provider": name,
+                    "category": str(category),
+                    "error": detail,
+                })
+                await self.event_bus.emit(Event(
+                    type="router.discovery_failed", source="model_router",
+                    data={"provider": name, "category": category, "error": detail},
+                ))
+            for model in getattr(provider, "configured_models", []) or []:
+                key = (model.provider or name, model.id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_models.append(model)
 
         # Enrich with health data
         for model in all_models:
             model.reliability = self.health.get_reliability(model.id)
 
         self._model_cache = all_models
+        self._discovery_errors = discovery_errors
         self._last_refresh = now
 
         await self.event_bus.emit(Event(
             type="router.models_refreshed",
             source="model_router",
-            data={"count": len(all_models), "providers": list(self.providers.keys())},
+            data={
+                "count": len(all_models),
+                "providers": list(self.providers.keys()),
+                "discovery_errors": len(discovery_errors),
+            },
         ))
 
         return all_models
@@ -154,10 +203,18 @@ class ModelRouter:
         filtered = []
         for m in models:
             # Must support tools if required
-            if ctx.requires_tools and not m.supports_tools:
+            if ctx.requires_tools and m.supports_tools is not True:
                 continue
             # Must support vision if required
-            if ctx.requires_vision and not m.supports_vision:
+            if ctx.requires_vision and m.supports_vision is not True:
+                continue
+            if ctx.requires_structured_output and m.supports_structured_output is not True:
+                continue
+            if ctx.requires_streaming and m.supports_streaming is not True:
+                continue
+            if ctx.requires_reasoning and m.supports_reasoning is not True:
+                continue
+            if ctx.estimated_context_tokens > 0 and m.context_window and m.context_window < ctx.estimated_context_tokens:
                 continue
             # Health is a hard constraint — skip unavailable models entirely
             health_state = self.health.get_state(m.id)
@@ -166,10 +223,12 @@ class ModelRouter:
             if not health_state.is_healthy:
                 continue
             # Free-only mode
-            if self.config.routing_mode == "free" and not m.is_free:
+            if ctx.routing_mode == "free" and not m.is_free:
+                continue
+            if not self.config.allow_paid_models and not m.is_free and not m.is_local:
                 continue
             # Local-only mode
-            if self.config.routing_mode == "local" and not m.is_local:
+            if ctx.routing_mode == "local" and not m.is_local:
                 continue
             filtered.append(m)
         return filtered
@@ -192,7 +251,7 @@ class ModelRouter:
                 break
 
         has_tools = bool(request.tools)
-        needs_vision = False
+        needs_vision = bool(request.metadata.get("requires_vision", False))
 
         # Determine prefer_free based on routing mode
         prefer_free = self.config.prefer_free or active_routing_mode == "free"
@@ -267,6 +326,9 @@ class ModelRouter:
             task_description=task_desc,
             requires_tools=has_tools,
             requires_vision=needs_vision,
+            requires_structured_output=bool(request.metadata.get("requires_structured_output", False)),
+            requires_streaming=bool(request.metadata.get("requires_streaming", False)),
+            requires_reasoning=bool(request.metadata.get("requires_reasoning", False)),
             estimated_context_tokens=est_tokens,
             prefer_free=prefer_free,
             routing_mode=active_routing_mode,
@@ -288,25 +350,71 @@ class ModelRouter:
     ) -> list[tuple[str, ModelProvider]]:
         """Select an ordered chain of (model_id, provider) for fallback.
 
-        Returns at least one model if any are available.
-        In free mode, uses OpenRouter's dynamic free-model router as primary,
-        with individual free models as fallback.
+        Returns compatible, healthy candidates from configured providers.
         """
         active_routing_mode = routing_mode_override or self.config.routing_mode
-        models = await self.refresh_models()
         ctx = self._build_scoring_context(request, active_routing_mode)
 
-        # ── Free mode: inject openrouter/free as primary ─────────────────
-        # OpenRouter's "openrouter/free" model dynamically selects from
-        # currently available free models with tool-calling support.
+        models = list(await self.refresh_models())
+        for provider in self.providers.values():
+            hints = provider.routing_hints(active_routing_mode)
+            if inspect.isawaitable(hints):
+                hints = await hints
+            if isinstance(hints, list):
+                models.extend(hints)
+        models = list({(model.provider, model.id): model for model in models}.values())
+
+        # ── Explicit Model Pinning ───────────────────────────────────────────
+        if ctx.user_selected_model:
+            target_id = ctx.user_selected_model
+            p: ModelProvider | None = None
+            if "::" in target_id:
+                prov_name, target_id = target_id.split("::", 1)
+                p = self.providers.get(prov_name.lower())
+            else:
+                # Prefer an exact catalog match (e.g. openrouter/free) before
+                # interpreting provider/model slash forms like groq/compound.
+                exact = [m for m in models if m.id == target_id]
+                if exact:
+                    p = self.providers.get(exact[0].provider)
+                elif "/" in target_id:
+                    prov_name, maybe_model = target_id.split("/", 1)
+                    if prov_name.lower() in self.providers:
+                        p = self.providers.get(prov_name.lower())
+                        target_id = maybe_model
+            if p is None:
+                matches = self._filter_models([m for m in models if m.id == target_id], ctx)
+                if len(matches) == 1:
+                    p = self.providers.get(matches[0].provider)
+            
+            if p:
+                await self.event_bus.emit(Event(
+                    type="routing.decision",
+                    source="model_router",
+                    data={
+                        "model": target_id,
+                        "provider": p.name,
+                        "score": 1.0,
+                        "mode": "pinned",
+                        "alternatives": [],
+                    },
+                ))
+                return [(target_id, p)]
+
+        # Provider routing hints are normalized ModelInfo candidates. Free
+        # routes and ordinary models follow the same health/capability checks.
         if active_routing_mode == "free":
-            return await self._build_free_chain(request, models)
+            return await self._build_free_chain(request, self._filter_models(models, ctx))
 
         # Filter
         filtered = self._filter_models(models, ctx)
         if not filtered:
             # Non-free fallback: use any model with tools support
-            filtered = [m for m in models if m.supports_tools]
+            filtered = [
+                m for m in models
+                if m.supports_tools is True
+                and (m.is_free or m.is_local or self.config.allow_paid_models)
+            ]
 
         # Score and rank
         ranked = rank_models(filtered, ctx, self.config.scoring_weights)
@@ -314,7 +422,7 @@ class ModelRouter:
         # Build chain
         chain: list[tuple[str, ModelProvider]] = []
         chain_models: list[ModelInfo] = []
-        chain_ids: set[str] = set()
+        chain_ids: set[tuple[str, str]] = set()
         primary_recorded = False
 
         def _record_primary(model: ModelInfo, score: float) -> None:
@@ -345,7 +453,8 @@ class ModelRouter:
 
         async def _try_add(model: ModelInfo, score: float) -> bool:
             nonlocal primary_recorded
-            if model.id in chain_ids:
+            key = (model.provider, model.id)
+            if key in chain_ids:
                 return False
             provider = self.providers.get(model.provider)
             if provider is None:
@@ -354,7 +463,7 @@ class ModelRouter:
             ok, _ = self.budget.check_model_limit(model.id)
             if not ok:
                 return False
-            chain_ids.add(model.id)
+            chain_ids.add(key)
             chain.append((model.id, provider))
             chain_models.append(model)
             if not primary_recorded:
@@ -384,7 +493,7 @@ class ModelRouter:
                         free_in_chain += 1
 
         if not chain:
-            if self.config.routing_mode == "free":
+            if active_routing_mode == "free":
                 # In free mode: DO NOT fall back to paid models
                 # Return empty chain
                 return []
@@ -392,7 +501,7 @@ class ModelRouter:
             for name, provider in self.providers.items():
                 try:
                     models_list = await provider.list_models()
-                    tool_models = [m for m in models_list if m.supports_tools]
+                    tool_models = [m for m in models_list if m.supports_tools is True and (m.is_free or m.is_local or self.config.allow_paid_models)]
                     if tool_models:
                         chain.append((tool_models[0].id, provider))
                         break
@@ -406,67 +515,37 @@ class ModelRouter:
         request: CompletionRequest,
         models: list[ModelInfo],
     ) -> list[tuple[str, ModelProvider]]:
-        """Build a free-model fallback chain.
-
-        Primary: "openrouter/free" — OpenRouter's dynamic free-model router.
-        Fallback: individual free models with tool-calling support.
-        """
+        """Build a provider-neutral chain from discovered free model metadata."""
+        free_models = [m for m in models if m.is_free and m.supports_tools is True]
+        # Concrete free models first; provider dynamic routes (e.g. openrouter/free) last.
+        free_models.sort(key=lambda model: (
+            "dynamic-route" in model.tags,
+            -model.context_window,
+            model.provider,
+            model.id,
+        ))
         chain: list[tuple[str, ModelProvider]] = []
-        chain_ids: set[str] = set()
-        provider = self.providers.get("openrouter")
-
-        # 1. Primary: openrouter/free (dynamic free-model router)
-        # Only add if the openrouter provider is available AND has a valid key
-        if provider is not None and getattr(provider, "api_key", ""):
-            chain.append(("openrouter/free", provider))
-            chain_ids.add("openrouter/free")
-            await self.event_bus.emit(Event(
-                type="routing.decision",
-                source="model_router",
-                data={
-                    "model": "openrouter/free",
-                    "provider": "openrouter",
-                    "score": 1.0,
-                    "mode": "free",
-                    "alternatives": [],
-                },
+        seen: set[tuple[str, str]] = set()
+        for model in free_models[: self.config.max_fallback_chain]:
+            provider = self.providers.get(model.provider)
+            if provider is None or (model.provider, model.id) in seen:
+                continue
+            if not self.health.get_state(model.id).is_healthy:
+                continue
+            seen.add((model.provider, model.id))
+            chain.append((model.id, provider))
+        if chain:
+            first_model, first_provider = chain[0]
+            self._routing_decisions.append(RoutingDecision(
+                selected_model=first_model, selected_provider=first_provider.name,
+                score=1.0, routing_mode="free",
             ))
-
-        # 2. Fallback: individual free models with tool support
-        free_models = [
-            m for m in models
-            if m.is_free and m.supports_tools and m.id not in chain_ids
-        ]
-        # Sort by context window (bigger is better for coding tasks)
-        free_models.sort(key=lambda m: m.context_window, reverse=True)
-
-        recorded_decision = bool(chain)  # already recorded if openrouter/free was added
-        for model in free_models[:3]:  # Max 3 fallbacks
-            p = self.providers.get(model.provider)
-            if p is not None:
-                chain.append((model.id, p))
-                chain_ids.add(model.id)
-                # Record decision for the first model in chain
-                if not recorded_decision:
-                    recorded_decision = True
-                    self._routing_decisions.append(RoutingDecision(
-                        selected_model=model.id,
-                        selected_provider=model.provider,
-                        score=1.0,
-                        routing_mode="free",
-                    ))
-                    await self.event_bus.emit(Event(
-                        type="routing.decision",
-                        source="model_router",
-                        data={
-                            "model": model.id,
-                            "provider": model.provider,
-                            "score": 1.0,
-                            "mode": "free",
-                            "alternatives": [],
-                        },
-                    ))
-
+            await self.event_bus.emit(Event(
+                type="routing.decision", source="model_router",
+                data={"model": first_model, "provider": first_provider.name,
+                      "score": 1.0, "mode": "free",
+                      "alternatives": [{"model": model, "provider": provider.name} for model, provider in chain[1:]]},
+            ))
         return chain
 
     async def execute(
@@ -490,24 +569,66 @@ class ModelRouter:
 
         chain = await self.select_models(request, routing_mode_override)
         if not chain:
+            if self._discovery_errors and not self._model_cache:
+                details = "; ".join(
+                    f"{item['provider']}: {item.get('error') or item.get('category', 'discovery failed')}"
+                    for item in self._discovery_errors
+                )
+                return FallbackResult(
+                    final_error=(
+                        "Model discovery failed and no configured models are available. "
+                        f"{details}"
+                    ),
+                    error_category="provider",
+                )
             if active_routing_mode == "free":
                 return FallbackResult(
                     final_error=(
-                        "No usable free model available. "
-                        "Harness could not find an available free model for this task. "
-                        "Options: /models, disable free mode, configure another provider, or start Ollama."
+                        "No configured free model is currently available. "
+                        "No paid model was used. "
+                        "Check /models, wait for cooldowns, or disable free mode."
                     )
                 )
             return FallbackResult(final_error="No available models")
 
+        self.current_model = chain[0][0]
+        self.attempt_count = 0
+        self.failed_models_for_current_request = []
+        self.failover_reason = ""
         result = await self.fallback_engine.execute(request, chain)
+        self.attempt_count = result.attempt_count
+        self.failed_models_for_current_request = list(dict.fromkeys(
+            attempt["model"] for attempt in result.attempts
+            if attempt.get("status") == "error"
+        ))
+        for attempt in reversed(result.attempts):
+            if attempt.get("status") == "error":
+                self.failover_reason = str(attempt.get("classification", ""))
+                break
+        if result.succeeded:
+            self.current_model = result.model_used
 
         # Record budget usage
         if result.succeeded and result.response:
-            usage = result.response.usage
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
-            self.budget.record_tokens(input_tokens, output_tokens, result.model_used)
+            usage = result.response.token_usage
+            if usage is not None:
+                self.budget.record_tokens(
+                    usage.input_tokens or 0,
+                    usage.output_tokens or 0,
+                    result.model_used,
+                )
+                if self.event_bus:
+                    from harness_core.observability.events import Event
+                    import asyncio
+                    asyncio.create_task(self.event_bus.emit(Event(
+                        type="model.usage",
+                        source="model_router",
+                        data={
+                            "input_tokens": usage.input_tokens or 0,
+                            "output_tokens": usage.output_tokens or 0,
+                            "total_tokens": usage.total_tokens or ((usage.input_tokens or 0) + (usage.output_tokens or 0)),
+                        }
+                    )))
 
         return result
 

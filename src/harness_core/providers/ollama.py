@@ -18,8 +18,9 @@ from harness_core.providers.base import (
 class OllamaProvider(ModelProvider):
     """Ollama local inference provider."""
 
-    def __init__(self, base_url: str | None = None) -> None:
+    def __init__(self, base_url: str | None = None, default_model: str | None = None) -> None:
         self.base_url = base_url or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        self.default_model = default_model or "llama3.1"
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -38,7 +39,7 @@ class OllamaProvider(ModelProvider):
         client = await self._get_client()
 
         body: dict[str, Any] = {
-            "model": request.model or "llama3.1",
+            "model": request.model or self.default_model,
             "messages": request.messages,
             "stream": False,
         }
@@ -68,7 +69,7 @@ class OllamaProvider(ModelProvider):
         client = await self._get_client()
 
         body: dict[str, Any] = {
-            "model": request.model or "llama3.1",
+            "model": request.model or self.default_model,
             "messages": request.messages,
             "stream": True,
         }

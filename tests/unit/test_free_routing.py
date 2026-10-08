@@ -243,11 +243,11 @@ class TestFreeModeFiltering:
         assert all(m.is_free for m in filtered)
 
     def test_normal_mode_includes_all_models(self):
-        """In normal mode, both free and paid models are available."""
+        """When paid models are explicitly allowed, free and paid both pass."""
         from harness_core.routing.router import ModelRouter, RouterConfig
         from harness_core.routing.scoring import ScoringContext
 
-        router = ModelRouter(config=RouterConfig(routing_mode="auto"))
+        router = ModelRouter(config=RouterConfig(routing_mode="auto", allow_paid_models=True))
         models = [
             self._make_model("free-model-a", is_free=True),
             self._make_model("paid-model-b", is_free=False),
@@ -256,6 +256,19 @@ class TestFreeModeFiltering:
         filtered = router._filter_models(models, ctx)
 
         assert len(filtered) == 2
+
+    def test_auto_mode_excludes_paid_without_opt_in(self):
+        """Paid models stay excluded unless allow_paid_models is enabled."""
+        from harness_core.routing.router import ModelRouter, RouterConfig
+        from harness_core.routing.scoring import ScoringContext
+
+        router = ModelRouter(config=RouterConfig(routing_mode="auto", allow_paid_models=False))
+        models = [
+            self._make_model("free-model-a", is_free=True),
+            self._make_model("paid-model-b", is_free=False),
+        ]
+        filtered = router._filter_models(models, ScoringContext(requires_tools=True))
+        assert [m.id for m in filtered] == ["free-model-a"]
 
     def test_free_mode_excludes_unavailable_models(self):
         """In free mode, unavailable models are also excluded."""
@@ -314,7 +327,7 @@ class TestFreeModeSelectModels:
             providers=[provider],
             config=RouterConfig(routing_mode="free"),
         )
-        # Mock refresh_models to return only paid models
+        # Seed only paid models; no routing hints on FakeProvider.
         router._model_cache = [
             ModelInfo(id="paid-a", name="paid-a", provider="openrouter",
                       supports_tools=True, is_free=False),
@@ -329,7 +342,7 @@ class TestFreeModeSelectModels:
 
     @pytest.mark.asyncio
     async def test_free_mode_returns_free_models(self):
-        """When free models exist, free mode returns them."""
+        """When free models exist in the catalog, free mode returns them."""
         from harness_core.routing.router import ModelRouter, RouterConfig
 
         provider = FakeProvider("openrouter")
@@ -339,20 +352,27 @@ class TestFreeModeSelectModels:
             config=RouterConfig(routing_mode="free"),
         )
         router._model_cache = [
-            ModelInfo(id="free-a", name="free-a", provider="openrouter",
-                      supports_tools=True, is_free=True, context_window=32000),
+            ModelInfo(
+                id="vendor/free-a", name="free-a", provider="openrouter",
+                supports_tools=True, is_free=True, context_window=32000,
+            ),
+            ModelInfo(
+                id="vendor/free-b", name="free-b", provider="openrouter",
+                supports_tools=True, is_free=True, context_window=16000,
+            ),
+            ModelInfo(
+                id="vendor/paid", name="paid", provider="openrouter",
+                supports_tools=True, is_free=False, context_window=100000,
+            ),
         ]
         import time
-        router._last_refresh = time.time() + 300  # far in the future so cache is valid
-
-        # Mock the provider to be in the router's providers dict
-        router.providers = {"openrouter": provider}
+        router._last_refresh = time.time() + 300
 
         request = CompletionRequest(messages=[{"role": "user", "content": "Hello"}])
         chain = await router.select_models(request)
 
-        assert len(chain) == 1
-        assert chain[0][0] == "free-a"
+        assert [model_id for model_id, _ in chain] == ["vendor/free-a", "vendor/free-b"]
+        assert all(provider_ref is provider for _, provider_ref in chain)
 
     @pytest.mark.asyncio
     async def test_free_mode_execute_returns_clear_error(self):
@@ -373,4 +393,5 @@ class TestFreeModeSelectModels:
         result = await router.execute(request)
 
         assert result.succeeded is False
-        assert "No usable free model available" in result.final_error
+        assert "No configured free model is currently available" in (result.final_error or "")
+        assert "No paid model was used" in (result.final_error or "")

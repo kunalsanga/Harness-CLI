@@ -29,7 +29,8 @@ class TestModelProfile:
         assert p.model_id == "test-model"
         assert p.provider == "test"
         assert p.display_name == "test-model"
-        assert p.supports_tools is False
+        # Capabilities are tri-state: None means unknown, never treated as false.
+        assert p.supports_tools is None
         assert p.is_free is False
 
     def test_capability_profile_average(self):

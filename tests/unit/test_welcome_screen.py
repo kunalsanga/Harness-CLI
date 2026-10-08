@@ -14,6 +14,7 @@ class TestWelcomeScreenProviderState:
 
     def _make_shell(self, provider=None, router=None, model="", provider_name="") -> InteractiveShell:
         """Create a shell with mocked state."""
+        from rich.console import Console
         shell = InteractiveShell.__new__(InteractiveShell)
         shell.model = None
         shell.mode = "auto"
@@ -23,7 +24,8 @@ class TestWelcomeScreenProviderState:
         shell.max_iterations = 30
         shell.max_cost = None
         shell.workspace = "/tmp/test"
-        shell.console = MagicMock()
+        shell.out_io = StringIO()
+        shell.console = Console(file=shell.out_io, force_terminal=True, width=150)
         shell.session_id = None
         shell.session_manager = None
         shell.current_model = model
@@ -45,30 +47,27 @@ class TestWelcomeScreenProviderState:
         """Welcome screen should show the project name derived from workspace."""
         shell = self._make_shell(provider=MagicMock(), router=MagicMock())
         shell._print_welcome()
-
-        calls = shell.console.print.call_args_list
-        # Should show 'Harness' and project name
-        harness_calls = [c for c in calls if "Harness" in str(c)]
-        project_calls = [c for c in calls if "test" in str(c)]
-        assert len(harness_calls) > 0, "Should show 'Harness'"
-        assert len(project_calls) > 0, "Should show project name"
+        
+        output = shell.out_io.getvalue().upper()
+        assert "HARNESS" in output, "Should show 'Harness'"
+        assert "TEST" in output, "Should show project name"
 
     def test_welcome_no_verbose_chrome(self):
         """Welcome screen should NOT show verbose chrome."""
         shell = self._make_shell(provider=MagicMock(), router=MagicMock())
         shell._print_welcome()
+        
+        output = shell.out_io.getvalue().lower()
 
-        calls = shell.console.print.call_args_list
-        # Should NOT show verbose info
-        verbose_calls = [c for c in calls if any(k in str(c) for k in ("Provider:", "Model:", "Routing:", "Ready.", "connected", "─"))]
-        assert len(verbose_calls) == 0, f"Should NOT show verbose chrome, got: {verbose_calls}"
+        # Should NOT show verbose info (but we DO use "─" for the logo so don't assert against it)
+        for k in ("provider:", "model:", "routing:", "ready.", "connected"):
+            assert k not in output, f"Should NOT show verbose chrome, got: {k}"
 
     def test_welcome_never_shows_stale_provider_state(self):
         """Welcome screen must not show stale state like 'No provider' when provider is connected."""
         shell = self._make_shell(provider=MagicMock(), router=MagicMock())
         shell._print_welcome()
 
-        calls = shell.console.print.call_args_list
+        output = shell.out_io.getvalue().lower()
         # Should NOT show "No provider connected" when we have a provider
-        stale_calls = [c for c in calls if "No provider connected" in str(c)]
-        assert len(stale_calls) == 0, "Should NOT show 'No provider connected' when provider is available"
+        assert "no provider connected" not in output, "Should NOT show 'No provider connected' when provider is available"

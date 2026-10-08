@@ -1,10 +1,13 @@
 # Troubleshooting
 
+> Current task execution uses OpenRouter. Ollama is not an active fallback in
+> the normal interactive runtime.
+
 ## Common Issues
 
 ### "No model provider configured"
 
-**Cause:** No API key set or provider not running.
+**Cause:** The OpenRouter API key is missing or the service cannot be reached.
 
 **Fix:**
 ```bash
@@ -12,10 +15,6 @@
 export OPENROUTER_API_KEY="sk-or-v1-..."
 harness doctor
 
-# Option 2: Ollama
-ollama serve
-ollama pull codellama
-harness doctor
 ```
 
 ### "Rate limited (429)"
@@ -25,7 +24,8 @@ harness doctor
 **Fix:**
 - Wait a minute and retry
 - Use a different model
-- Use Ollama for unlimited local inference
+- Use the configured free-model failover; local providers are not activated by
+  the current normal task runtime.
 
 ### "Provider connection failed"
 

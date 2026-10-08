@@ -91,6 +91,8 @@ class ScoringContext:
     requires_tools: bool = True
     requires_vision: bool = False
     requires_structured_output: bool = False
+    requires_streaming: bool = False
+    requires_reasoning: bool = False
     estimated_context_tokens: int = 4096
     prefer_free: bool = False
     routing_mode: str = "auto"
@@ -171,10 +173,18 @@ def score_task_fit(model: ModelInfo, ctx: ScoringContext) -> float:
 
 
 def score_tool_support(model: ModelInfo, ctx: ScoringContext) -> float:
-    """Score based on tool/function-calling support."""
+    """Score based on tool/function-calling support.
+
+    Unknown capability must stay neutral — never treat None as False.
+    Hard filtering elsewhere already excludes known incompatibilities.
+    """
     if not ctx.requires_tools:
         return 1.0  # doesn't matter
-    return 1.0 if model.supports_tools else 0.0
+    if model.supports_tools is True:
+        return 1.0
+    if model.supports_tools is False:
+        return 0.0
+    return 0.5
 
 
 def score_context_fit(model: ModelInfo, ctx: ScoringContext) -> float:

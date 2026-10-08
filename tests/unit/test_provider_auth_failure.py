@@ -83,8 +83,8 @@ class TestModelLevelFailureDetection:
     """Test that model-level auth failures are handled correctly."""
 
     @pytest.mark.asyncio
-    async def test_403_marks_only_that_model_unavailable(self):
-        """When one model returns 403, only that model is marked unavailable."""
+    async def test_403_shared_credential_failure_stops_model_rotation(self):
+        """A shared OpenRouter access failure must not rotate model IDs."""
         engine = FallbackEngine(
             fallback_config=FallbackConfig(retry=RetryConfig(max_retries=0))
         )
@@ -109,14 +109,13 @@ class TestModelLevelFailureDetection:
 
         result = await engine.execute(request, chain)
 
-        assert result.succeeded is True
-        assert result.model_used == "model-b"
-        # Both models were attempted
-        assert call_count == 2
+        assert result.succeeded is False
+        assert "OPENROUTER_API_KEY" in result.final_error
+        assert call_count == 1
 
     @pytest.mark.asyncio
-    async def test_401_marks_only_that_model_unavailable(self):
-        """401 Unauthorized marks only the specific model as unavailable."""
+    async def test_401_shared_credential_failure_stops_model_rotation(self):
+        """401 Unauthorized is a configuration failure, not model failover."""
         engine = FallbackEngine(
             fallback_config=FallbackConfig(retry=RetryConfig(max_retries=0))
         )
@@ -137,8 +136,8 @@ class TestModelLevelFailureDetection:
 
         result = await engine.execute(request, chain)
 
-        assert result.succeeded is True
-        assert result.model_used == "model-b"
+        assert result.succeeded is False
+        assert "OPENROUTER_API_KEY" in result.final_error
 
     @pytest.mark.asyncio
     async def test_failed_model_excluded_from_subsequent_requests(self):
@@ -155,11 +154,11 @@ class TestModelLevelFailureDetection:
 
         provider._generate_fn = _generate
 
-        # First request: bad-model fails, good-model succeeds
+        # First request stops on the shared credential/access failure.
         request = CompletionRequest(messages=[{"role": "user", "content": "Hello"}])
         chain1 = [("bad-model", provider), ("good-model", provider)]
         result1 = await engine.execute(request, chain1)
-        assert result1.succeeded is True
+        assert result1.succeeded is False
 
         # Second request: bad-model should be skipped automatically
         chain2 = [("bad-model", provider), ("good-model", provider)]
@@ -172,8 +171,8 @@ class TestModelLevelFailureDetection:
         assert bad_skipped[0]["status"] == "skipped"
 
     @pytest.mark.asyncio
-    async def test_same_provider_other_models_still_tried(self):
-        """Auth failure on one OpenRouter model does NOT block other OpenRouter models."""
+    async def test_auth_failure_does_not_try_another_model(self):
+        """A shared provider credential failure stops before a second model."""
         engine = FallbackEngine(
             fallback_config=FallbackConfig(retry=RetryConfig(max_retries=0))
         )
@@ -198,10 +197,9 @@ class TestModelLevelFailureDetection:
 
         result = await engine.execute(request, chain)
 
-        assert result.succeeded is True
-        assert result.model_used == "z-ai/glm-5.3-flash"
-        # Both models were attempted
-        assert call_count == 2
+        assert result.succeeded is False
+        assert "OPENROUTER_API_KEY" in result.final_error
+        assert call_count == 1
 
     @pytest.mark.asyncio
     async def test_rate_limit_does_not_mark_model_unavailable(self):

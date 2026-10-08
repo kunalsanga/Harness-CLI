@@ -1,5 +1,10 @@
 # 1. Executive Summary
 
+> **Historical forensic snapshot.** Findings below describe an earlier
+> checkout and may no longer apply. Use
+> [`.agent-context/CURRENT_STATE.md`](../.agent-context/CURRENT_STATE.md) for
+> verified current state.
+
 The current behavior of the `harness` CLI for informational tasks (like "explain this project") is severely degraded by competing architectural boundaries and unhandled fallback cascades. When the user executes `uv run harness "explain this project"`, the CLI incorrectly renders duplicate prompts and thinking states, executes an isolated intent workflow that aborts unexpectedly on a 402 provider failure, and emits a contradictory status matrix to the user interface combining "Failed" with "Task ended with status: paused".
 
 This forensic audit has identified the exact causes of these bugs without modifying code. The primary problem lies in the integration layer between `InteractiveShell` (which handles UI orchestration), the `ConversationRenderer` (which draws the UI), and the `AgentLoop` (which executes logic). Events are double-bound, models are failing hard, and task status enums are mapped inconsistently to the final user completion formatter.

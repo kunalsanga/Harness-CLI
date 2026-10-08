@@ -13,7 +13,14 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 import httpx
 
-from harness_core.providers.base import CompletionRequest, CompletionResponse, ModelInfo, ModelProvider
+from harness_core.providers.base import (
+    CompletionRequest,
+    CompletionResponse,
+    ModelInfo,
+    ModelProvider,
+    ProviderErrorCategory,
+    ProviderRequestError,
+)
 from harness_core.providers.openrouter import OpenRouterProvider
 from harness_core.routing.fallback import FallbackEngine, FallbackConfig, RetryConfig, classify_error, ErrorClassification
 from harness_core.routing.health import HealthEvent, ModelHealthTracker
@@ -95,13 +102,14 @@ async def test_401_preserved_with_model_id_and_no_secret():
     client.post = AsyncMock(side_effect=exc)
     client.timeout = MagicMock(read=120)
     p._get_client = AsyncMock(return_value=client)
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(ProviderRequestError) as ei:
         await p.generate(CompletionRequest(messages=[{"role":"user","content":"hi"}], model="openrouter/auto"))
-    msg = str(ei.value)
-    assert "401" in msg
-    assert "openrouter/auto" in msg
-    assert "sk-or-" not in msg
-    assert "secret" not in msg.lower()
+    err = ei.value
+    assert err.category == ProviderErrorCategory.AUTHENTICATION
+    assert err.status_code == 401
+    assert err.model == "openrouter/auto"
+    assert "sk-or-" not in str(err)
+    assert "secret" not in str(err).lower()
 
 @pytest.mark.asyncio
 async def test_429_preserved():
@@ -110,9 +118,11 @@ async def test_429_preserved():
     exc = httpx.HTTPStatusError("429", request=err_resp.request, response=err_resp)
     client = AsyncMock(); client.post = AsyncMock(side_effect=exc); client.timeout = MagicMock(read=120)
     p._get_client = AsyncMock(return_value=client)
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(ProviderRequestError) as ei:
         await p.generate(_req())
-    assert "429" in str(ei.value)
+    assert ei.value.category == ProviderErrorCategory.RATE_LIMIT
+    assert ei.value.status_code == 429
+    assert "Rate limited" in str(ei.value)
 
 @pytest.mark.asyncio
 async def test_400_invalid_request_preserved():
@@ -121,9 +131,10 @@ async def test_400_invalid_request_preserved():
     exc = httpx.HTTPStatusError("400", request=err_resp.request, response=err_resp)
     client = AsyncMock(); client.post = AsyncMock(side_effect=exc); client.timeout = MagicMock(read=120)
     p._get_client = AsyncMock(return_value=client)
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(ProviderRequestError) as ei:
         await p.generate(_req(with_tools=True))
-    assert "400" in str(ei.value)
+    assert ei.value.category == ProviderErrorCategory.INVALID_REQUEST
+    assert ei.value.status_code == 400
     assert "Invalid tool" in str(ei.value)
 
 @pytest.mark.asyncio
@@ -133,9 +144,10 @@ async def test_404_model_unavailable():
     exc = httpx.HTTPStatusError("404", request=err_resp.request, response=err_resp)
     client = AsyncMock(); client.post = AsyncMock(side_effect=exc); client.timeout = MagicMock(read=120)
     p._get_client = AsyncMock(return_value=client)
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(ProviderRequestError) as ei:
         await p.generate(CompletionRequest(messages=[{"role":"user","content":"hi"}], model="not-a-model"))
-    assert "404" in str(ei.value)
+    assert ei.value.category == ProviderErrorCategory.MODEL_UNAVAILABLE
+    assert ei.value.status_code == 404
 
 @pytest.mark.asyncio
 async def test_5xx_and_timeout_network():
@@ -153,8 +165,9 @@ async def test_malformed_provider_response_raises_typed():
     bad.raise_for_status = MagicMock()
     client = AsyncMock(); client.post = AsyncMock(return_value=bad); client.timeout = MagicMock(read=120)
     p._get_client = AsyncMock(return_value=client)
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(ProviderRequestError) as ei:
         await p.generate(_req())
+    assert ei.value.category == ProviderErrorCategory.PROVIDER
     assert "invalid response" in str(ei.value).lower()
 
 @pytest.mark.asyncio
@@ -193,10 +206,13 @@ async def test_fallback_never_unknown_when_all_skipped():
     res = await engine.execute(_req(), chain)
     assert not res.succeeded
     assert "unknown" not in res.final_error.lower()
-    assert "skipped" in res.final_error.lower()
+    # Fail-fast summary names each candidate with its health status
+    # (auth-failed models show as unavailable, no cooldown).
+    assert "No configured free model is currently available" in res.final_error
+    assert "m1" in res.final_error and "m2" in res.final_error
 
 @pytest.mark.asyncio
-async def test_fallback_per_model_429_400_404_preserved():
+async def test_fallback_stops_after_nontransient_bad_request():
     engine = FallbackEngine(fallback_config=FallbackConfig(retry=RetryConfig(max_retries=0)))
     p = FakeProvider("openrouter")
     async def _gen(r):
@@ -206,7 +222,7 @@ async def test_fallback_per_model_429_400_404_preserved():
         return CompletionResponse(content="ok")
     p._fn = _gen
     chain = [("m-a", p), ("m-b", p), ("m-c", p), ("m-d", p)]
-    # m-d also fails with 500 to have a last error
+    # Later models must not be queried after a malformed request response.
     orig = p._fn
     async def _gen2(r):
         if r.model == "m-d": raise Exception("500 Internal Server Error")
@@ -215,10 +231,8 @@ async def test_fallback_per_model_429_400_404_preserved():
     res = await engine.execute(_req(), chain)
     assert not res.succeeded
     assert "unknown" not in res.final_error.lower()
-    # Should contain per-model breakdown or status codes
-    low = res.final_error.lower()
-    assert "429" in res.final_error or "rate limit" in low
-    assert any("400" in a.get("error","") or "500" in a.get("error","") for a in res.attempts if a.get("status")=="error")
+    assert [a["model"] for a in res.attempts if a.get("status") == "error"] == ["m-a", "m-b"]
+    assert "400" in res.final_error
 
 @pytest.mark.asyncio
 async def test_fallback_empty_message_not_unknown():
@@ -238,6 +252,32 @@ async def test_no_secret_in_final_error():
     res = await engine.execute(_req(), [("m1", p)])
     assert "sk-or" not in res.final_error
     assert "Authorization" not in res.final_error
+
+
+# ── Auth final_error keeps the numeric status under UI truncation ──────
+
+@pytest.mark.asyncio
+async def test_auth_final_error_status_survives_truncation():
+    """401 vs 403 must be distinguishable even after the runtime/UI truncates
+    the diagnostic (first-line or 120-char truncation)."""
+    from harness_core.cli.interactive import _friendly_model_error
+
+    for status, keyword in ((401, "Unauthorized"), (403, "Forbidden")):
+        engine = FallbackEngine(fallback_config=FallbackConfig(retry=RetryConfig(max_retries=0)))
+        p = FakeProvider("openrouter")
+        p._fn = AsyncMock(side_effect=Exception(
+            f"OpenRouter {status} {keyword}. (model=google/gemma-4-26b-a4b-it:free)"
+        ))
+        res = await engine.execute(_req(), [("gemma-26b", p)])
+        assert not res.succeeded
+        diag = res.final_error or ""
+        # The raw provider status must appear before any truncation point.
+        assert str(status) in diag[:120], diag
+        # Friendly message must classify from the numeric status, not the phrase.
+        assert _friendly_model_error(diag[:120]) == (
+            "Provider authentication failed. Check the configured provider credential." if status == 401
+            else "Provider access was denied. Check credential permissions and model access."
+        )
 
 # ── Classifier & orchestrator: provider failures not UNKNOWN ──────────
 

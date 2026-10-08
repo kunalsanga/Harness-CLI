@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "items": [
+    {
+      "title": "Audit repository context, worktree, and runtime architecture",
+      "status": "in-progress"
+    },
+    {
+      "title": "Identify highest-priority missing production capability",
+      "status": "pending"
+    },
+    {
+      "title": "Implement the smallest compatible improvement with tests",
+      "status": "pending"
+    },
+    {
+      "title": "Run focused and broader validation",
+      "status": "pending"
+    },
+    {
+      "title": "Summarize audit findings and implementation roadmap",
+      "status": "pending"
+    }
+  ],
+  "updated_at": "2026-09-30T07:41:08.901Z",
+  "session_id": "01a0f136-ff13-7707-92bf-ac368c27a194"
+}

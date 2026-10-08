@@ -23,25 +23,36 @@ class RuntimeStage(enum.Enum):
     """The explicit project execution lifecycle.
 
     Not every stage must run for every project: the runtime advances through
-    the stages its TaskGraph actually exercises.
+    the stages its TaskGraph actually exercises. The TUI renders these
+    as semantic progress indicators.
     """
 
     UNKNOWN = "unknown"
-    DISCOVER = "discover"
-    UNDERSTAND = "understand"
-    PLAN = "plan"
+    UNDERSTANDING = "understanding"    # intent classification + context
+    DISCOVER = "discover"              # repository discovery
+    UNDERSTAND = "understand"          # requirements structured
+    PLAN = "plan"                      # planning / decomposition
     DESIGN = "design"
     DECOMPOSE = "decompose"
-    EXECUTE = "execute"
-    INTEGRATE = "integrate"
-    TEST = "test"
-    DEBUG = "debug"
-    REVIEW = "review"
-    VERIFY = "verify"
-    DELIVER = "deliver"
+    DELEGATING = "delegating"          # multi-agent delegation
+    EXECUTE = "execute"                # active execution
+    IMPLEMENTING = "implementing"      # code writing / modification
+    TESTING = "testing"                # running tests
+    DIAGNOSING = "diagnosing"          # failure diagnosis
+    FIXING = "fixing"                  # applying repairs
+    INTEGRATE = "integrate"            # component integration
+    TEST = "test"                      # test stage (legacy alias)
+    DEBUG = "debug"                    # debugging stage (legacy alias)
+    REVIEW = "review"                  # code review
+    VERIFY = "verify"                  # verification
+    COMMITTING = "committing"          # git commit
+    DEPLOYING = "deploying"            # deployment
+    DELIVER = "deliver"                # delivery / handoff
+    COMPLETE = "complete"              # terminal success
+    PAUSED = "paused"
+    FAILED = "failed"                  # terminal failure
     # Terminal outcomes (not traversable forward stages):
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
+    SUCCEEDED = "succeeded"            # terminal success (legacy)
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
 
@@ -49,18 +60,27 @@ class RuntimeStage(enum.Enum):
 # Ordered stages used to derive stage transitions for state snapshots.
 _STAGE_ORDER: list[RuntimeStage] = [
     RuntimeStage.UNKNOWN,
+    RuntimeStage.UNDERSTANDING,
     RuntimeStage.DISCOVER,
     RuntimeStage.UNDERSTAND,
     RuntimeStage.PLAN,
     RuntimeStage.DESIGN,
     RuntimeStage.DECOMPOSE,
+    RuntimeStage.DELEGATING,
     RuntimeStage.EXECUTE,
+    RuntimeStage.IMPLEMENTING,
+    RuntimeStage.TESTING,
+    RuntimeStage.DIAGNOSING,
+    RuntimeStage.FIXING,
     RuntimeStage.INTEGRATE,
     RuntimeStage.TEST,
     RuntimeStage.DEBUG,
     RuntimeStage.REVIEW,
     RuntimeStage.VERIFY,
+    RuntimeStage.COMMITTING,
+    RuntimeStage.DEPLOYING,
     RuntimeStage.DELIVER,
+    RuntimeStage.COMPLETE,
 ]
 
 
@@ -190,6 +210,10 @@ class ProjectState:
     verification_summary: str = ""
     verification_results: list[dict[str, Any]] = field(default_factory=list)
     failed_task_ids: list[str] = field(default_factory=list)
+
+    # TaskContract — the single source of truth for what this task requires.
+    # Set by classify_request() at the start of execution.
+    task_contract: Any = None  # TaskContract | None (Any to avoid circular import)
 
     # ── stage transitions ────────────────────────────────────────────────
 

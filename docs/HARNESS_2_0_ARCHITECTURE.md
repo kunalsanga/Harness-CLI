@@ -1,5 +1,11 @@
 # HARNESS 2.0 — Forensic Architecture Audit
 
+> **Historical audit snapshot (2026-09-13), not current implementation truth.**
+> Several findings below have since changed, including native Python fallback
+> and active runtime wiring. Use
+> [`.agent-context/ARCHITECTURE.md`](../.agent-context/ARCHITECTURE.md) for the
+> current path; retain this file as historical audit evidence.
+
 **Date:** September 13, 2026
 **Purpose:** Complete repository mapping before any implementation work
 **Status:** AUDIT COMPLETE — DO NOT MODIFY FILES UNTIL REVIEWED

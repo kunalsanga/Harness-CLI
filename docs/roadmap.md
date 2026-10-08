@@ -1,5 +1,8 @@
 # Harness Engineering CLI — Roadmap
 
+> Historical milestone record and aspirational roadmap. For current verified
+> status and priorities, use [`.agent-context/ROADMAP.md`](../.agent-context/ROADMAP.md).
+
 ## Milestones
 
 ### M1 — Core Agent Engine ✅ COMPLETE

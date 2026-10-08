@@ -28,6 +28,100 @@ class TaskStatus(Enum):
     PAUSED = "paused"
 
 
+class ExecutionState(Enum):
+    """Canonical user-facing lifecycle state for one task."""
+
+    IDLE = "idle"
+    UNDERSTANDING = "understanding"
+    PLANNING = "planning"
+    THINKING = "thinking"
+    WORKING = "working"
+    REPAIRING = "repairing"
+    VERIFYING = "verifying"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    PAUSED = "paused"
+
+
+@dataclass
+class TaskExecutionTimeline:
+    """Monotonic wall-clock accounting for a single task.
+
+    Phase durations are exclusive wall-clock intervals. Model and tool time
+    are nested diagnostics and are never added to phase or task elapsed time.
+    """
+
+    state: ExecutionState = ExecutionState.IDLE
+    started_at: float | None = None
+    finished_at: float | None = None
+    transitioned_at: float | None = None
+    phase_durations: dict[str, float] = field(default_factory=dict)
+    model_attempt_duration: float = 0.0
+    tool_duration: float = 0.0
+    _phase_started_at: float | None = field(default=None, repr=False)
+
+    @property
+    def elapsed(self) -> float:
+        if self.started_at is None:
+            return 0.0
+        end = self.finished_at if self.finished_at is not None else time.monotonic()
+        return max(0.0, end - self.started_at)
+
+    def transition(self, state: ExecutionState, at: float | None = None) -> bool:
+        now = time.monotonic() if at is None else at
+        if self.state == state:
+            return False
+        if self.state in {
+            ExecutionState.COMPLETED, ExecutionState.FAILED,
+            ExecutionState.CANCELLED, ExecutionState.PAUSED,
+        }:
+            return False
+        if self.started_at is None:
+            self.started_at = now
+        if self._phase_started_at is not None:
+            key = self.state.value
+            self.phase_durations[key] = self.phase_durations.get(key, 0.0) + max(
+                0.0, now - self._phase_started_at
+            )
+        self.state = state
+        self.transitioned_at = now
+        self._phase_started_at = now if state not in {
+            ExecutionState.COMPLETED, ExecutionState.FAILED,
+            ExecutionState.CANCELLED, ExecutionState.PAUSED,
+            ExecutionState.IDLE,
+        } else None
+        if state in {
+            ExecutionState.COMPLETED, ExecutionState.FAILED,
+            ExecutionState.CANCELLED, ExecutionState.PAUSED,
+        }:
+            self.finished_at = now
+        return True
+
+    def record_model_attempt(self, duration: float) -> None:
+        self.model_attempt_duration += max(0.0, duration)
+
+    def record_tool(self, duration: float) -> None:
+        self.tool_duration += max(0.0, duration)
+
+    def snapshot(self) -> dict[str, Any]:
+        durations = dict(self.phase_durations)
+        if self._phase_started_at is not None:
+            durations[self.state.value] = durations.get(self.state.value, 0.0) + max(
+                0.0, (self.finished_at or time.monotonic()) - self._phase_started_at
+            )
+        return {
+            "state": self.state.value,
+            "started_at": self.started_at,
+            "transitioned_at": self.transitioned_at,
+            "finished_at": self.finished_at,
+            "elapsed": self.elapsed,
+            "phase_durations": durations,
+            "model_attempt_duration": self.model_attempt_duration,
+            "tool_duration": self.tool_duration,
+        }
+
+
 class AgentRole(Enum):
     """Roles for specialized agents."""
 
@@ -59,12 +153,20 @@ class FailureReason(Enum):
 
 
 class ToolResultStatus(Enum):
-    """Status of a tool execution."""
+    """Status of a tool execution.
+
+    Extended classification for structured retry/recovery decisions.
+    """
 
     SUCCESS = "success"
     ERROR = "error"
     PERMISSION_DENIED = "permission_denied"
     TIMEOUT = "timeout"
+    RETRYABLE_FAILURE = "retryable_failure"    # transient, safe to retry
+    NOT_FOUND = "not_found"                    # resource/path does not exist
+    INVALID_REQUEST = "invalid_request"        # malformed arguments
+    RATE_LIMITED = "rate_limited"              # 429 from tool/API
+    AUTH_FAILURE = "auth_failure"              # 401/403 from tool/API
 
 
 @dataclass
@@ -119,13 +221,28 @@ class ToolResult:
 
     @property
     def failure_category(self) -> str:
-        """Classify the failure for retry/recovery decisions."""
+        """Classify the failure for retry/recovery decisions.
+
+        Returns one of: success, permission_denied, timeout,
+        retryable_failure, not_found, invalid_request, rate_limited,
+        auth_failure, execution_error, tool_error.
+        """
         if self.status == ToolResultStatus.SUCCESS:
             return "success"
         if self.status == ToolResultStatus.PERMISSION_DENIED:
             return "permission_denied"
         if self.status == ToolResultStatus.TIMEOUT:
             return "timeout"
+        if self.status == ToolResultStatus.RETRYABLE_FAILURE:
+            return "retryable_failure"
+        if self.status == ToolResultStatus.NOT_FOUND:
+            return "not_found"
+        if self.status == ToolResultStatus.INVALID_REQUEST:
+            return "invalid_request"
+        if self.status == ToolResultStatus.RATE_LIMITED:
+            return "rate_limited"
+        if self.status == ToolResultStatus.AUTH_FAILURE:
+            return "auth_failure"
         if self.exit_code is not None and self.exit_code != 0:
             return "execution_error"
         return "tool_error"
@@ -524,6 +641,7 @@ class Task:
     completed_operations: list[str] = field(default_factory=list)
     # Harness 2.0: set when budget-driven compaction trimmed tool history.
     compaction_note: str | None = None
+    execution_timeline: TaskExecutionTimeline = field(default_factory=TaskExecutionTimeline)
 
 
 class TaskPhase(Enum):

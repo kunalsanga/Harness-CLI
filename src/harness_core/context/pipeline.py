@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TYPE_CHECKING
 
 from harness_core.context.models import (
     CandidateSource,
@@ -39,6 +39,9 @@ from harness_core.context.models import (
 )
 from harness_core.context.relevance import AIRelevanceRanker, AIRelevanceConfig
 from harness_core.context.reuse import ContextReuseManager
+
+if TYPE_CHECKING:
+    from harness_core.intelligence import ProjectIntelligence
 
 # Safety cap on how many file contents get loaded per discovery cycle —
 # bounds both memory and the token cost of file content pieces.
@@ -61,11 +64,13 @@ class ContextPipeline:
         reuse: ContextReuseManager | None = None,
         ai_ranker: AIRelevanceRanker | None = None,
         memory: _MemoryProvider | None = None,
+        intelligence: "ProjectIntelligence | None" = None,
     ) -> None:
         self.workspace_root = Path(workspace_root)
         self.reuse = reuse or ContextReuseManager()
         self.ai_ranker = ai_ranker
         self.memory = memory
+        self.intelligence = intelligence
 
     # ── candidate discovery ───────────────────────────────────────────
 
@@ -117,6 +122,55 @@ class ContextPipeline:
         # 2. Grep evidence boosts files with content matches.
         for path in (search_matches or {}):
             _add(path, CandidateSource.GREP, 0.7, "content match")
+
+        # 2b. ProjectIntelligence: symbol hits + dependency expansion.
+        # Optional injected facade — when absent (or when anything fails)
+        # discovery degrades to the deterministic sources above.
+        intel = self.intelligence
+        if intel is not None:
+            try:
+                root = Path(intel.root)
+                if intel.file_list(limit=1):
+                    # Symbol hits: task terms that match indexed symbol names.
+                    seen_syms: set[str] = set()
+                    for token in request.task.replace("(", " ").replace(")", " ").split():
+                        token = token.strip(".,:;_-")
+                        if len(token) < 4:
+                            continue
+                        for sym in intel.find_symbols(token, limit=5):
+                            if sym.name in seen_syms:
+                                continue
+                            seen_syms.add(sym.name)
+                            rel = str(Path(sym.file_path).relative_to(root))
+                            _add(
+                                rel,
+                                CandidateSource.SYMBOL,
+                                0.6,
+                                f"symbol '{sym.name}' ({sym.kind})",
+                            )
+                    # Dependency expansion: one hop from grep/symbol seeds.
+                    seeds = list((search_matches or {}).keys())
+                    seeds += [
+                        str(Path(s.file_path).relative_to(root)) for s in intel.find_symbols(
+                            " ".join(request.task.split()[:4]), limit=3
+                        )
+                    ]
+                    for seed in seeds[:10]:
+                        try:
+                            related = intel.dependencies.get_related_files(
+                                str(root / seed), max_depth=1
+                            )
+                        except (ValueError, OSError):
+                            continue
+                        for rel_path in related[:8]:
+                            _add(
+                                str(Path(rel_path).relative_to(root)),
+                                CandidateSource.DEPENDENCY,
+                                0.5,
+                                f"linked to {seed}",
+                            )
+            except Exception:
+                pass  # intelligence is advisory — never blocks discovery
 
         # 3. Recently-touched files (reuse manager order).
         for i, path in enumerate(self._recent_files()):

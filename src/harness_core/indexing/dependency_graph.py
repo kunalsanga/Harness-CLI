@@ -66,6 +66,61 @@ class DependencyGraph:
         with self._lock:
             self._module_to_file[module_path] = str(Path(file_path).resolve())
 
+    def remove_outgoing_edges(self, path: str) -> int:
+        """Remove only *path*'s outgoing edges (path imports others).
+
+        Used when re-indexing a changed file: its own imports are rebuilt,
+        but incoming edges belong to the importing files and must survive.
+        Returns the number of edges removed.
+        """
+        path = str(Path(path).resolve())
+        removed = 0
+        with self._lock:
+            for target in self._forward.pop(path, set()):
+                rev = self._reverse.get(target)
+                if rev is not None:
+                    rev.discard(path)
+                    if not rev:
+                        self._reverse.pop(target, None)
+            kept = [e for e in self._edges if e.source != path]
+            removed = len(self._edges) - len(kept)
+            self._edges = kept
+        return removed
+
+    def remove_file(self, path: str) -> int:
+        """Remove a file and all its edges (incremental update support).
+
+        Removes outgoing edges (path imports others) and incoming edges
+        (others import path) plus any module registrations. Returns the
+        number of edges removed.
+        """
+        path = str(Path(path).resolve())
+        removed = 0
+        with self._lock:
+            # Outgoing: path -> targets
+            for target in self._forward.pop(path, set()):
+                rev = self._reverse.get(target)
+                if rev is not None:
+                    rev.discard(path)
+                    if not rev:
+                        self._reverse.pop(target, None)
+            # Incoming: sources -> path
+            for source in self._reverse.pop(path, set()):
+                fwd = self._forward.get(source)
+                if fwd is not None:
+                    fwd.discard(path)
+                    if not fwd:
+                        self._forward.pop(source, None)
+            # Edge records
+            kept = [e for e in self._edges if e.source != path and e.target != path]
+            removed = len(self._edges) - len(kept)
+            self._edges = kept
+            # Module registrations pointing at this file
+            self._module_to_file = {
+                m: f for m, f in self._module_to_file.items() if f != path
+            }
+        return removed
+
     def get_dependencies(self, path: str) -> list[str]:
         """Get files that *path* directly depends on."""
         path = str(Path(path).resolve())
@@ -141,6 +196,11 @@ class DependencyGraph:
         """Check if the graph has cycles (DFS-based)."""
         with self._lock:
             return self._has_cycle_unlocked()
+
+    def registered_modules(self) -> dict[str, str]:
+        """Snapshot of module path -> file path registrations."""
+        with self._lock:
+            return dict(self._module_to_file)
 
     def _has_cycle_unlocked(self) -> bool:
         """Cycle detection without lock. Caller must hold lock."""

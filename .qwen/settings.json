@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd *)",
+      "Bash(uv *)",
+      "Bash(python *)",
+      "Bash(tail *)",
+      "Bash(del *)",
+      "Bash(head *)",
+      "Bash(mkdir *)",
+      "Bash(echo *)",
+      "Bash(dir *)",
+      "Bash(type *)"
+    ]
+  },
+  "$version": 4
+}

@@ -252,11 +252,11 @@ class TestAllProviderFailure:
         from harness_core.routing.health import ModelHealthTracker
 
         bad1 = MagicMock()
-        bad1.generate = AsyncMock(side_effect=Exception("401 Unauthorized"))
+        bad1.generate = AsyncMock(side_effect=Exception("500 Internal Server Error"))
         bad1.name = "bad1"
 
         bad2 = MagicMock()
-        bad2.generate = AsyncMock(side_effect=Exception("402 Payment Required"))
+        bad2.generate = AsyncMock(side_effect=Exception("503 Service Unavailable"))
         bad2.name = "bad2"
 
         bad3 = MagicMock()

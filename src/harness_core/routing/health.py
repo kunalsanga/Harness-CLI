@@ -36,7 +36,9 @@ class ModelHealthStatus(Enum):
     UNAVAILABLE = "unavailable" # Returned 401/403 — not available to this user
     PAYMENT_REQUIRED = "payment_required" # 402 — model requires payment
     RATE_LIMITED = "rate_limited" # 429 — temporarily unavailable
-    ERROR = "error"           # Server errors, timeouts, etc.
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable" # 5xx / provider_unavailable
+    TIMEOUT = "timeout"       # request timed out
+    ERROR = "error"           # Server errors, network failures, etc.
     NO_TOOL_USE = "no_tool_use"  # Responded without using required tools — rotate away
 
 
@@ -71,6 +73,14 @@ class ModelHealthState:
     last_rate_limit_time: float = 0.0
     consecutive_failures: int = 0
 
+    # Unified cooldown: until this unix time the router must not select the
+    # model. Set for EVERY temporary failure (429, provider_unavailable,
+    # 5xx, timeout, network) — not just rate limits.
+    cooldown_until: float = 0.0
+    # Normalized category of the last failure (rate_limit, model_unavailable,
+    # timeout, network, error) used for display and diagnostics.
+    last_error_category: str = ""
+
     # Cooldown: if a model is rate-limited, don't use it for this many seconds
     cooldown_seconds: float = 0.0
 
@@ -102,6 +112,45 @@ class ModelHealthState:
         return (time.time() - self.last_rate_limit_time) < self.cooldown_seconds
 
     @property
+    def is_cooling_down(self) -> bool:
+        """Whether a temporary-failure cooldown is currently active."""
+        return time.time() < self.cooldown_until
+
+    def cooldown_remaining(self) -> float:
+        """Seconds until the active cooldown expires (0 if none)."""
+        return max(0.0, self.cooldown_until - time.time())
+
+    def _apply_cooldown(self, seconds: float) -> None:
+        """Extend the cooldown window (never shorten an existing one)."""
+        self.cooldown_until = max(self.cooldown_until, time.time() + max(0.0, seconds))
+
+    @property
+    def display_status(self) -> str:
+        """Human-readable health status derived from evidence.
+
+        "Unknown" until any request attempt is recorded; cooldown-backed
+        statuses only show while the cooldown is actually active.
+        """
+        if self.health_status == ModelHealthStatus.UNAVAILABLE:
+            return "Auth Failed"
+        if self.health_status == ModelHealthStatus.PAYMENT_REQUIRED:
+            return "Payment Required"
+        if self.health_status == ModelHealthStatus.NO_TOOL_USE and time.time() < self.no_tool_cooldown_until:
+            return "No Tool Use"
+        if self.is_cooling_down:
+            return {
+                "rate_limit": "Rate Limited",
+                "model_unavailable": "Unavailable",
+                "timeout": "Timeout",
+                "network": "Network Error",
+            }.get(self.last_error_category, "Error")
+        if self.total_calls == 0:
+            return "Unknown"
+        if self.is_healthy:
+            return "Ready"
+        return "Error"
+
+    @property
     def is_healthy(self) -> bool:
         """Whether the model is considered usable right now."""
         # Explicit status overrides all other checks
@@ -109,14 +158,15 @@ class ModelHealthState:
             return False
         if self.health_status == ModelHealthStatus.PAYMENT_REQUIRED:
             return False  # requires payment, not usable in free mode
-        if self.health_status == ModelHealthStatus.RATE_LIMITED:
-            return self.is_rate_limited  # may have recovered
         if self.health_status == ModelHealthStatus.NO_TOOL_USE:
             # Rotate away until the cooldown timestamp passes, then recover
             return time.time() >= self.no_tool_cooldown_until
-        if self.health_status == ModelHealthStatus.ERROR:
-            return self.consecutive_failures < 3  # recover after some time
-        if self.is_rate_limited:
+        # Any active temporary-failure cooldown blocks selection.
+        if self.is_cooling_down:
+            return False
+        # Legacy rate-limit path (kept for compatibility with trackers that
+        # only set cooldown_seconds/last_rate_limit_time).
+        if self.health_status == ModelHealthStatus.RATE_LIMITED and self.is_rate_limited:
             return False
         if self.consecutive_failures >= 5:
             return False
@@ -149,6 +199,9 @@ class ModelHealthState:
             "consecutive_failures": self.consecutive_failures,
             "is_rate_limited": self.is_rate_limited,
             "is_healthy": self.is_healthy,
+            "health_status": self.health_status.value,
+            "cooldown_remaining": round(self.cooldown_remaining(), 1),
+            "last_error_category": self.last_error_category,
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "estimated_cost": round(self.estimated_cost, 6),
@@ -192,14 +245,24 @@ class ModelHealthTracker:
             state.record_latency(latency_ms)
         # Mark as healthy on success (recovers from previous errors)
         state.health_status = ModelHealthStatus.HEALTHY
+        # Success is direct evidence the model serves requests again.
+        state.cooldown_until = 0.0
+        state.last_error_category = ""
 
     def record_failure(
         self,
         model_id: str,
         event: HealthEvent,
         latency_ms: float = 0.0,
+        cooldown_override: float | None = None,
     ) -> None:
-        """Record a failure with its type."""
+        """Record a failure with its type.
+
+        Temporary failures (429, provider_unavailable, 5xx, timeout, network)
+        set a model-specific cooldown so the router does not immediately
+        re-select the model. ``cooldown_override`` honors a provider-supplied
+        Retry-After value when present.
+        """
         state = self.get_state(model_id)
         state.total_calls += 1
         state.failures += 1
@@ -216,25 +279,55 @@ class ModelHealthTracker:
             state.cooldown_seconds = min(
                 300.0, self._default_cooldown * (2 ** min(state.rate_limit_hits - 1, 4))
             )
+            state.health_status = ModelHealthStatus.RATE_LIMITED
+            state.last_error_category = "rate_limit"
+            self._apply_cooldown_for(state, cooldown_override or state.cooldown_seconds)
         elif event == HealthEvent.TIMEOUT:
             state.timeouts += 1
-        elif event == HealthEvent.CLIENT_ERROR_4XX:
-            state.client_errors += 1
+            state.health_status = ModelHealthStatus.TIMEOUT
+            state.last_error_category = "timeout"
+            self._apply_temporary_cooldown(state, cooldown_override)
         elif event == HealthEvent.SERVER_ERROR_5XX:
             state.server_errors += 1
+            state.health_status = ModelHealthStatus.TEMPORARILY_UNAVAILABLE
+            state.last_error_category = "model_unavailable"
+            self._apply_temporary_cooldown(state, cooldown_override)
+        elif event == HealthEvent.NETWORK_ERROR:
+            state.network_errors += 1
+            state.health_status = ModelHealthStatus.ERROR
+            state.last_error_category = "network"
+            self._apply_temporary_cooldown(state, cooldown_override)
+        elif event == HealthEvent.CLIENT_ERROR_4XX:
+            state.client_errors += 1
         elif event == HealthEvent.TOOL_CALL_FAILURE:
             state.tool_call_failures += 1
         elif event == HealthEvent.INVALID_RESPONSE:
             state.invalid_responses += 1
-        elif event == HealthEvent.NETWORK_ERROR:
-            state.network_errors += 1
+            state.health_status = ModelHealthStatus.ERROR
+            state.last_error_category = "error"
+            self._apply_temporary_cooldown(state, cooldown_override)
         elif event == HealthEvent.AUTH_FAILED:
             state.client_errors += 1
             state.health_status = ModelHealthStatus.UNAVAILABLE
             state.last_auth_failure_time = time.time()
+            state.last_error_category = "auth"
         elif event == HealthEvent.PAYMENT_REQUIRED:
             state.client_errors += 1
             state.health_status = ModelHealthStatus.PAYMENT_REQUIRED
+            state.last_error_category = "payment"
+
+    def _apply_temporary_cooldown(self, state: ModelHealthState, override: float | None) -> None:
+        """Bounded exponential cooldown for a non-rate-limit temporary failure."""
+        if override is not None:
+            self._apply_cooldown_for(state, override)
+            return
+        streak = min(max(0, state.consecutive_failures - 1), 4)
+        self._apply_cooldown_for(
+            state, min(300.0, self._default_cooldown * (2 ** streak))
+        )
+
+    def _apply_cooldown_for(self, state: ModelHealthState, seconds: float) -> None:
+        state._apply_cooldown(seconds)
 
     def record_tool_call_failure(self, model_id: str) -> None:
         """Record a tool call failure (model called wrong tool / bad args)."""
@@ -258,6 +351,17 @@ class ModelHealthTracker:
         """Return model IDs that are currently healthy (not rate-limited, not failing)."""
         ids = model_ids or list(self._states.keys())
         return [mid for mid in ids if self.get_state(mid).is_healthy]
+
+    def unavailable_summary(
+        self, model_ids: list[str]
+    ) -> list[tuple[str, str, float]]:
+        """Return (model_id, display_status, cooldown_remaining) for unhealthy models."""
+        out: list[tuple[str, str, float]] = []
+        for mid in model_ids:
+            state = self.get_state(mid)
+            if not state.is_healthy:
+                out.append((mid, state.display_status, state.cooldown_remaining()))
+        return out
 
     def get_reliability(self, model_id: str) -> float:
         """Get the reliability score for a model."""

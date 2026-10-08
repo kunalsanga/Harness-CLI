@@ -206,12 +206,6 @@ class TestAgentLoopEndToEnd:
         """Agent loop completes when model returns content (no tool calls)."""
         provider = MockProvider()
         provider._responses = [
-            # Planning phase response
-            CompletionResponse(
-                content="1. Inspect project\n2. Explain findings",
-                model="mock",
-                provider="mock",
-            ),
             # Final answer
             CompletionResponse(
                 content="The project is a Python CLI tool.",
@@ -230,6 +224,7 @@ class TestAgentLoopEndToEnd:
         assert task.status == TaskStatus.COMPLETED
         assert task.result is not None
         assert "Python" in task.result
+        assert provider._call_count == 1, "read-only question should skip the plan request"
         # iterations includes the planning call
         assert task.iterations >= 1
 
@@ -239,12 +234,7 @@ class TestAgentLoopEndToEnd:
         read_tool = ReadFileTool()
         tools = [read_tool]
 
-        # Planning phase response + first tool call + final answer
-        plan_resp = CompletionResponse(
-            content="1. Read project config\n2. Explain",
-            model="mock",
-            provider="mock",
-        )
+        # Read-only requests skip the extra planning call.
         first_resp = CompletionResponse(
             content=None,
             model="mock",
@@ -267,7 +257,7 @@ class TestAgentLoopEndToEnd:
         )
 
         provider = MockProvider()
-        provider._responses = [plan_resp, first_resp, second_resp]
+        provider._responses = [first_resp, second_resp]
 
         loop = AgentLoop(
             provider=provider,
@@ -278,6 +268,7 @@ class TestAgentLoopEndToEnd:
         task = await loop.run("Read pyproject.toml and tell me about it")
         assert task.status == TaskStatus.COMPLETED
         assert len(task.tool_calls) == 1
+        assert provider._call_count == 2, "read-only task should use work/final requests only"
         assert task.tool_calls[0].tool_name == "read_file"
         assert task.tool_calls[0].result is not None
 

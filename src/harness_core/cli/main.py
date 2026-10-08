@@ -173,7 +173,7 @@ def run(
         from harness_core.agent.loop import AgentLoop
         from harness_core.agent.types import AgentConfig, AgentRole
         from harness_core.observability.events import Event, EventBus
-        from harness_core.providers.openrouter import OpenRouterProvider
+        from harness_core.providers.factory import create_providers, load_project_provider_config
         from harness_core.routing.router import ModelRouter, RouterConfig
         from harness_core.routing.task_aware import TaskAwareRouter
         from harness_core.models.registry import ModelRegistry
@@ -182,18 +182,33 @@ def run(
         from harness_core.tools.search import GlobTool, GrepTool
         from harness_core.tools.shell import RunCommandTool
 
-        provider = OpenRouterProvider()
-        if not await provider.health_check():
-            console.print("  [red][FAIL] OpenRouter provider not available. Check OPENROUTER_API_KEY.[/]")
-            raise typer.Exit(code=4)
+        provider_config = load_project_provider_config(Path.cwd())
+        providers = create_providers(provider_config)
+        provider = providers[0]
+
+        async def close_providers() -> None:
+            for configured_provider in providers:
+                try:
+                    await configured_provider.close()
+                except Exception:
+                    pass
+
+        # Project intelligence: one facade shared by search tools and the
+        # agent loop's context pipeline. Build failure is non-fatal.
+        try:
+            from harness_core.intelligence import ProjectIntelligence
+            intelligence = ProjectIntelligence(Path.cwd())
+            intelligence.scan()
+        except Exception:
+            intelligence = None
 
         tools = [
             ReadFileTool(),
             WriteFileTool(),
             EditFileTool(),
             ListFilesTool(),
-            GlobTool(),
-            GrepTool(),
+            GlobTool(intelligence),
+            GrepTool(intelligence),
             RunCommandTool(),
             GitStatusTool(),
             GitDiffTool(),
@@ -217,6 +232,7 @@ def run(
                 if routing_data:
                     router_config.routing_mode = routing_data.get("strategy", mode)
                     router_config.prefer_free = routing_data.get("prefer_free", False)
+                    router_config.allow_paid_models = routing_data.get("allow_paid_models", False)
                 if budgets_data:
                     router_config.budget.max_iterations = budgets_data.get("max_iterations", max_iterations)
                     router_config.budget.max_tool_calls = budgets_data.get("max_tool_calls", 100)
@@ -229,16 +245,6 @@ def run(
         router_config.budget.max_iterations = max_iterations
         if max_cost is not None:
             router_config.budget.max_cost = max_cost
-
-        # Build router with all available providers
-        providers = [provider]
-        try:
-            from harness_core.providers.ollama import OllamaProvider
-            ollama = OllamaProvider()
-            if await ollama.health_check():
-                providers.append(ollama)
-        except Exception:
-            pass
 
         # Wire task-aware routing pipeline
         task_aware = TaskAwareRouter(registry=ModelRegistry())
@@ -393,7 +399,7 @@ def run(
             else:
                 render_failure_summary(console, vm, outcome, plain=plain_ui)
 
-            await provider.close()
+            await close_providers()
 
             if outcome.status.value != "success":
                 raise typer.Exit(code=1)
@@ -402,6 +408,7 @@ def run(
         # Multi-agent mode
         if mode == "multi-agent":
             from harness_core.agents.orchestrator import Orchestrator, ExecutionMode, AgentBudget
+            from harness_core.providers.routed import RoutedModelProvider
             # Phase 8 integration: persistent project memory.
             # Enabled by default for initialised projects (.harness/config.yaml);
             # opt out with `memory: {enabled: false}` in that file. Memory is
@@ -423,7 +430,7 @@ def run(
             )
 
             orchestrator = Orchestrator(
-                provider=provider,
+                provider=RoutedModelProvider(router),
                 tools=tools,
                 router=router,
                 task_aware=task_aware,
@@ -480,7 +487,7 @@ def run(
                         for err in result.errors:
                             console.print(f"  [red]Error:[/] {err}")
 
-            await provider.close()
+            await close_providers()
 
             if not result.success:
                 raise typer.Exit(code=1)
@@ -502,6 +509,7 @@ def run(
             event_bus=event_bus,
             router=router,
             task_aware=task_aware,
+            intelligence=intelligence,
         )
 
         with Progress(
@@ -531,7 +539,7 @@ def run(
                     Panel(result.error or "Task failed", title="Error", border_style="red")
                 )
 
-        await provider.close()
+        await close_providers()
 
         if result.status.value != "completed":
             raise typer.Exit(code=1)
@@ -584,8 +592,7 @@ def shell(
 @app.command()
 def doctor() -> None:
     """Check system health."""
-    from harness_core.providers.openrouter import OpenRouterProvider
-    from harness_core.providers.ollama import OllamaProvider
+    from harness_core.providers.factory import create_providers, load_project_provider_config
 
     console.print(Panel("Harness Doctor", border_style="blue"))
 
@@ -598,21 +605,16 @@ def doctor() -> None:
     console.print("\n[bold]Providers[/]")
 
     async def _check_providers() -> None:
-        openrouter = OpenRouterProvider()
-        ollama = OllamaProvider()
-
-        if await openrouter.health_check():
-            console.print("  [green][OK] OpenRouter[/]")
-        else:
-            console.print("  [red][FAIL] OpenRouter[/]")
-
-        if await ollama.health_check():
-            console.print("  [green][OK] Ollama[/]")
-        else:
-            console.print("  [dim]  [--] Ollama (not running)[/]")
-
-        await openrouter.close()
-        await ollama.close()
+        configured = create_providers(load_project_provider_config(Path.cwd()))
+        try:
+            for provider in configured:
+                if await provider.health_check():
+                    console.print(f"  [green][OK] {provider.name}[/]")
+                else:
+                    console.print(f"  [red][FAIL] {provider.name}[/]")
+        finally:
+            for provider in configured:
+                await provider.close()
 
     asyncio.run(_check_providers())
 
@@ -744,23 +746,41 @@ def agents_inspect(
 
 # ── models sub-commands ────────────────────────────────────────────────────
 
+async def _discover_configured_model_profiles():
+    from harness_core.models.discovery import discover_provider
+    from harness_core.providers.factory import create_providers, load_project_provider_config
+
+    providers = create_providers(load_project_provider_config(Path.cwd()))
+    profiles = []
+    try:
+        for configured_provider in providers:
+            profiles.extend(await discover_provider(configured_provider))
+    finally:
+        for configured_provider in providers:
+            await configured_provider.close()
+    return profiles
+
 @models_app.command("list")
 def models_list(
     provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Filter by provider"),
     free_only: bool = typer.Option(False, "--free", help="Show only free models"),
 ) -> None:
     """List available models."""
-    from harness_core.providers.openrouter import OpenRouterProvider
+    from harness_core.providers.factory import create_providers, load_project_provider_config
 
     async def _list_models() -> None:
-        openrouter = OpenRouterProvider()
-
-        if not await openrouter.health_check():
-            console.print("  [red][FAIL] Cannot connect to OpenRouter[/]")
-            raise typer.Exit(code=4)
-
-        all_models = await openrouter.list_models()
-        await openrouter.close()
+        providers = create_providers(load_project_provider_config(Path.cwd()))
+        all_models = []
+        try:
+            for configured_provider in providers:
+                try:
+                    all_models.extend(await configured_provider.list_models())
+                    all_models.extend(getattr(configured_provider, "configured_models", []))
+                except Exception as exc:
+                    console.print(f"  [yellow]Discovery failed for {configured_provider.name}: {type(exc).__name__}[/]")
+        finally:
+            for configured_provider in providers:
+                await configured_provider.close()
 
         # Filter
         models = all_models
@@ -782,7 +802,7 @@ def models_list(
                 m.provider,
                 str(m.context_window) if m.context_window else "-",
                 "Y" if m.is_free else "N",
-                "Y" if m.supports_tools else "N",
+                "Yes" if m.supports_tools is True else "No" if m.supports_tools is False else "Unknown",
             )
 
         console.print(table)
@@ -799,9 +819,7 @@ def models_recommend(
     from harness_core.classifier.classifier import TaskClassifier
     from harness_core.models.registry import ModelRegistry
     from harness_core.models.empirical import EmpiricalHistory
-    from harness_core.models.discovery import discover_provider
     from harness_core.routing.task_aware import TaskAwareRouter
-    from harness_core.providers.openrouter import OpenRouterProvider
 
     async def _recommend() -> None:
         classifier = TaskClassifier()
@@ -819,11 +837,9 @@ def models_recommend(
 
         registry = ModelRegistry()
         empirical = EmpiricalHistory()
-        openrouter = OpenRouterProvider()
-        profiles = await discover_provider(openrouter)
+        profiles = await _discover_configured_model_profiles()
         for p in profiles:
             registry.register(p)
-        await openrouter.close()
 
         router = TaskAwareRouter(
             registry=registry,
@@ -832,9 +848,9 @@ def models_recommend(
         )
 
         models = registry.list_all()
-        model_ids = [m.model_id for m in models if m.supports_tools]
+        model_ids = [m.model_id for m in models if m.supports_tools is True]
         if free_only:
-            free_models = [m for m in models if m.is_free and m.supports_tools]
+            free_models = [m for m in models if m.is_free and m.supports_tools is True]
             model_ids = [m.model_id for m in free_models]
             if not model_ids:
                 console.print("[yellow]No suitable free models found.[/]")
@@ -884,17 +900,13 @@ def models_inspect(
     """Inspect a model's profile and capabilities with empirical data."""
     from harness_core.models.registry import ModelRegistry
     from harness_core.models.empirical import EmpiricalHistory
-    from harness_core.models.discovery import discover_provider
-    from harness_core.providers.openrouter import OpenRouterProvider
 
     async def _inspect() -> None:
         registry = ModelRegistry()
         empirical = EmpiricalHistory()
-        openrouter = OpenRouterProvider()
-        profiles = await discover_provider(openrouter)
+        profiles = await _discover_configured_model_profiles()
         for p in profiles:
             registry.register(p)
-        await openrouter.close()
 
         profile = registry.get(model_id)
         if profile is None:
@@ -941,38 +953,8 @@ def models_inspect(
 
 @models_app.command("local")
 def models_local() -> None:
-    """List locally installed Ollama models."""
-    from harness_core.providers.ollama import OllamaProvider
-
-    async def _local() -> None:
-        ollama = OllamaProvider()
-        if not await ollama.health_check():
-            console.print("[yellow]Ollama is not running.[/]")
-            console.print("[dim]Start Ollama with: ollama serve[/]")
-            raise typer.Exit(code=0)
-
-        models = await ollama.list_models()
-        await ollama.close()
-
-        if not models:
-            console.print("[yellow]No local models found.[/]")
-            return
-
-        table = Table(title=f"Local Ollama Models ({len(models)})")
-        table.add_column("Model", style="cyan")
-        table.add_column("Provider", style="green")
-        table.add_column("Tools", justify="center")
-
-        for m in models:
-            table.add_row(
-                m.id,
-                m.provider,
-                "Y" if m.supports_tools else "N",
-            )
-
-        console.print(table)
-
-    asyncio.run(_local())
+    """Report local provider status without probing inactive providers."""
+    console.print("[dim]Local model providers are not active. Harness currently uses OpenRouter.[/]")
 
 
 @models_app.command("compare")
@@ -983,17 +965,13 @@ def models_compare(
     """Compare two models side by side with empirical data."""
     from harness_core.models.registry import ModelRegistry
     from harness_core.models.empirical import EmpiricalHistory
-    from harness_core.models.discovery import discover_provider
-    from harness_core.providers.openrouter import OpenRouterProvider
 
     async def _compare() -> None:
         registry = ModelRegistry()
         empirical = EmpiricalHistory()
-        openrouter = OpenRouterProvider()
-        profiles = await discover_provider(openrouter)
+        profiles = await _discover_configured_model_profiles()
         for p in profiles:
             registry.register(p)
-        await openrouter.close()
 
         a = registry.get(model_a)
         b = registry.get(model_b)
@@ -1074,7 +1052,7 @@ def models_benchmark(
     from harness_core.benchmarks.types import BenchmarkCategory
     from harness_core.benchmarks.tasks import ALL_BENCHMARK_TASKS
     from harness_core.benchmarks.engine import AgentBenchmarkEngine
-    from harness_core.providers.openrouter import OpenRouterProvider
+    from harness_core.providers.factory import create_providers, load_project_provider_config
 
     async def _benchmark() -> None:
         if not model:
@@ -1105,10 +1083,20 @@ def models_benchmark(
         console.print(f"[bold blue]Benchmarking {model}...[/]")
         console.print("[dim]Running in isolated workspaces. This may take a while.[/]")
 
-        provider = OpenRouterProvider()
-        if not await provider.health_check():
-            console.print("[red][FAIL] OpenRouter not available. Check OPENROUTER_API_KEY.[/]")
-            raise typer.Exit(code=4)
+        configured_providers = create_providers(load_project_provider_config(Path.cwd()))
+        model_provider = model.split("::", 1)[0] if "::" in model else ""
+        provider = next((item for item in configured_providers if item.name == model_provider), None)
+        if provider is None:
+            matching = [item for item in configured_providers if any(info.id == model for info in getattr(item, "configured_models", []))]
+            if len(matching) == 1:
+                provider = matching[0]
+            elif len(configured_providers) == 1:
+                provider = configured_providers[0]
+            else:
+                console.print("[red]Model is ambiguous across configured providers. Use provider::model-id.[/]")
+                for configured_provider in configured_providers:
+                    await configured_provider.close()
+                raise typer.Exit(code=2)
 
         tasks = ALL_BENCHMARK_TASKS
         if category:
@@ -1124,7 +1112,7 @@ def models_benchmark(
             console.print("[yellow]No tasks found for the specified criteria.[/]")
             raise typer.Exit(code=1)
 
-        engine = AgentBenchmarkEngine(providers={"openrouter": provider})
+        engine = AgentBenchmarkEngine(providers={item.name: item for item in configured_providers})
 
         with Progress(
             SpinnerColumn("dots"),
@@ -1135,11 +1123,12 @@ def models_benchmark(
             results = []
             for bench_task in tasks:
                 progress.update(ptask, description=f"Benchmarking: {bench_task.name}")
-                result = await engine.run_task(bench_task, model, "openrouter")
+                result = await engine.run_task(bench_task, model, provider.name)
                 results.append(result)
                 progress.advance(ptask)
 
-        await provider.close()
+        for configured_provider in configured_providers:
+            await configured_provider.close()
 
         console.print(f"\n[bold blue]Benchmark Results: {model}[/]")
 
@@ -1853,28 +1842,19 @@ def providers_list(
     json_output: bool = typer.Option(False, "--json", help="JSON output"),
 ) -> None:
     """List available providers and their status."""
+    from harness_core.config.credentials import CredentialResolver
+    resolver = CredentialResolver()
     providers_info = [
-        {
-            "name": "OpenRouter",
-            "env_var": "OPENROUTER_API_KEY",
-            "description": "Access 300+ models including free tier",
-            "url": "https://openrouter.ai",
-            "free_models": True,
-        },
-        {
-            "name": "Ollama",
-            "env_var": "OLLAMA_HOST",
-            "description": "Local inference — no API key needed",
-            "url": "https://ollama.com",
-            "free_models": True,
-        },
-        {
-            "name": "LiteLLM",
-            "env_var": "LITELLM_API_KEY",
-            "description": "Unified API for 100+ LLM providers",
-            "url": "https://litellm.ai",
-            "free_models": False,
-        },
+        {"name": "openrouter", "env_var": "OPENROUTER_API_KEY", "description": "OpenRouter model gateway"},
+        {"name": "openai", "env_var": "OPENAI_API_KEY", "description": "OpenAI API"},
+        {"name": "anthropic", "env_var": "ANTHROPIC_API_KEY", "description": "Anthropic Messages API"},
+        {"name": "gemini", "env_var": "GEMINI_API_KEY", "description": "Google Gemini API"},
+        {"name": "nvidia", "env_var": "NVIDIA_API_KEY", "description": "NVIDIA NIM API"},
+        {"name": "groq", "env_var": "GROQ_API_KEY", "description": "Groq API"},
+        {"name": "ollama", "env_var": "", "description": "Local Ollama endpoint"},
+        {"name": "9router", "env_var": "NINE_ROUTER_API_KEY", "description": "9router gateway"},
+        {"name": "litellm", "env_var": "LITELLM_API_KEY", "description": "LiteLLM gateway"},
+        {"name": "openai-compatible", "env_var": "Configured per provider", "description": "Custom compatible endpoint"},
     ]
 
     if json_output:
@@ -1884,153 +1864,90 @@ def providers_list(
     table = Table(title="Available Providers")
     table.add_column("Provider", style="cyan")
     table.add_column("Status")
-    table.add_column("Free Models", justify="center")
     table.add_column("Description", max_width=40)
 
-    import os
     for p in providers_info:
-        has_key = bool(os.environ.get(p["env_var"]))
-        status = "[green]Configured[/]" if has_key else "[yellow]Not configured[/]"
+        has_key = resolver.has_credential(p["name"])
+        status = "[green]Configured[/]" if has_key or not p["env_var"] else "[yellow]Not configured[/]"
         table.add_row(
             p["name"],
             status,
-            "Yes" if p["free_models"] else "No",
             p["description"],
         )
 
     console.print(table)
     console.print("\n[bold]Configure:[/]")
-    console.print("  [cyan]harness providers configure openrouter[/]")
-    console.print("  [cyan]harness providers configure ollama[/]")
+    console.print("  [cyan]harness auth setup --provider <name>[/]")
 
 
 @providers_app.command("configure")
 def providers_configure(
-    provider: str = typer.Argument(..., help="Provider name (openrouter, ollama, litellm)"),
+    provider: str = typer.Argument(..., help="Provider name (see 'harness providers list')"),
 ) -> None:
     """Configure a model provider."""
-    import os
-
     provider = provider.lower().strip()
 
-    if provider == "openrouter":
-        key = os.environ.get("OPENROUTER_API_KEY", "")
-        if key:
-            console.print("[green]OpenRouter is already configured.[/]")
-            console.print(f"  API key: {key[:8]}...{key[-4:]}")
-            return
-
-        console.print("[bold]Configure OpenRouter[/]")
-        console.print("\nOpenRouter provides access to 300+ AI models including free tiers.")
-        console.print("\nTo configure:")
-        console.print("  1. Visit https://openrouter.ai/keys")
-        console.print("  2. Create an API key")
-        console.print("  3. Set the environment variable:")
-        console.print("\n    [cyan]# PowerShell[/]")
-        console.print("    $env:OPENROUTER_API_KEY = 'sk-or-v1-...'\n")
-        console.print("    [cyan]# Bash/Linux/macOS[/]")
-        console.print("    export OPENROUTER_API_KEY='sk-or-v1-...'\n")
-        console.print("    [cyan]# Or add to .env file (in project root)[/]")
-        console.print("    echo 'OPENROUTER_API_KEY=sk-or-v1-...' > .env\n")
-        console.print("  4. Run: [cyan]harness doctor[/] to verify\n")
-        console.print("[dim]Free models available — no payment required to start.[/]")
-
-    elif provider == "ollama":
-        console.print("[bold]Configure Ollama[/]")
-        console.print("\nOllama runs AI models locally — no API key needed.")
-        console.print("\nTo configure:")
-        console.print("  1. Install Ollama: https://ollama.com/download")
-        console.print("  2. Start the server: [cyan]ollama serve[/]")
-        console.print("  3. Pull a model: [cyan]ollama pull codellama[/]")
-        console.print("  4. Run: [cyan]harness doctor[/] to verify\n")
-        console.print("[dim]Recommended models: codellama, deepseek-coder, llama3[/]")
-
-    elif provider == "litellm":
-        console.print("[bold]Configure LiteLLM[/]")
-        console.print("\nLiteLLM provides a unified API for 100+ LLM providers.")
-        console.print("\nTo configure:")
-        console.print("  1. Set the API key:")
-        console.print("\n    [cyan]# PowerShell[/]")
-        console.print("    $env:LITELLM_API_KEY = 'your-key'\n")
-        console.print("    [cyan]# Bash/Linux/macOS[/]")
-        console.print("    export LITELLM_API_KEY='your-key'\n")
-        console.print("  2. Run: [cyan]harness doctor[/] to verify")
-
-    else:
-        console.print(f"[red]Unknown provider: {provider}[/]")
-        console.print("[dim]Available: openrouter, ollama, litellm[/]")
+    from harness_core.config.credentials import CredentialResolver
+    aliases = {"google": "gemini", "ninerouter": "9router"}
+    provider = aliases.get(provider, provider)
+    if CredentialResolver().has_credential(provider):
+        console.print(f"[green]{provider} is already configured.[/]")
+        return
+    env_vars = {
+        "openrouter": "OPENROUTER_API_KEY", "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY",
+        "nvidia": "NVIDIA_API_KEY", "groq": "GROQ_API_KEY",
+        "9router": "NINE_ROUTER_API_KEY", "litellm": "LITELLM_API_KEY",
+    }
+    if provider == "ollama":
+        console.print("Configure the Ollama endpoint and model in .harness/config.yaml.")
+    elif provider in env_vars:
+        console.print(f"Set [cyan]{env_vars[provider]}[/] in your environment or local .env file.")
+        console.print("Configure endpoint and model in .harness/config.yaml when needed.")
+    elif provider:
+        console.print(f"[red]Unsupported provider: {provider}[/]")
+        console.print("For custom OpenAI-compatible endpoints, declare type: openai-compatible in .harness/config.yaml.")
         raise typer.Exit(code=1)
 
 
 @app.command()
 def setup() -> None:
     """Interactive setup for new users."""
-    import os
     console.print(Panel("Welcome to Harness Engineering CLI", border_style="blue"))
     console.print("\nHarness is a model-agnostic AI coding agent that runs in your terminal.")
     console.print("This wizard will help you get started.\n")
 
     # Step 1: Check existing configuration
     console.print("[bold]Step 1: Checking configuration...[/]")
-    has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
-    has_ollama = False
+    from harness_core.providers.factory import create_providers, load_project_provider_config
     try:
-        import subprocess
-        result = subprocess.run(
-            ["ollama", "list"],
-            capture_output=True, text=True, timeout=5,
-        )
-        has_ollama = result.returncode == 0
-    except Exception:
-        pass
+        configured = create_providers(load_project_provider_config(Path.cwd()))
+    except Exception as exc:
+        console.print(f"[red]Provider configuration error: {exc}[/]")
+        return
+    has_configured_provider = bool(configured)
 
-    if has_openrouter:
-        console.print("  [green][OK] OpenRouter configured[/]")
+    if has_configured_provider:
+        console.print("  [green][OK] Configured providers: " + ", ".join(p.name for p in configured) + "[/]")
     else:
         console.print("  [yellow][--] OpenRouter not configured[/]")
 
-    if has_ollama:
-        console.print("  [green][OK] Ollama running[/]")
-    else:
-        console.print("  [yellow][--] Ollama not running[/]")
-
-    if not has_openrouter and not has_ollama:
+    if not has_configured_provider:
         console.print("\n[bold yellow]No providers configured![/]")
-        console.print("\nYou need at least one provider to use Harness:")
-        console.print("\n  [cyan]Option 1: OpenRouter (recommended for beginners)[/]")
-        console.print("    - Access 300+ models including free tiers")
-        console.print("    - No payment required to start")
-        console.print("    - Run: [cyan]harness providers configure openrouter[/]\n")
-        console.print("  [cyan]Option 2: Ollama (local, private, free)[/]")
-        console.print("    - Runs entirely on your machine")
-        console.print("    - No API key needed")
-        console.print("    - Run: [cyan]harness providers configure ollama[/]\n")
-        console.print("[dim]You can configure providers now or later.[/]")
+        console.print("\nSet OPENROUTER_API_KEY or run `harness providers configure openrouter`.")
         return
 
     # Step 2: Test connection
     console.print("\n[bold]Step 2: Testing provider connection...[/]")
 
     async def _test() -> None:
-        if has_openrouter:
-            from harness_core.providers.openrouter import OpenRouterProvider
-            provider = OpenRouterProvider()
+        for provider in configured:
             if await provider.health_check():
                 models = await provider.list_models()
                 free = [m for m in models if m.is_free]
-                console.print(f"  [green][OK] OpenRouter connected ({len(models)} models, {len(free)} free)[/]")
+                console.print(f"  [green][OK] {provider.name} connected ({len(models)} models, {len(free)} free)[/]")
             else:
-                console.print("  [red][FAIL] OpenRouter connection failed[/]")
-            await provider.close()
-
-        if has_ollama:
-            from harness_core.providers.ollama import OllamaProvider
-            provider = OllamaProvider()
-            if await provider.health_check():
-                models = await provider.list_models()
-                console.print(f"  [green][OK] Ollama running ({len(models)} models)[/]")
-            else:
-                console.print("  [red][FAIL] Ollama connection failed[/]")
+                console.print(f"  [red][FAIL] {provider.name} connection failed[/]")
             await provider.close()
 
     asyncio.run(_test())
@@ -2060,9 +1977,7 @@ def providers() -> None:
     """Manage model providers."""
     console.print("[dim]Use 'harness providers list' or 'harness providers configure <name>'[/]")
     console.print("\nAvailable providers:")
-    console.print("  [cyan]openrouter[/] — 300+ models, free tier available")
-    console.print("  [cyan]ollama[/]     — local inference, no API key")
-    console.print("  [cyan]litellm[/]    — unified API for 100+ providers")
+    console.print("  [cyan]openrouter[/] — model API")
 
 
 # ── M10 Benchmark Commands ──────────────────────────────────────────────────

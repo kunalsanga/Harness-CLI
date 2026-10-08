@@ -62,6 +62,9 @@ class Sym:
     ARROW_R = "▶"      # ▶
     THIN_LINE = "─"    # ─
     BULLET = "•"       # •
+    BOLT = "⚡"         # ⚡
+    STOP = "⏹"         # ⏹
+    HOOK = "↳"         # ↳
 
     @classmethod
     def safe_check(cls) -> str:
@@ -74,6 +77,10 @@ class Sym:
     @classmethod
     def safe_warn(cls) -> str:
         return "!"
+
+    @classmethod
+    def safe_diamond(cls) -> str:
+        return "*"
 
 
 # ── Terminal helpers ────────────────────────────────────────────────────────
@@ -109,6 +116,56 @@ def fmt_elapsed(seconds: float) -> str:
         return f"{mins}m{secs:02d}s"
     hours, mins = divmod(mins, 60)
     return f"{hours}h{mins:02d}m"
+
+
+def shorten_path(path: str, workspace: str = "") -> str:
+    """Convert an absolute path to a compact workspace-relative path.
+
+    Uses forward slashes for consistent display across platforms.
+    Falls back to basename if the path is outside the workspace.
+    """
+    if not path:
+        return "?"
+    normalized = path.replace("\\", "/")
+    if workspace:
+        ws = workspace.replace("\\", "/").rstrip("/") + "/"
+        if normalized.startswith(ws):
+            return normalized[len(ws):]
+    # Fallback: if the path is long, show just the last 2-3 segments
+    parts = normalized.split("/")
+    if len(parts) > 3 and len(normalized) > 50:
+        return "/".join(parts[-3:])
+    if len(normalized) > 60:
+        return "/".join(parts[-2:]) if len(parts) > 1 else parts[-1]
+    return normalized
+
+
+# ── Phase mapping — backend phases → user-facing display states ─────────────
+# These map directly to the backend's AgentLoop._emit_phase() values.
+# No invented states. Only render what the backend actually emits.
+
+PHASE_DISPLAY: dict[str, str] = {
+    "understanding": "Understanding",
+    "planning": "Planning",
+    "implementing": "Working",
+    "testing": "Verifying",
+    "diagnosing": "Repairing",
+    "fixing": "Repairing",
+    "verifying": "Verifying",
+    "committing": "Working",
+    "pushing": "Working",
+    "complete": "Completed",
+    "workflow": "Working",
+}
+
+PHASE_ICON: dict[str, str] = {
+    "Understanding": Sym.SPINNER,
+    "Planning": Sym.SPINNER,
+    "Working": Sym.SPINNER,
+    "Verifying": Sym.SPINNER,
+    "Repairing": Sym.WARN,
+    "Completed": Sym.CHECK,
+}
 
 
 # ── Renderable Builders (pure, no state) ────────────────────────────────────
@@ -250,18 +307,25 @@ def render_welcome(
     *,
     plain: bool = False,
 ) -> None:
-    """Compact welcome — minimal chrome. No giant ASCII, no dashboard."""
+    """Compact branded welcome — distinctive Harness wordmark.
+
+    ◆ Harness
+      Autonomous AI Engineering
+      project-name
+    """
     import os
     project_name = os.path.basename(workspace)
-    ws_display = workspace if len(workspace) <= 60 else "..." + workspace[-57:]
     if plain:
-        console.print("Harness")
-        console.print(f"{workspace}")
+        console.print(f"{Sym.safe_diamond()} Harness")
+        console.print(f"  Autonomous AI Engineering")
+        console.print(f"  {project_name}")
         console.print("")
         return
-    console.print(f"  [bold]Harness[/] [dim]·[/] [bold]{project_name}[/]", highlight=False)
-    console.print(f"  [dim]{ws_display}[/]", highlight=False)
-    console.print(f"  [dim]{'─' * 48}[/]", highlight=False)
+    console.print("")
+    console.print(f"  [cyan]{Sym.DIAMOND}[/] [bold white]Harness[/]", highlight=False)
+    console.print(f"  [dim]Autonomous AI Engineering[/]", highlight=False)
+    console.print(f"  [dim]{project_name}[/]", highlight=False)
+    console.print("")
 
 
 def render_status_line(

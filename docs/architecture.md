@@ -1,5 +1,10 @@
 # Harness Engineering CLI — Architecture
 
+> Historical capability overview. It describes a wider provider-neutral design
+> than the currently active task runtime. The normal interactive path uses
+> OpenRouter; current wiring is documented in
+> [`.agent-context/ARCHITECTURE.md`](../.agent-context/ARCHITECTURE.md).
+
 ## System Overview
 
 ```

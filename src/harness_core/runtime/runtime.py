@@ -42,7 +42,7 @@ from harness_core.agents.message_bus import AgentMessageBus
 from harness_core.agents.registry import AgentRegistry
 from harness_core.agents.scheduler import Scheduler
 from harness_core.observability.events import Event, EventBus
-from harness_core.planning.domain import Plan, PlanningResult
+from harness_core.planning.domain import Plan, PlanningResult, TaskContract, TaskIntent, classify_request
 from harness_core.planning.planner import Planner
 from harness_core.runtime.context import assemble_role_context
 from harness_core.runtime.requirements import (
@@ -65,6 +65,93 @@ if TYPE_CHECKING:
 
 RECOVERY_MARKER = "_recovery_"
 RETEST_MARKER = "_retest_"
+
+
+@dataclass
+class RuntimeCheckpoint:
+    """Serializable snapshot of runtime state for crash recovery (Directive 7).
+
+    On resume: restore state, inspect workspace, reconcile filesystem,
+    detect changes since checkpoint, continue from the correct task.
+    """
+
+    project_id: str = ""
+    workspace: str = ""
+    session_id: str = ""
+    original_request: str = ""
+    status: str = "running"
+    stage: str = "unknown"
+    created_at: float = 0.0
+    # Task graph state
+    task_graph_dict: dict[str, Any] | None = None
+    # Requirements
+    requirements_dict: dict[str, Any] | None = None
+    # Traceability
+    traceability_dict: dict[str, Any] | None = None
+    # Recovery state
+    recovery_attempts: int = 0
+    recovery_exhausted: bool = False
+    # Provider/model state
+    current_provider: str = ""
+    current_model: str = ""
+    # Tool history (last N for context restoration)
+    tool_history_summary: list[dict[str, Any]] | None = None
+    # Verification state
+    verification_status: str = "not_started"
+    # Discovered context
+    modified_files: list[str] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_id": self.project_id,
+            "workspace": self.workspace,
+            "session_id": self.session_id,
+            "original_request": self.original_request,
+            "status": self.status,
+            "stage": self.stage,
+            "created_at": self.created_at,
+            "task_graph": self.task_graph_dict,
+            "requirements": self.requirements_dict,
+            "traceability": self.traceability_dict,
+            "recovery_attempts": self.recovery_attempts,
+            "recovery_exhausted": self.recovery_exhausted,
+            "current_provider": self.current_provider,
+            "current_model": self.current_model,
+            "tool_history_summary": self.tool_history_summary,
+            "verification_status": self.verification_status,
+            "modified_files": self.modified_files,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RuntimeCheckpoint:
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    def save(self, path: Path) -> None:
+        """Persist checkpoint to disk as JSON."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), indent=2, default=str), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: Path) -> RuntimeCheckpoint | None:
+        """Load checkpoint from disk. Returns None if file doesn't exist or is corrupt."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return cls.from_dict(data)
+        except (FileNotFoundError, json.JSONDecodeError, TypeError):
+            return None
+
+    def is_stale(self, workspace_path: str) -> bool:
+        """Check if checkpoint is stale (workspace changed since checkpoint)."""
+        ws = Path(workspace_path)
+        if not ws.exists():
+            return True
+        # A simple heuristic: if the workspace root's mtime is newer than
+        # the checkpoint, files may have changed externally.
+        try:
+            ws_mtime = ws.stat().st_mtime
+            return ws_mtime > self.created_at
+        except OSError:
+            return True
 
 
 def _is_recovery_task(task_id: str) -> bool:
@@ -120,7 +207,14 @@ class EngineeringRuntime:
         # planning may use its own provider boundary so callers can stub the
         # model without stubbing the (real) scheduler + worker execution.
         self._provider = provider
-        self._plan_provider = plan_provider or provider
+        if router is not None:
+            from harness_core.providers.routed import RoutedModelProvider
+            routed_provider = RoutedModelProvider(router)
+            self._plan_provider = routed_provider
+            self._execution_provider = routed_provider
+        else:
+            self._plan_provider = plan_provider or provider
+            self._execution_provider = provider
 
         self.lock_manager = WorkspaceLockManager(self.workspace_path)
         self.scheduler: Scheduler | None = None
@@ -183,6 +277,21 @@ class EngineeringRuntime:
         self.state.original_request = original_request
         await self._emit("runtime_started", {"project_id": self.project_id})
 
+        # Classify intent at the start of planning-based execution.
+        await self._enter_stage(RuntimeStage.UNDERSTANDING, detail="classifying intent")
+        contract = classify_request(original_request)
+        self.state.task_contract = contract
+        await self._emit(
+            "task.intent_detected",
+            {
+                "intent": contract.intent.value,
+                "complexity": contract.complexity.value,
+                "is_read_only": contract.is_read_only,
+                "scope": contract.scope,
+                "objective": original_request[:200],
+            },
+        )
+
         await self._enter_stage(RuntimeStage.DISCOVER, detail="project context loaded")
 
         if requirements is None:
@@ -226,7 +335,7 @@ class EngineeringRuntime:
         scheduler = Scheduler(
             event_bus=self.event_bus,
             registry=self.registry,
-            provider=self._provider,
+            provider=self._execution_provider,
             tools=self.tools,
             workspace_path=self.workspace_path,
             max_concurrency=self.max_concurrency,
@@ -339,7 +448,7 @@ class EngineeringRuntime:
             duration_ms=(time.time() - started) * 1000,
         )
 
-    # ── Interactive execution (Stage 1: canonical runtime path) ────────────
+    # ── Interactive execution (canonical runtime path) ────────────────────
 
     async def execute_interactive(
         self,
@@ -350,34 +459,63 @@ class EngineeringRuntime:
     ) -> RuntimeOutcome:
         """Execute a single interactive task through the canonical runtime.
 
-        Skips the model-driven planner: creates a single-task graph directly
-        and runs it through the Scheduler → WorkerAgent → AgentLoop chain.
-        This is the single authoritative execution path for interactive mode.
+        This is the SINGLE AUTHORITATIVE execution path for interactive mode.
+        It classifies intent BEFORE creating the task graph, so the execution
+        strategy matches what the user actually asked for.
+
+        Intent → Contract → Strategy:
+          EXPLAIN/ANALYZE/RESEARCH/REVIEW  → read-only, skip verification
+          IMPLEMENT/MODIFY/DEBUG           → full execution + verification
+          GIT                              → git operations
+          TEST                             → test-only
+          MIXED                            → best-effort full path
         """
         started = time.time()
         self.state.original_request = goal
         await self._emit("runtime_started", {"project_id": self.project_id})
 
+        # ── Step 1: Classify intent (BEFORE planning) ──────────────────
+        await self._enter_stage(RuntimeStage.UNDERSTANDING, detail="classifying intent")
+        contract = classify_request(goal)
+        self.state.task_contract = contract
+        await self._emit(
+            "task.intent_detected",
+            {
+                "intent": contract.intent.value,
+                "complexity": contract.complexity.value,
+                "is_read_only": contract.is_read_only,
+                "scope": contract.scope,
+                "objective": goal[:200],
+            },
+        )
+
+        # ── Step 2: Discover project context ───────────────────────────
         await self._enter_stage(RuntimeStage.DISCOVER, detail="project context loaded")
 
+        # ── Step 3: Structure requirements ─────────────────────────────
         if requirements is None:
             requirements = Requirements(objective=goal)
         if not requirements.objective:
             requirements.objective = goal
         self.state.requirements = requirements
         await self._enter_stage(RuntimeStage.UNDERSTAND, detail="requirements structured")
+        req_count = len(requirements.to_requirements())
         await self._emit(
             "requirements_created",
-            {"objective": requirements.objective, "requirement_count": len(requirements.to_requirements())},
+            {"objective": requirements.objective, "requirement_count": req_count},
         )
 
-        # Build a single-task graph directly (no model planner needed).
-        await self._enter_stage(RuntimeStage.PLAN, detail="interactive single-task plan")
+        # ── Step 4: Build task graph ───────────────────────────────────
+        await self._enter_stage(RuntimeStage.PLAN, detail="building task graph")
+
+        # Select role based on intent
+        role = _role_for_intent(contract.intent)
+
         graph = TaskGraph()
         task = SubTask(
             task_id="interactive_task_1",
             description=goal,
-            role=AgentRole.CODER,
+            role=role,
             dependencies=[],
             priority=10,
         )
@@ -401,13 +539,13 @@ class EngineeringRuntime:
         # Attach context to the single task.
         await self._attach_task_contexts(graph, index)
 
-        # Execute through the real Scheduler.
+        # ── Step 5: Execute through the real Scheduler ──────────────────
         await self._enter_stage(RuntimeStage.EXECUTE, detail="scheduler dispatch")
         bus = AgentMessageBus(self.event_bus, graph, self.registry)
         scheduler = Scheduler(
             event_bus=self.event_bus,
             registry=self.registry,
-            provider=self._provider,
+            provider=self._execution_provider,
             tools=self.tools,
             workspace_path=self.workspace_path,
             max_concurrency=self.max_concurrency,
@@ -451,24 +589,45 @@ class EngineeringRuntime:
         for task_id in list(getattr(self.lock_manager, "_locks", {})):
             await self.lock_manager.release_all(task_id)
 
-        # Record artifacts and verify.
+        # Record artifacts.
         self._record_artifacts_from_tasks(graph)
 
-        await self._enter_stage(RuntimeStage.VERIFY, detail="requirement verification")
-        verification_ok, summary, results = self._verify_requirements(graph, index)
-        self.state.verification_status = (
-            VerificationStatus.PASSED if verification_ok else VerificationStatus.FAILED
-        )
+        # ── Step 6: Verification (intent-aware) ────────────────────────
+        if contract.should_skip_verification():
+            # Read-only tasks: no verification needed — they produce no changes.
+            # Mark verification as passed based on task completion evidence.
+            completed_tasks = [
+                t for t in graph.tasks.values()
+                if t.status == TaskStatus.COMPLETED
+            ]
+            verification_ok = len(completed_tasks) > 0
+            summary = f"read-only {contract.intent.value} task — no verification needed"
+            results = []
+            self.state.verification_status = (
+                VerificationStatus.PASSED if verification_ok else VerificationStatus.FAILED
+            )
+        else:
+            await self._enter_stage(RuntimeStage.VERIFY, detail="requirement verification")
+            verification_ok, summary, results = self._verify_requirements(graph, index)
+            self.state.verification_status = (
+                VerificationStatus.PASSED if verification_ok else VerificationStatus.FAILED
+            )
         self.state.verification_summary = summary
         self.state.verification_results = results
         await self._emit(
             "verification_completed",
-            {"passed": verification_ok, "summary": summary, "results": results},
+            {
+                "passed": verification_ok,
+                "summary": summary,
+                "results": results,
+                "intent": contract.intent.value,
+                "skipped_reason": "read_only" if contract.should_skip_verification() else None,
+            },
         )
 
         await self._record_memory_references(graph, index)
 
-        # Terminal status decision.
+        # ── Step 7: Terminal status decision (intent-aware) ─────────────
         failed_originals = [
             t.task_id
             for t in graph.tasks.values()
@@ -485,9 +644,9 @@ class EngineeringRuntime:
             detail = f"Verification failed: {summary}"
         else:
             status = RuntimeStatus.SUCCESS
-            detail = "all requirements verified"
+            detail = "all requirements verified" if not contract.is_read_only else "task completed"
             await self._enter_stage(RuntimeStage.DELIVER, detail=detail)
-            await self._enter_stage(RuntimeStage.SUCCEEDED)
+            await self._enter_stage(RuntimeStage.COMPLETE)
 
         self.state.status = status
         self.state.completed_at = time.time()
@@ -496,7 +655,12 @@ class EngineeringRuntime:
             self.state.register_blocker(detail)
             await self._emit("runtime_failed", {"reason": detail})
         else:
-            await self._emit("runtime_completed", {"status": status.value})
+            await self._emit("runtime_completed", {
+                "status": status.value,
+                "intent": contract.intent.value,
+                "is_read_only": contract.is_read_only,
+                "duration_ms": round((time.time() - started) * 1000, 1),
+            })
 
         return RuntimeOutcome(
             state=self.state,
@@ -867,6 +1031,29 @@ class EngineeringRuntime:
 
 
 # ── Module-level helpers (pure) ───────────────────────────────────────────
+
+
+def _role_for_intent(intent: TaskIntent) -> AgentRole:
+    """Map a TaskIntent to the appropriate AgentRole for the SubTask.
+
+    The SubTask role determines which AgentRole the WorkerAgent uses,
+    which in turn influences the system prompt and available tools.
+    """
+    _ROLE_MAP: dict[TaskIntent, AgentRole] = {
+        TaskIntent.EXPLAIN: AgentRole.CODER,
+        TaskIntent.ANALYZE: AgentRole.CODER,
+        TaskIntent.RESEARCH: AgentRole.CODER,
+        TaskIntent.IMPLEMENT: AgentRole.CODER,
+        TaskIntent.MODIFY: AgentRole.CODER,
+        TaskIntent.DEBUG: AgentRole.DEBUGGER,
+        TaskIntent.TEST: AgentRole.TESTER,
+        TaskIntent.REFACTOR: AgentRole.CODER,
+        TaskIntent.REVIEW: AgentRole.REVIEWER,
+        TaskIntent.GIT: AgentRole.CODER,
+        TaskIntent.DEPLOY: AgentRole.CODER,
+        TaskIntent.MIXED: AgentRole.CODER,
+    }
+    return _ROLE_MAP.get(intent, AgentRole.CODER)
 
 
 def build_traceability_index(

@@ -114,6 +114,36 @@ def _format_elapsed(seconds: float) -> str:
     return f"{hours}h{mins:02d}m{secs:02d}s"
 
 
+def _friendly_model_error(detail: str) -> str:
+    """Turn provider diagnostics into concise user-facing categories."""
+    value = detail.lower()
+    if "401" in value or "unauthorized" in value or "invalid api key" in value:
+        return "Provider authentication failed. Check the configured provider credential."
+    if "403" in value or "forbidden" in value:
+        return "Provider access was denied. Check credential permissions and model access."
+    # Truncated auth diagnostics may have lost the numeric status; the shared
+    # credential is the common cause, so default to the credential message.
+    if "auth/access failure" in value:
+        return "Provider authentication failed. Check the configured provider credential."
+    if "429" in value or "rate limit" in value or "too many requests" in value:
+        return "Configured models are rate limited. Retry after the provider cooldown."
+    if "timeout" in value or "timed out" in value:
+        return "Model request timed out."
+    if "connecterror" in value or "network error" in value or "connection" in value:
+        return "Could not connect to the model provider. Check your network connection."
+    # Exhausted the free pool — fail-fast summary (per-model detail included).
+    if "no configured free model is currently available" in value:
+        return detail.strip()
+    # Exhausted the free pool on model-specific availability failures
+    # (e.g. Nemotron's structured provider_unavailable wrap) — distinct from
+    # rate limiting; each model was genuinely tried and rotated past.
+    if "model unavailable" in value or "model_unavailable" in value:
+        return "Configured models are temporarily unavailable. Try again shortly."
+    if "unavailable" in value or "no endpoints" in value or "5xx" in value or "500" in value or "502" in value or "503" in value or "504" in value:
+        return "The selected provider is temporarily unavailable."
+    return "Task paused. The selected provider is temporarily unavailable.\n\nYour session is preserved.\n\nTry again or switch provider with /models."
+
+
 # Unified slash commands — single source for completer + handler (spec §2)
 SLASH_COMMANDS: list[str] = [
     "/help", "/status", "/model", "/models", "/session", "/diff", "/clear",
@@ -205,6 +235,7 @@ class InteractiveShell:
         self._event_bus: Any = None
         self._agent_loop: Any = None
         self._provider: Any = None
+        self._providers: list[Any] = []
         self._router: Any = None
         self._task_aware: Any = None
         self._tools: list[Any] = []
@@ -220,21 +251,55 @@ class InteractiveShell:
         self._pt_history: Any = None
         self._pt_completer: Any = None
         self._pt_history_items: list[str] = []
+        self._first_task = True
+        self._shown_failovers: set[tuple[str, str]] = set()
+        self._last_model_error = ""
 
     # ─── Welcome ───────────────────────────────────────────────────────
 
     def _print_welcome(self) -> None:
-        """Compact branded startup header."""
+        """Compact session header with provider, mode, model, and workspace."""
         import os
-        project_name = os.path.basename(self.workspace)
-        if self.plain:
-            self.console.print(f"Harness")
-            self.console.print(f"{self.workspace}")
-            self.console.print("")
-            return
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.text import Text
+
+        project_name = Path(self.workspace).name if self.workspace else "app"
+        provider = self.current_provider or "openrouter"
+        mode = self.mode
+        model = self.current_model or self.model or "Auto"
+
+        width = self._get_real_terminal_width()
+
+        logo_str = (
+            r"[#3b82f6] __  __     [#6366f1]______     [#8b5cf6]______     [#a855f7]__   __     [#d946ef]______     [#ec4899]______     [#f43f5e]______    [/]" + "\n" +
+            r"[#3b82f6]/\ \_\ \   [#6366f1]/\  __ \   [#8b5cf6]/\  == \   [#a855f7]/\ '-.\ \   [#d946ef]/\  ___\   [#ec4899]/\  ___\   [#f43f5e]/\  ___\   [/]" + "\n" +
+            r"[#3b82f6]\ \  __ \  [#6366f1]\ \  __ \  [#8b5cf6]\ \  __<   [#a855f7]\ \ \-.  \  [#d946ef]\ \  __\   [#ec4899]\ \___  \  [#f43f5e]\ \___  \  [/]" + "\n" +
+            r"[#3b82f6] \ \_\ \_\  [#6366f1]\ \_\ \_\  [#8b5cf6]\ \_\ \_\  [#a855f7]\ \_\\'\_\  [#d946ef]\ \_____\  [#ec4899]\/\_____\  [#f43f5e]\/\_____\ [/]" + "\n" +
+            r"[#3b82f6]  \/_/\/_/   [#6366f1]\/_/\/_/   [#8b5cf6]\/_/ /_/   [#a855f7]\/_/ \/_/   [#d946ef]\/_____/   [#ec4899]\/_____/   [#f43f5e]\/_____/ [/]" + "\n" +
+            r"                  [dim]AUTONOMOUS AI ENGINEERING[/]"
+        )
+
+        workspace_str = str(self.workspace)
+        if len(workspace_str) > 45:
+            workspace_str = "...\\" + os.path.basename(workspace_str)
+
+        info_text = Text.from_markup(f"[bold]>_ HARNESS[/] (v{__version__})\n\n[dim]API Key | {provider} · {model} · {mode}\n{workspace_str}[/]")
+        info_text.justify = "left"
+        info_panel = Panel(info_text, border_style="dim", expand=False)
+
+        if width >= 130:
+            grid = Table.grid(expand=True)
+            grid.add_column()
+            grid.add_column(justify="right")
+            grid.add_row(logo_str, info_panel)
+            self.console.print(grid)
+        else:
+            self.console.print(logo_str)
+            self.console.print(info_panel)
+
         self.console.print("")
-        self.console.print("  [bold white]Harness[/]  [dim]Autonomous AI Engineering[/]", highlight=False)
-        self.console.print(f"  [dim]{project_name}[/]", highlight=False)
+        self.console.print("[dim]Tips: Use Ctrl+Enter for a new line, and / for commands.[/]")
         self.console.print("")
 
     def _print_status_line(self) -> None:
@@ -250,7 +315,7 @@ class InteractiveShell:
 
     async def _setup_provider(self) -> bool:
         try:
-            from harness_core.providers.openrouter import OpenRouterProvider
+            from harness_core.providers.factory import create_providers, load_project_provider_config
             from harness_core.observability.events import EventBus
             from harness_core.routing.router import ModelRouter, RouterConfig
             from harness_core.routing.task_aware import TaskAwareRouter
@@ -263,29 +328,10 @@ class InteractiveShell:
             from harness_core.tools.shell import RunCommandTool
 
             self._event_bus = EventBus()
-            providers: list[Any] = []
-            openrouter = OpenRouterProvider()
-            if await openrouter.health_check():
-                providers.append(openrouter)
-            try:
-                from harness_core.providers.ollama import OllamaProvider
-                ollama = OllamaProvider()
-                if await ollama.health_check():
-                    providers.append(ollama)
-            except Exception:
-                pass
-            try:
-                from harness_core.providers.nvidia import NvidiaProvider
-                nvidia = NvidiaProvider()
-                if await nvidia.health_check():
-                    providers.append(nvidia)
-            except Exception:
-                pass
-            if not providers:
-                self.console.print("  [red]No providers available.[/]")
-                self.console.print("  [dim]Set OPENROUTER_API_KEY or start Ollama.[/]")
-                return False
+            providers = create_providers(load_project_provider_config(self.workspace))
+            self._providers = providers
             self._provider = providers[0]
+            self.current_provider = self._provider.name
             router_config = RouterConfig()
             effective_mode = self.mode
             if self.free:
@@ -306,6 +352,7 @@ class InteractiveShell:
                     if routing_data:
                         router_config.routing_mode = routing_data.get("strategy", effective_mode)
                         router_config.prefer_free = routing_data.get("prefer_free", False)
+                        router_config.allow_paid_models = routing_data.get("allow_paid_models", False)
                     if budgets_data:
                         router_config.budget.max_iterations = budgets_data.get("max_iterations", self.max_iterations)
                         router_config.budget.max_cost = budgets_data.get("max_cost_per_task", 5.0)
@@ -313,13 +360,24 @@ class InteractiveShell:
                     pass
             self._task_aware = TaskAwareRouter(registry=ModelRegistry())
             self._router = ModelRouter(providers=providers, config=router_config, event_bus=self._event_bus, task_aware=self._task_aware)
-            tools = [ReadFileTool(), WriteFileTool(), EditFileTool(), ListFilesTool(), GlobTool(), GrepTool(), RunCommandTool(working_directory=self.workspace), GitStatusTool(), GitDiffTool(), GitLogTool(), GitIdentityTool(), GitAddTool(), GitCommitTool(), GitPushTool(), GitRemoteTool()]
+            # Project intelligence: one facade shared by search tools and the
+            # context pipeline (SYMBOL/DEPENDENCY sources). Build failure is
+            # non-fatal — tools/pipeline fall back to their own scans.
+            try:
+                from harness_core.intelligence import ProjectIntelligence
+                intelligence = ProjectIntelligence(self.workspace)
+                intelligence.scan()
+            except Exception:
+                intelligence = None
+            tools = [ReadFileTool(), WriteFileTool(), EditFileTool(), ListFilesTool(), GlobTool(intelligence), GrepTool(intelligence), RunCommandTool(working_directory=self.workspace), GitStatusTool(), GitDiffTool(), GitLogTool(), GitIdentityTool(), GitAddTool(), GitCommitTool(), GitPushTool(), GitRemoteTool()]
             self._tools = tools
             agent_config = AgentConfig(role=AgentRole.BUILD, max_iterations=self.max_iterations, model_preference=self.model, routing_mode=effective_mode)
-            self._agent_loop = AgentLoop(provider=self._provider, tools=tools, workspace_root=Path(self.workspace), config=agent_config, event_bus=self._event_bus, router=self._router, task_aware=self._task_aware)
+            self._agent_loop = AgentLoop(provider=self._provider, tools=tools, workspace_root=Path(self.workspace), config=agent_config, event_bus=self._event_bus, router=self._router, task_aware=self._task_aware, intelligence=intelligence)
             return True
         except Exception as e:
-            self.console.print(f"  [red]Setup failed: {_safe_str(e)}[/]")
+            self.console.print("  [red]Could not initialize the configured provider session.[/]")
+            if self.verbose:
+                self.console.print(f"  [dim]{_safe_str(e)}[/]")
             return False
 
     # ─── Event Handlers — truthful, live (spec §4, §16) ────────────────
@@ -335,7 +393,7 @@ class InteractiveShell:
 
         async def on_task_started(event: Any) -> None:
             goal = event.data.get("goal", "")
-            self.task_start = time.time()
+            self.task_start = time.monotonic()
             # Prompt was already rendered by _execute_task via conv.start(goal).
             # Do NOT print it again here.  Just ensure the renderer is running.
 
@@ -400,12 +458,43 @@ class InteractiveShell:
             provider = event.data.get("provider", "")
             self.current_model = model
             self.current_provider = provider
+            if _conv() is not None and model:
+                _conv().update_model_activity(model)
+                _conv().update_models([model])
             if self.verbose:
                 self.console.print(f"  [dim]  model: {model} ({provider})[/]", highlight=False)
 
         async def on_model_switched(event: Any) -> None:
-            # Model switches are tracked internally; surfaced in completion if needed.
-            pass
+            old_id = str(event.data.get("from", ""))
+            new_id = str(event.data.get("to", ""))
+            pair = (old_id, new_id)
+            if pair in self._shown_failovers:
+                return
+            self._shown_failovers.add(pair)
+            
+            self.current_model = new_id or self.current_model
+            if _conv() is not None and new_id:
+                _conv().update_model_activity(new_id)
+                _conv().update_models([old_id, new_id])
+                
+            # Do NOT expose internal model routing details in normal UI.
+            if not self.verbose:
+                return
+            
+            def display_name(model_id: str) -> str:
+                aliases = {
+                    "google/gemma-4-31b-it:free": "Gemma 4 31B",
+                    "google/gemma-4-26b-a4b-it:free": "Gemma 4 26B A4B",
+                    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": "Nemotron 3 Nano",
+                    "openrouter/free": "OpenRouter Free",
+                }
+                return aliases.get(model_id, model_id)
+            old, new = display_name(old_id), display_name(new_id)
+            reason = str(event.data.get("reason", ""))
+            if old and new:
+                why = "reached its current limit" if "rate" in reason else "is temporarily unavailable"
+                self.console.print(f"  [yellow]{old} {why}[/]", highlight=False)
+                self.console.print(f"  [dim]Continuing with {new}[/]", highlight=False)
 
         async def on_routing_models_refreshed(event: Any) -> None:
             count = event.data.get("count", 0)
@@ -421,7 +510,7 @@ class InteractiveShell:
         async def on_tool_call(event: Any) -> None:
             tool = event.data.get("tool", "")
             args = event.data.get("args", {})
-            if _conv() is not None:
+            if event.data.get("workflow") and _conv() is not None:
                 _conv().tool_started(tool, args)
             if self.verbose:
                 display = _tool_display_name(tool, args)
@@ -433,9 +522,11 @@ class InteractiveShell:
             exit_code = event.data.get("exit_code")
             error = event.data.get("error", "")
             self.total_tool_calls += 1
-            # Update renderers
-            if _conv() is not None:
-                _conv().tool_completed(tool, status)
+            if event.data.get("workflow") and _conv() is not None:
+                _conv().tool_completed(
+                    tool,
+                    "success" if status == "success" else "failed",
+                )
             # Compact, truthful console echo only when not in Live mode
             if self.plain or _conv() is None:
                 activity_name = tool
@@ -448,7 +539,7 @@ class InteractiveShell:
                     if error:
                         first_line = error.split("\n")[0]
                         if first_line:
-                            self.console.print(f"  [red]  {_safe_str(first_line)}[/]", highlight=False)
+                            self.console.print(f"  [red]  {_safe_str(first_line) if self.verbose else 'Tool execution failed.'}[/]", highlight=False)
                 else:
                     self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
             elif status != "success" and status != "permission_denied":
@@ -457,14 +548,40 @@ class InteractiveShell:
                     self.console.print(f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
 
         async def on_model_error(event: Any) -> None:
-            # Model errors are surfaced via the completion status.
-            # Do NOT print directly here — it creates out-of-order event noise.
-            pass
+            # Retain the diagnostic for accurate final classification; never
+            # print provider details in normal mode.
+            self._last_model_error = str(event.data.get("error", ""))
 
         async def on_task_phase(event: Any) -> None:
             phase = event.data.get("phase", "")
             if _conv() is not None:
                 _conv().update_phase(phase)
+
+        async def on_execution_state(event: Any) -> None:
+            if _conv() is not None:
+                _conv().update_execution(event.data)
+
+        async def on_model_started(event: Any) -> None:
+            if _conv() is not None:
+                _conv().update_model_activity(str(event.data.get("model", "")))
+
+        async def on_model_completed(event: Any) -> None:
+            if _conv() is not None:
+                _conv().update_model_activity("")
+
+        async def on_tool_started(event: Any) -> None:
+            if _conv() is not None:
+                _conv().tool_started_safe(
+                    str(event.data.get("tool", "")),
+                    str(event.data.get("summary", "")),
+                )
+
+        async def on_tool_terminal(event: Any) -> None:
+            if _conv() is not None:
+                _conv().tool_completed(
+                    str(event.data.get("tool", "")),
+                    "success" if event.type == "tool.completed" else "failed",
+                )
 
         async def on_task_completed(event: Any) -> None:
             status = event.data.get("status", "")
@@ -479,6 +596,12 @@ class InteractiveShell:
                 "recovered": event.data.get("recovered", 0),
                 "unresolved": event.data.get("unresolved", 0),
             }
+            if _conv() is not None:
+                execution = event.data.get("execution") or {}
+                if execution:
+                    _conv().update_execution(execution)
+                _conv().update_todo_items(event.data.get("todos") or [])
+                _conv().update_models(event.data.get("models_used") or [])
 
         async def on_verification(event: Any) -> None:
             # Verification is now shown via the completion summary, not as a separate dashboard line.
@@ -487,6 +610,14 @@ class InteractiveShell:
                 self.console.print("  [yellow]◐[/] [bold]Verifying...[/]", highlight=False)
             elif event.type == "verification.completed":
                 passed = event.data.get("passed", False)
+                if _conv() is not None:
+                    if not passed:
+                        note = "Verification needs attention"
+                    elif not event.data.get("checks_run", 0):
+                        note = "Files present; no automated checks detected"
+                    else:
+                        note = "Checks passed"
+                    _conv().update_verification(note)
                 if self.verbose:
                     if passed:
                         self.console.print("  [green]✓[/] [bold]Verification passed[/]", highlight=False)
@@ -535,16 +666,23 @@ class InteractiveShell:
         bus.on("plan.created", on_plan_created)
         bus.on("task.classified", on_task_classified)
         bus.on("task.phase", on_task_phase)
+        bus.on("execution.state", on_execution_state)
+        bus.on("model.started", on_model_started)
+        bus.on("model.completed", on_model_completed)
         bus.on("routing.decision", on_routing_decision)
         bus.on("router.models_refreshed", on_routing_models_refreshed)
         bus.on("iteration.started", on_iteration_started)
         bus.on("tool.call", on_tool_call)
         bus.on("tool.result", on_tool_result)
+        bus.on("tool.started", on_tool_started)
+        bus.on("tool.completed", on_tool_terminal)
+        bus.on("tool.failed", on_tool_terminal)
         bus.on("model.error", on_model_error)
         bus.on("task.completed", on_task_completed)
         bus.on("task.failed", on_task_failed)
         bus.on("task.paused", on_task_paused)
         bus.on("model.switched", on_model_switched)
+        bus.on("model.failover", on_model_switched)
         bus.on("test.completed", on_test_completed)
         bus.on("diagnosis.triggered", on_diagnosis_triggered)
         bus.on("progress.stalled", on_progress_stalled)
@@ -585,7 +723,7 @@ class InteractiveShell:
         elif command == "/status":
             self._cmd_status()
         elif command == "/model":
-            self._cmd_model()
+            await self._cmd_model(args)
         elif command == "/models":
             await self._cmd_models()
         elif command == "/session":
@@ -659,7 +797,7 @@ class InteractiveShell:
     def _cmd_status(self) -> None:
         elapsed = time.time() - self.session_start if self.session_start else 0
         time_str = _format_elapsed(elapsed)
-        task_elapsed = time.time() - self.task_start if self.task_start and self.running else 0
+        task_elapsed = time.monotonic() - self.task_start if self.task_start and self.running else 0
         if self.plain:
             self.console.print(f"Session: {self.session_id or 'none'}")
             self.console.print(f"Model: {self.current_model or 'not set'}")
@@ -684,7 +822,35 @@ class InteractiveShell:
             table.add_row("Task time", f"{task_elapsed:.1f}s")
         self.console.print(table)
 
-    def _cmd_model(self) -> None:
+    async def _cmd_model(self, args: str = "") -> None:
+        if args:
+            parts = args.split("/", 1)
+            if len(parts) == 2 and parts[1].strip():
+                prov_name = parts[0].strip().lower()
+                model_id = parts[1].strip()
+                
+                if prov_name not in self._router.providers:
+                    self.console.print(f"  [red]✗ Invalid provider: {prov_name}[/]")
+                    return
+                
+                try:
+                    models = await self._router.refresh_models()
+                    found = any(m.provider == prov_name and m.id == model_id for m in models)
+                    if not found:
+                        self.console.print(f"  [red]✗ Invalid model: {args}[/]")
+                        self.console.print("  [dim]Specify a complete provider/model identifier.[/]")
+                        return
+                except Exception:
+                    pass
+                
+                self.current_provider = prov_name
+                self.current_model = args
+                self.console.print(f"  [green]✓ Model set to {args}[/]")
+            else:
+                self.console.print(f"  [red]✗ Invalid model: {args}[/]")
+                self.console.print("  [dim]Specify a complete provider/model identifier.[/]")
+            return
+
         if self.plain:
             self.console.print(f"Model: {self.current_model or 'not set'}")
             self.console.print(f"Provider: {self.current_provider or 'not set'}")
@@ -702,33 +868,34 @@ class InteractiveShell:
 
     async def _cmd_models(self) -> None:
         try:
-            from harness_core.providers.openrouter import OpenRouterProvider
-            from harness_core.models.registry import ModelRegistry
-            from harness_core.models.discovery import discover_provider
-            openrouter = OpenRouterProvider()
-            if not await openrouter.health_check():
-                self.console.print("  [red]✗ Unable to retrieve models[/]")
-                self.console.print("  [dim]Cannot connect to OpenRouter. Check OPENROUTER_API_KEY.[/]")
-                await openrouter.close()
-                return
-            registry = ModelRegistry()
-            profiles = await discover_provider(openrouter)
-            for p in profiles:
-                registry.register(p)
-            await openrouter.close()
-            models = registry.list_all()
-            tool_models = [m for m in models if m.supports_tools]
-            table = Table(title=f"Models ({len(tool_models)} with tools)")
+            models = await self._router.refresh_models(force=True) if self._router else []
+            for provider in (self._router.providers.values() if self._router else []):
+                models.extend(await provider.routing_hints("free"))
+            health = getattr(self._router, "health", None)
+            table = Table(title="Configured / Discovered Models")
             table.add_column("Model", style="cyan", max_width=40)
             table.add_column("Provider", style="green")
-            table.add_column("Context", justify="right")
-            table.add_column("Free", justify="center")
-            for m in tool_models[:25]:
-                table.add_row(m.model_id, m.provider, str(m.context_window) if m.context_window else "-", "Y" if m.is_free else "")
+            table.add_column("Source")
+            table.add_column("Health")
+            table.add_column("Cooldown")
+            table.add_column("Tools")
+            for model in models[:60]:
+                model_id = model.id
+                state = health.get_state(model_id) if health is not None else None
+                if state is not None:
+                    status = state.display_status
+                    remaining = state.cooldown_remaining()
+                    cooldown = f"{remaining:.0f}s" if remaining > 0 else "—"
+                else:
+                    status, cooldown = "Unknown", "—"
+                configured = "Configured" if model_id in {m.id for p in (self._router.providers.values() if self._router else []) for m in getattr(p, "configured_models", [])} else "Discovered"
+                tools = "Supported" if model.supports_tools is True else "Unsupported" if model.supports_tools is False else "Unknown"
+                table.add_row(model.name or model_id, model.provider, configured, status, cooldown, tools)
             self.console.print(table)
         except Exception as e:
             self.console.print(f"  [red]✗ Unable to retrieve models[/]")
-            self.console.print(f"  [dim]{_safe_str(e)}[/]")
+            if self.verbose:
+                self.console.print(f"  [dim]{_safe_str(e)}[/]")
 
     def _cmd_session(self, args: str) -> None:
         sub = args.strip().lower() if args else "show"
@@ -783,7 +950,6 @@ class InteractiveShell:
                 self.console.print("  [bold]Changed files:[/]")
                 for line in result.stdout.strip().split("\n"):
                     self.console.print(f"    {line}")
-                self.console.print("")
                 self.console.print("  [dim]Run `git diff` in terminal for full diff.[/]")
             else:
                 self.console.print("  [dim]No changes detected.[/]")
@@ -990,11 +1156,17 @@ class InteractiveShell:
     # ─── Execution — conversation + streaming (spec §4, §9, §10) ───────
 
     async def _execute_task(self, goal: str) -> str | None:
+        self._shown_failovers.clear()
+        self._last_model_error = ""
+        if getattr(self, '_first_task', True):
+            self.console.clear()
+            self._first_task = False
+            
         if self.mode == "unified":
             return await self._execute_task_unified(goal)
         if self._provider is None:
             return "Agent not initialized. Please check provider configuration."
-        self.task_start = time.time()
+        self.task_start = time.monotonic()
         self.running = True
         self.cancel_event.clear()
 
@@ -1041,7 +1213,7 @@ class InteractiveShell:
         runtime._interactive_config = AgentConfig(
             role=AgentRole.BUILD,
             max_iterations=self.max_iterations,
-            model_preference=self.model,
+            model_preference=self.current_model or self.model,
             routing_mode=self.mode,
         )
         self._active_runtime = runtime
@@ -1061,17 +1233,28 @@ class InteractiveShell:
                     conv.stop()
                 except Exception:
                     pass
-            elapsed = time.time() - self.task_start
+            elapsed = time.monotonic() - self.task_start
+            if conv is not None:
+                models_used = conv.state.models_used or models_used
+                execution_timing = conv.state.phase_durations or execution_timing
+                if conv.state.started_at:
+                    elapsed = max(elapsed, time.monotonic() - conv.state.started_at)
 
             # Extract results from the RuntimeOutcome.
             status_val = "completed" if outcome.status.value == "success" else "failed"
             graph = outcome.graph
             agent_text = ""
             files_changed: list[str] = []
+            models_used: list[str] = []
+            execution_timing: dict[str, float] = {}
             if graph:
                 for task in graph.tasks.values():
                     if task.result:
                         agent_text = task.result
+                    models_used.extend(getattr(task, "models_used", []) or [])
+                    timeline = getattr(task, "execution_timeline", None)
+                    if timeline is not None:
+                        execution_timing = timeline.snapshot().get("phase_durations", {})
                     for f in (task.files_changed or []):
                         fname = f.replace("\\", "/").split("/")[-1]
                         if fname and fname not in files_changed:
@@ -1087,14 +1270,20 @@ class InteractiveShell:
                 try:
                     if agent_text:
                         conv.stream_response(agent_text)
-                    conv.render_completion(elapsed, success=(status_val == "completed"), status=status_val)
+                    conv.render_completion(
+                        elapsed,
+                        success=(status_val == "completed"),
+                        status=status_val,
+                        model=self.current_model,
+                        models_used=models_used,
+                        phase_durations=execution_timing,
+                    )
                 except Exception:
                     # Fallback markdown print
                     if agent_text and not self.plain:
                         from rich.markdown import Markdown
                         from rich.padding import Padding
                         self.console.print(Padding(Markdown(agent_text), (0, 0, 0, 2)))
-                        self.console.print("")
                     elif agent_text:
                         for line in agent_text.splitlines():
                             self.console.print(f"  {line}", highlight=False)
@@ -1111,7 +1300,6 @@ class InteractiveShell:
                     from rich.markdown import Markdown
                     from rich.padding import Padding
                     self.console.print(Padding(Markdown(agent_text), (0, 0, 0, 2)))
-                    self.console.print("")
                 elif agent_text:
                     for line in agent_text.splitlines():
                         self.console.print(f"  {line}", highlight=False)
@@ -1124,22 +1312,13 @@ class InteractiveShell:
                     self.console.print(f"  [red]✗[/] [dim]{status_val.title()} · {elapsed_str}[/]", highlight=False)
                 self.console.print("", highlight=False)
 
-            # On failure: tiny, contextual error — no diagnostic dashboard.
+            # Keep detailed diagnostics available in verbose mode; normal mode
+            # gets a category-specific summary without provider internals.
             if status_val != "completed":
                 error_msg = outcome.state.blockers[-1] if outcome.state.blockers else ""
-                error_line = ""
-                if error_msg:
-                    for eline in str(error_msg).splitlines():
-                        eline = eline.strip()
-                        if eline and len(eline) > 5:
-                            error_line = eline[:120]
-                            break
-                if not error_line:
-                    error_line = "Task did not complete successfully."
-                if self.plain:
-                    self.console.print(f"  {error_line}", highlight=False)
-                else:
-                    self.console.print(f"  [dim]{error_line}[/]", highlight=False)
+                diagnostic = str(error_msg or self._last_model_error)
+                error_line = _safe_str(diagnostic) if self.verbose and diagnostic else _friendly_model_error(diagnostic)
+                self.console.print(f"  {error_line}", highlight=False)
                 self.console.print("", highlight=False)
             if run and self.session_manager:
                 try:
@@ -1171,7 +1350,9 @@ class InteractiveShell:
                     conv.stop()
                 except Exception:
                     pass
-            self.console.print(f"\n  [red]✗ Error: {_safe_str(e)}[/]", highlight=False)
+            self.console.print("\n  [red]Task failed.[/]", highlight=False)
+            if self.verbose:
+                self.console.print(f"  [dim]{_safe_str(e)}[/]", highlight=False)
             if run and self.session_manager:
                 try:
                     self.session_manager.fail_run(run.run_id, str(e))
@@ -1189,6 +1370,11 @@ class InteractiveShell:
             self._conv = None
 
     async def _execute_task_unified(self, goal: str) -> str | None:
+        self._shown_failovers.clear()
+        self._last_model_error = ""
+        if getattr(self, '_first_task', True):
+            self._first_task = False
+
         from harness_core.cli.runtime_dashboard import LiveTerminalUI, RuntimeViewModel, render_failure_summary, render_success_summary
         from harness_core.memory.manager import init_memory_manager_from_project
         from harness_core.runtime.runtime import EngineeringRuntime
@@ -1205,8 +1391,15 @@ class InteractiveShell:
                 config_data = {}
             memory = init_memory_manager_from_project(Path(self.workspace), config=config_data)
         runtime = EngineeringRuntime(workspace_path=self.workspace, provider=self._provider, plan_provider=self._provider, event_bus=self._event_bus, router=self._router, tools=self._tools, memory=memory, project_id=str(Path(self.workspace).resolve()), max_concurrency=self.max_parallel)
+        from harness_core.agent.types import AgentConfig, AgentRole
+        runtime._interactive_config = AgentConfig(
+            role=AgentRole.BUILD,
+            max_iterations=self.max_iterations,
+            model_preference=self.current_model or self.model,
+            routing_mode=self.mode,
+        )
         self._active_runtime = runtime
-        self.task_start = time.time()
+        self.task_start = time.monotonic()
         self.running = True
         self.cancel_event.clear()
         vm = RuntimeViewModel()
@@ -1232,17 +1425,30 @@ class InteractiveShell:
                 vm.finalize(outcome)
             self.running = False
             self._active_runtime = None
+        self.console.print("[dim]Tips: Use Ctrl+Enter for a new line, / for commands.[/]")
         self.console.print("")
         if outcome is None:
             return None
-        if outcome.status.value == "success":
-            render_success_summary(self.console, vm, outcome, plain=self.plain)
-        else:
-            render_failure_summary(self.console, vm, outcome, plain=self.plain)
+        agent_text = ""
+        if outcome.graph:
+            for task in outcome.graph.tasks.values():
+                if task.result:
+                    agent_text = task.result
+
+        if agent_text:
+            self.console.print("\n")
+            if not self.plain:
+                from rich.markdown import Markdown
+                from rich.padding import Padding
+                self.console.print(Padding(Markdown(agent_text.strip()), (0, 0, 0, 0)))
+            else:
+                self.console.print(agent_text.strip())
+            self.console.print("")
+
         return (outcome.state.original_request or goal)
 
     def _render_cancellation(self) -> None:
-        elapsed = time.time() - self.task_start if self.task_start else 0.0
+        elapsed = time.monotonic() - self.task_start if self.task_start else 0.0
         elapsed_str = _format_elapsed(elapsed)
         task = getattr(self._agent_loop, "_active_task", None)
         self.console.print("", highlight=False)
@@ -1269,6 +1475,7 @@ class InteractiveShell:
             from prompt_toolkit.history import InMemoryHistory
             from prompt_toolkit.key_binding import KeyBindings
             from prompt_toolkit.styles import Style
+            from prompt_toolkit.formatted_text import HTML
             if self._pt_history is None:
                 self._pt_history = InMemoryHistory()
                 for item in self._pt_history_items[-50:]:
@@ -1278,18 +1485,41 @@ class InteractiveShell:
                         pass
             if self._pt_completer is None:
                 self._pt_completer = WordCompleter(SLASH_COMMANDS, ignore_case=True, sentence=True)
-            style = Style.from_dict({"prompt": "ansicyan bold", "completion-menu.completion": "bg:#333333 #ffffff", "completion-menu.completion.current": "bg:#00aaaa #000000"})
+            style = Style.from_dict({
+                "bottom-toolbar": "bg:default fg:default",
+                "prompt": "bold",
+                "completion-menu.completion": "bg:#111111 #cbd5e1",
+                "completion-menu.completion.current": "bg:#1e3a8a #f8fafc"
+            })
             kb = KeyBindings()
             
             @kb.add("enter")
             def _submit(event: Any) -> None:
-                event.current_buffer.validate_and_handle()
+                if event.current_buffer.text.strip():
+                    event.current_buffer.validate_and_handle()
                 
             @kb.add("escape", "enter")
+            @kb.add("c-j")
             def _insert_newline(event: Any) -> None:
                 event.current_buffer.insert_text("\n")
                 
+            def get_prompt_text() -> Any:
+                width = self._get_real_terminal_width()
+                line = "─" * width
+                prompt = (
+                    f"<ansicyan>{line}</ansicyan>\n"
+                    "\n"
+                    '<style fg="#6366f1">></style> '
+                )
+                return HTML(prompt)
+
+            def get_continuation(width: int, line_number: int, is_soft_wrap: bool) -> Any:
+                return HTML("  ")
+                
             self._prompt_session = PromptSession(
+                message=get_prompt_text,
+                placeholder=HTML('<style fg="#94a3b8">Type your message or @path/to/file</style>'),
+                prompt_continuation=get_continuation,
                 history=self._pt_history,
                 completer=self._pt_completer,
                 complete_while_typing=True,
@@ -1298,9 +1528,11 @@ class InteractiveShell:
                 key_bindings=kb,
                 style=style,
                 mouse_support=False,
-                prompt_continuation=lambda width, line_number, is_soft_wrap: "  │ ",
             )
-        except Exception:
+        except Exception as e:
+            self.console.print("Could not initialize the interactive prompt.")
+            if self.verbose:
+                self.console.print(_safe_str(e))
             self._prompt_session = None
         return self._prompt_session
 
@@ -1348,17 +1580,15 @@ class InteractiveShell:
             
             from prompt_toolkit.formatted_text import HTML
 
-            def get_prompt_text() -> Any:
-                return HTML("  <ansicyan><b>❯</b></ansicyan> ")
-
             try:
                 ans: str = await session.prompt_async(
-                    get_prompt_text,
-                    placeholder=HTML("<ansigray>Ask Harness anything...</ansigray>")
+                    placeholder=HTML("<style fg=\"#94a3b8\"> Type your message or @path/to/file</style>") if self._first_task else None
                 )
             except (EOFError, KeyboardInterrupt):
                 return None
             if ans.strip():
+                # We don't erase the prompt manually. Let it scroll up naturally.
+                self._first_task = False
                 self._pt_history_items.append(ans.strip())
                 if len(self._pt_history_items) > 200:
                     self._pt_history_items = self._pt_history_items[-200:]
@@ -1371,9 +1601,9 @@ class InteractiveShell:
     async def run(self) -> None:
         self.session_start = time.time()
         if not await self._setup_provider():
-            self.console.print("")
+            self._print_welcome()
             self.console.print("  [red]Cannot start interactive session.[/]")
-            self.console.print("  [dim]Set OPENROUTER_API_KEY or start Ollama.[/]")
+            self.console.print("  [dim]Set OPENROUTER_API_KEY to use Harness.[/]")
             return
         if self.mode != "unified":
             self._setup_event_handlers()
@@ -1398,7 +1628,7 @@ class InteractiveShell:
                         try:
                             self._execution_task.result()
                         except Exception as e:
-                            self.console.print(f"  [red]Execution error:[/] {e}")
+                            self.console.print(f"  [red]Execution failed.[/] { _safe_str(e) if self.verbose else ''}")
                         self._execution_task = None
                         
                     if input_task in done:
@@ -1449,9 +1679,9 @@ class InteractiveShell:
         except EOFError:
             pass
         finally:
-            if self._provider:
+            for provider in self._providers or ([self._provider] if self._provider else []):
                 try:
-                    await self._provider.close()
+                    await provider.close()
                 except Exception:
                     pass
 

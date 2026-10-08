@@ -82,7 +82,8 @@ class Test429FastFailure:
 
     @pytest.mark.asyncio
     async def test_three_rate_limited_models_cause_fast_failure(self):
-        """When 3 models are rate-limited, fail immediately."""
+        """When every pool model is rate-limited, all are attempted (bounded
+        by pool size) and the request fails with a rate-limit summary."""
         engine = FallbackEngine(
             fallback_config=FallbackConfig(
                 retry=RetryConfig(max_retries=0),
@@ -110,13 +111,15 @@ class Test429FastFailure:
         assert not result.succeeded
         assert "rate limited" in result.final_error.lower()
         assert "429" in result.final_error
-        # Should NOT have tried all 4 — fast failure after 3
+        # Rotation is bounded by the chain: every model tried exactly once,
+        # no same-model retry loop.
         attempted = [a for a in result.attempts if a.get("status") == "error"]
-        assert len(attempted) <= 3
+        assert len(attempted) == 4
 
     @pytest.mark.asyncio
     async def test_mixed_failures_no_fast_failure(self):
-        """When failures are mixed (not all 429), no fast failure."""
+        """When failures are mixed transient types, rotation continues through
+        the chain (auth/permission failures are the stop condition, not these)."""
         engine = FallbackEngine(
             fallback_config=FallbackConfig(
                 retry=RetryConfig(max_retries=0),
@@ -131,7 +134,7 @@ class Test429FastFailure:
             if i == 0:
                 provider.generate = AsyncMock(side_effect=Exception("429 Too Many Requests"))
             elif i == 1:
-                provider.generate = AsyncMock(side_effect=Exception("403 Forbidden"))
+                provider.generate = AsyncMock(side_effect=Exception("503 Service Unavailable"))
             elif i == 2:
                 provider.generate = AsyncMock(side_effect=Exception("500 Internal Server Error"))
             else:
@@ -194,7 +197,10 @@ class TestHealthStatusFor429:
         state = tracker.get_state("model_a")
         assert state.rate_limit_hits == 1
         assert state.is_rate_limited
-        assert state.health_status == ModelHealthStatus.UNKNOWN  # 429 doesn't change explicit status
+        # 429 now records an explicit RATE_LIMITED status with a cooldown
+        # (part of the unified temporary-failure cooldown policy).
+        assert state.health_status == ModelHealthStatus.RATE_LIMITED
+        assert state.cooldown_remaining() > 0
 
     def test_rate_limited_model_not_healthy(self):
         tracker = ModelHealthTracker(default_cooldown_seconds=60.0)

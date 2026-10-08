@@ -61,7 +61,8 @@ temp/
 .harness/logs/
 
 # Local model/cache artifacts
-models/
+/models/
+.uv-cache/
 model-cache/
 embeddings/
 *.sqlite-wal

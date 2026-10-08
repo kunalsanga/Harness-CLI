@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from typing import Any, Protocol
 
 from harness_core.agent.todos import (
@@ -48,7 +49,7 @@ class WorkflowContext:
     # execution as a real ToolCall (events + iteration/tool accounting).
     # Without it, workflow-driven git/test operations were invisible to
     # the runtime: "Commit 06a6ae3 / Push origin/main" with 0 tool calls.
-    record_tool_call: Any = None  # async (tool_name, args, result) -> None
+    record_tool_call: Any = None  # async (tool_name, args, result, duration_seconds) -> None
 
 
 class ModelCaller(Protocol):
@@ -84,10 +85,12 @@ async def _run_tool(ctx: WorkflowContext, name: str, **kwargs: Any) -> ToolResul
         return ToolResults.error(f"Tool not available: {name}", retryable=False)
     args = dict(kwargs)
     args.setdefault("cwd", str(ctx.workspace))
+    started_at = time.monotonic()
     result = await tool.execute(args)
+    duration_seconds = max(0.0, time.monotonic() - started_at)
     if ctx.record_tool_call is not None:
         try:
-            await ctx.record_tool_call(name, args, result)
+            await ctx.record_tool_call(name, args, result, duration_seconds)
         except Exception:
             pass  # accounting must never break the workflow itself
     return result

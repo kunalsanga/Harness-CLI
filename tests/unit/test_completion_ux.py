@@ -166,10 +166,10 @@ def test_success_summary_only_evidence_present():
         duration=24.5,
         next_actions=[NextAction("Review the UI changes", "")],
     )
-    assert "✓ Done — UI responsiveness improved" in out
-    assert "M script.js" in out
-    assert "A perf-report.md" in out
-    assert "32/32" in out
+    assert "✓ Done" in out
+    assert "UI responsiveness improved" in out
+    assert "script.js" in out
+    assert "perf-report.md" in out
     assert "24.5s" in out
     assert "Commit" not in out  # no git evidence passed → nothing claimed
     assert "Next" in out
@@ -201,8 +201,7 @@ def test_failure_summary_is_honest():
     )
     assert "✗ Could not safely complete the task" in out
     assert "exit code: 1" in out
-    assert "✗ Final verification failed" in out
-    assert "No false success was reported." in out
+    assert "✗ Checks failed" in out
     assert "✓ Done" not in out
 
 

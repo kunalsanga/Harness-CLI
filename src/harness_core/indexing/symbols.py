@@ -142,13 +142,64 @@ class SymbolIndex:
         self._import_by_module: dict[str, list[ImportInfo]] = defaultdict(list)
         self._lock = threading.Lock()
         self._indexed_files: set[str] = set()
+        # Line count per indexed file — lets the incremental scanner detect
+        # shrunk files and lets callers render bounded context windows.
+        self._file_lines: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
+    def remove_file(self, path: str | Path) -> int:
+        """Remove a file's symbols and imports from the index.
+
+        Returns the number of symbols removed (0 if the file was not
+        indexed). Used by incremental updates so a changed file does not
+        accumulate stale duplicate symbols across re-index runs.
+        """
+        path_str = str(Path(path).resolve())
+        with self._lock:
+            old_symbols = self._by_file.pop(path_str, [])
+            old_imports = self._import_by_file.pop(path_str, [])
+            if not old_symbols and not old_imports and path_str not in self._indexed_files:
+                return 0
+            removed_ids = {id(s) for s in old_symbols}
+            self._symbols = [s for s in self._symbols if id(s) not in removed_ids]
+            import_ids = {id(i) for i in old_imports}
+            self._imports = [i for i in self._imports if id(i) not in import_ids]
+            for sym in old_symbols:
+                bucket = self._by_name.get(sym.name)
+                if bucket is not None:
+                    remaining = [s for s in bucket if id(s) not in removed_ids]
+                    if remaining:
+                        self._by_name[sym.name] = remaining
+                    else:
+                        self._by_name.pop(sym.name, None)
+                bucket = self._by_kind.get(sym.kind)
+                if bucket is not None:
+                    remaining = [s for s in bucket if id(s) not in removed_ids]
+                    if remaining:
+                        self._by_kind[sym.kind] = remaining
+                    else:
+                        self._by_kind.pop(sym.kind, None)
+            for imp in old_imports:
+                bucket = self._import_by_module.get(imp.module)
+                if bucket is not None:
+                    remaining = [i for i in bucket if id(i) not in import_ids]
+                    if remaining:
+                        self._import_by_module[imp.module] = remaining
+                    else:
+                        self._import_by_module.pop(imp.module, None)
+            self._indexed_files.discard(path_str)
+            self._file_lines.pop(path_str, None)
+            return len(old_symbols)
+
     def index_file(self, path: str | Path) -> int:
-        """Index a single file. Returns the number of symbols found."""
+        """Index a single file. Returns the number of symbols found.
+
+        Re-indexing a changed file replaces its previous symbols instead of
+        duplicating them (incremental update contract).
+        """
         path = Path(path)
         path_str = str(path.resolve())
 
@@ -164,7 +215,12 @@ class SymbolIndex:
         symbols, imports = self._parse_file(content, path_str, ext)
 
         with self._lock:
+            # Replace any previous indexing of this file (e.g. after
+            # remove_file from an incremental update).
+            if path_str in self._indexed_files:
+                self.remove_file(path_str)
             self._indexed_files.add(path_str)
+            self._file_lines[path_str] = len(content.splitlines())
             self._symbols.extend(symbols)
             self._imports.extend(imports)
             for sym in symbols:
@@ -192,6 +248,19 @@ class SymbolIndex:
                     continue
                 total += self.index_file(fp)
         return total
+
+    def line_span(self, path: str | Path, line_number: int, context: int = 3) -> tuple[int, int]:
+        """Bounded context window around a symbol line (start, end), 1-based.
+
+        Uses the file's known line count so symbol lookups can render a
+        small excerpt without reading the whole file.
+        """
+        path_str = str(Path(path).resolve())
+        with self._lock:
+            total = self._file_lines.get(path_str, 0)
+        start = max(1, line_number - context)
+        end = min(total or (line_number + context), line_number + context)
+        return start, end
 
     def find_definition(self, name: str) -> list[Symbol]:
         """Find where a symbol is defined."""
@@ -314,13 +383,7 @@ class SymbolIndex:
             ))
 
         # Find methods inside classes
-        current_class = ''
-        for i, line in enumerate(lines, 1):
-            for cls_name, cls_line in classes.items():
-                if i == cls_line:
-                    current_class = cls_name
-                    break
-
+        # (approximate parent: the most recent class defined above the method)
         for m in self._PY_METHOD.finditer(content):
             indent = m.group('indent')
             if len(indent) <= 0:
@@ -329,10 +392,12 @@ class SymbolIndex:
             name = m.group('name')
             is_async = 'async' in m.group(0)
 
-            # Determine parent class (approximate)
+            # Determine parent class (approximate: nearest preceding class line)
             parent = ''
+            best_line = -1
             for cls_name, cls_line in classes.items():
-                if cls_line < line_no:
+                if cls_line < line_no and cls_line > best_line:
+                    best_line = cls_line
                     parent = cls_name
 
             symbols.append(Symbol(
