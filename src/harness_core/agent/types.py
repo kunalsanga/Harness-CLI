@@ -186,6 +186,10 @@ class ToolResult:
     stderr: str | None = None
 
     @property
+    def success(self) -> bool:
+        return self.status == ToolResultStatus.SUCCESS
+
+    @property
     def is_perm_denied(self) -> bool:
         return self.status == ToolResultStatus.PERMISSION_DENIED
 
@@ -258,6 +262,8 @@ class ToolCall:
     result: ToolResult | None = None
     timestamp: float = field(default_factory=time.time)
     duration_ms: float = 0.0
+    iteration: int = 0
+    thought: str = ""
 
 
 @dataclass

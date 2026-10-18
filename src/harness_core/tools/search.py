@@ -118,12 +118,22 @@ class GlobTool(Tool):
         return sorted(matches)
 
     def _glob_via_walk(self, pattern: str, search_path: Path) -> list[str]:
-        return sorted(
-            str(p.relative_to(search_path))
-            for p in search_path.rglob("*")
-            if fnmatch.fnmatch(p.name, pattern.split("/")[-1])
-            and not any(part.startswith(".") for part in p.parts)
-        )
+        target_name = pattern.split("/")[-1]
+        matches: list[str] = []
+        for p in search_path.rglob("*"):
+            try:
+                rel = p.relative_to(search_path)
+            except ValueError:
+                continue
+            # Exclude files inside hidden directories (.git, .venv, etc.)
+            if any(part.startswith(".") for part in rel.parts[:-1]):
+                continue
+            # Exclude hidden files unless the pattern explicitly searches for them
+            if rel.parts and rel.parts[-1].startswith(".") and not target_name.startswith("."):
+                continue
+            if fnmatch.fnmatch(p.name, target_name):
+                matches.append(str(rel))
+        return sorted(matches)
 
 
 class GrepTool(Tool):
@@ -237,7 +247,15 @@ class GrepTool(Tool):
         for file_path in search_path.rglob("*"):
             if not file_path.is_file():
                 continue
-            if any(part.startswith(".") for part in file_path.parts):
+            try:
+                rel = file_path.relative_to(search_path)
+            except ValueError:
+                continue
+            # Exclude files inside hidden directories (.git, .venv, etc.)
+            if any(part.startswith(".") for part in rel.parts[:-1]):
+                continue
+            # Exclude hidden files unless include pattern explicitly targets dot-files
+            if rel.parts and rel.parts[-1].startswith(".") and not include.startswith("."):
                 continue
             if not fnmatch.fnmatch(file_path.name, include):
                 continue

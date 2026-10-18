@@ -457,11 +457,13 @@ class TestStructuredGit:
 
     @pytest.mark.asyncio
     async def test_status_outside_repo_diagnosed(self, tmp_path: Path):
+        import tempfile
         from harness_core.tools.git import GitStatusTool
         tool = GitStatusTool()
-        result = await tool.execute({"cwd": str(tmp_path)})
-        assert result.status == ToolResultStatus.ERROR
-        assert "git repository" in result.error.lower()
+        with tempfile.TemporaryDirectory() as td:
+            result = await tool.execute({"cwd": td})
+            assert result.status == ToolResultStatus.ERROR
+            assert "git repository" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_loop_accounts_commit_and_push(self, git_repo: Path):

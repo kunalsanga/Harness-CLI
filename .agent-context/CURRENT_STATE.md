@@ -1,8 +1,24 @@
 # Current State
 
-Last checked: 2026-10-18 (Autonomous Git Workflow & Zero-Tool-Call Resolution)
+Last checked: 2026-10-19 (REA Reverse Engineering & Claude Code Parity Sprint)
 
-## Autonomous Git Workflow & Zero-Tool-Call Fix (2026-10-18)
+## REA Reverse Engineering & Claude Code Parity Sprint (2026-10-19)
+
+- **Claude Code Reverse Engineering via REA & Observable Artifacts**:
+  - REA (`rea-agents@6.7.0`) verified in environment; CLI engine verified healthy.
+  - Claude Code (`2.1.302`) inspected via CLI, schema manifest, and active session transcript (`10a1d624-7826-4e9c-a02c-d75547490122.jsonl`).
+  - Mapped Claude Code tool conventions (`Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`), turn grouping, thought preservation, and XML/markdown fallback tool calling to Harness.
+- **AgentLoop Reliability, Hardening & Compatibility Audit**:
+  - **Tool & Argument Aliasing Guardrails**: Direct tool registrations take strict precedence over aliases. Aliases resolve ONLY if the target tool is actually registered in the active runtime (e.g. read-only roles cannot have 'Bash' silently resolve). Argument normalization handles `old_content`/`new_content`, `search`/`replace`, `cmd`, and `file_path` without overwriting existing arguments.
+  - **Safe Content Tool Extraction & No Quoted Examples**: Quoted examples (preceded by 'for example', 'e.g.', 'sample', etc.), normal JSON responses (with 'status', 'items', 'result'), and invalid schemas are ignored. Replaced naive backslash replacement with targeted drive-letter regex escaping so `\n`, `\t`, and quotes are never corrupted in string content.
+  - **OpenRouter Defensive Health Check**: `OpenRouterProvider.health_check()` handles `None` or malformed payloads safely, accurately reports `remaining == 0` on free tier as unhealthy, while ensuring paid and unconstrained accounts remain healthy.
+  - **Workspace Search Policy**: Excludes workspace-internal hidden directories (`.git`, `.venv`, `.cache`) while allowing workspace root to exist inside dot-prefixed parents and allowing intentional searches for dot-files (`.env`, `.gitignore`).
+- **Test Baseline (Audited & Verified)**:
+  - Full unit test suite: **1,677 passed, 1 skipped, 0 failed** in 170.18s.
+  - Non-live E2E suite: **88 passed, 1 skipped, 0 failed** in 23.92s.
+  - Parity & audit regression test suite (`tests/unit/test_agent_execution_parity.py`): **11 passed, 0 failed**.
+  - CLI smoke tests: `uv run harness --help` and import smoke test passed cleanly.
+
 
 - **Zero-Tool-Call Defect Diagnosed & Fixed**:
   - `WorkerAgent` wrapped the user prompt in an agent preamble (`You are a specialized agent: ... Objective: <goal>`), preventing `classify_workflow()` from matching leading keywords. As a result, deterministic workflows were skipped and fell through to the LLM. When OpenRouter was rate-limited (HTTP 429), the task failed with 0 tool calls.

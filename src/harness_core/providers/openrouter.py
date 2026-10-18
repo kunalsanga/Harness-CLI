@@ -347,7 +347,8 @@ class OpenRouterProvider(ModelProvider):
     async def health_check(self) -> bool:
         """Check if the provider is available AND the API key is valid.
 
-        Validates the key against OpenRouter key endpoints (/key or /auth/key).
+        Validates the key against OpenRouter key endpoints (/key or /auth/key)
+        and verifies that free-tier request limits are not exhausted.
         """
         if not self.api_key:
             return False
@@ -356,20 +357,28 @@ class OpenRouterProvider(ModelProvider):
             # /key endpoint is OpenRouter's official key inspection endpoint
             response = await client.get("/key")
             if response.status_code == 200:
+                payload = response.json() if callable(getattr(response, "json", None)) else {}
+                data = payload.get("data") if isinstance(payload, dict) else {}
+                if isinstance(data, dict) and data.get("is_free_tier"):
+                    daily = data.get("free_model_daily_requests")
+                    if isinstance(daily, dict) and daily.get("remaining") == 0:
+                        return False
                 return True
             if response.status_code == 401:
                 return False
             # Fallback to /auth/key
             auth_response = await client.get("/auth/key")
-            return auth_response.status_code == 200
+            if auth_response.status_code == 200:
+                payload = auth_response.json() if callable(getattr(auth_response, "json", None)) else {}
+                data = payload.get("data") if isinstance(payload, dict) else {}
+                if isinstance(data, dict) and data.get("is_free_tier"):
+                    daily = data.get("free_model_daily_requests")
+                    if isinstance(daily, dict) and daily.get("remaining") == 0:
+                        return False
+                return True
+            return False
         except Exception:
-            # Fallback: check if models endpoint works
-            try:
-                client = await self._get_client()
-                response = await client.get("/models")
-                return response.status_code == 200
-            except Exception:
-                return False
+            return False
 
     async def close(self) -> None:
         if self._client and not self._client.is_closed:

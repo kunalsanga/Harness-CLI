@@ -53,6 +53,8 @@ logs/
 tmp/
 temp/
 *.tmp
+.pytest_tmp/
+.tmp-pytest/
 
 # Harness local state
 .harness/local/

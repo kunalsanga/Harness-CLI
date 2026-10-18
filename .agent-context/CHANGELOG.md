@@ -1,5 +1,25 @@
 # Agent Context Changelog
 
+## 2026-10-19 — REA-Powered Claude Code Parity & Agent Execution Loop Hardening
+
+- Root cause diagnosed (historical zero-tool-call E2E failure):
+  1. OpenRouter `/key` endpoint returned HTTP 200 with `remaining: 0` daily free requests. `OpenRouterProvider.health_check()` previously treated any HTTP 200 as healthy, causing live E2E tests to run against exhausted accounts and immediately fail with HTTP 429 rate limit across all free models, resulting in zero tool calls.
+  2. Open-source and free models frequently output Claude Code tool names (`Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`) and argument variations (`file_path`, `cmd`, `old_str`/`new_str`), which previously failed as `unknown_tool` or `missing_argument`.
+  3. Models generating tool calls directly inside assistant text blocks (`<tool_call>...` or markdown codeblocks) were ignored if the provider adapter did not extract them into `message.tool_calls`.
+  4. Parallel tool calls in a single turn were previously converted into multiple independent assistant turns, violating model provider conversation schema requirements.
+- Core fixes implemented & audited:
+  - `OpenRouterProvider.health_check()` now checks `free_model_daily_requests.remaining > 0` for free keys, accurately marking exhausted keys unhealthy; defensively handles `None` or malformed payloads without crashing.
+  - `AgentLoop`: Hardened `_TOOL_ALIASES` with direct registration precedence and registered target validation. Argument normalization expanded to `old_content`/`new_content`, `search`/`replace`.
+  - `AgentLoop`: Hardened `_extract_tool_calls_from_content()`: ignores quoted examples, skips ordinary JSON responses, requires registered tool names and dict arguments, and avoids blanket backslash replacement that corrupts `\n`, `\t`, and quotes.
+  - `AgentLoop`: Tool argument parsing hardened against unparsed strings, markdown fences, and malformed JSON, with targeted Windows drive-letter repair.
+  - `AgentLoop`: Turns preserve `thought`/reasoning and group parallel tool calls under a single assistant turn before providing matching tool results.
+  - `search.py`: Fixed `_glob_via_walk` and `_grep_via_walk` hidden-directory pruning bug (`rel.parts[:-1]`), allowing workspaces in dot-named parents and enabling intentional dot-file searches (`.env`, `.gitignore`).
+- Test results:
+  - Full unit test suite: **1,677 passed, 1 skipped, 0 failed** in 170.18s.
+  - Non-live E2E suite: **88 passed, 1 skipped, 0 failed** in 23.92s.
+  - Parity & audit regression suite: **11 passed, 0 failed**. Smoke tests pass cleanly. No live credentials required.
+
+
 ## 2026-10-18 — Deterministic Git Push Workflow & Zero-Tool-Call Root Cause Resolution
 
 - Root cause diagnosed (3.2s zero-tool-call failure): `WorkerAgent` wrapped the user's task goal in an agent instruction preamble (`You are a specialized agent: ... Objective: <goal>`), causing `classify_workflow()` in `workflows.py` to evaluate the prompt as length > 50 characters and miss push keywords, bypassing deterministic workflows and falling through to rate-limited LLM free models.

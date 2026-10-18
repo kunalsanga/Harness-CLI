@@ -591,8 +591,40 @@ When you are done, summarize what you did and provide evidence of success."""
             return DEFAULT_CONTEXT_TOKEN_BUDGET
         return budget
 
-    @staticmethod
-    def _tool_call_pair(tc: ToolCall) -> tuple[dict[str, Any], dict[str, Any]]:
+    @classmethod
+    def _tool_turn_block(
+        cls, calls: list[ToolCall]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Build an assistant message containing all tool calls in the turn, followed by tool messages."""
+        thought = calls[0].thought if calls and calls[0].thought else None
+        assistant_msg = {
+            "role": "assistant",
+            "content": thought,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.tool_name,
+                        "arguments": json.dumps(tc.arguments),
+                    },
+                }
+                for tc in calls
+            ],
+        }
+        tool_msgs = []
+        for tc in calls:
+            assert tc.result is not None
+            raw = tc.result.output or tc.result.error or "(no output)"
+            tool_msgs.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": truncate_to_tokens(raw, MAX_TOOL_RESULT_TOKENS),
+            })
+        return assistant_msg, tool_msgs
+
+    @classmethod
+    def _tool_call_pair(cls, tc: ToolCall) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build the assistant/tool message pair for one completed tool call.
 
         These two messages must always travel together: an assistant message
@@ -600,29 +632,8 @@ When you are done, summarize what you did and provide evidence of success."""
         request for most providers, so every trimming decision below operates
         on the pair rather than on individual messages.
         """
-        assert tc.result is not None
-        raw = tc.result.output or tc.result.error or "(no output)"
-        return (
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.tool_name,
-                            "arguments": json.dumps(tc.arguments),
-                        },
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": truncate_to_tokens(raw, MAX_TOOL_RESULT_TOKENS),
-            },
-        )
+        asst, tools = cls._tool_turn_block([tc])
+        return asst, tools[0]
 
     def _build_messages(
         self,
@@ -690,23 +701,33 @@ When you are done, summarize what you did and provide evidence of success."""
         else:
             candidates = list(calls_with_results)
 
-        # Step 2: fit as many of those as the budget allows, newest first, so
-        # the model always retains the most recent observation it acted on.
-        # A summary is reserved for whenever anything gets left out.
-        pairs = [self._tool_call_pair(tc) for tc in candidates]
+        # Step 2: group candidates by turn / iteration so parallel tool calls
+        # remain in a single assistant message followed by matching tool results.
+        turn_groups: list[list[ToolCall]] = []
+        for tc in candidates:
+            if turn_groups and tc.iteration > 0 and turn_groups[-1][0].iteration == tc.iteration:
+                turn_groups[-1].append(tc)
+            else:
+                turn_groups.append([tc])
+
+        blocks: list[tuple[dict[str, Any], list[dict[str, Any]]]] = [
+            self._tool_turn_block(group) for group in turn_groups
+        ]
         fixed_tokens = messages_tokens(prefix) + messages_tokens(suffix)
         summary_reserve = _SUMMARY_TOKEN_RESERVE if len(candidates) < len(calls_with_results) else 0
         available = budget - fixed_tokens - summary_reserve
 
-        kept: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        kept_blocks: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
         used = 0
-        for pair in reversed(pairs):
-            cost = message_tokens(pair[0]) + message_tokens(pair[1])
-            if kept and used + cost > available:
+        for assistant_msg, tool_msgs in reversed(blocks):
+            cost = message_tokens(assistant_msg) + sum(message_tokens(tm) for tm in tool_msgs)
+            if kept_blocks and used + cost > available:
                 break
             used += cost
-            kept.insert(0, pair)
-        dropped_count = len(calls_with_results) - len(kept)
+            kept_blocks.insert(0, (assistant_msg, tool_msgs))
+
+        kept_call_count = sum(len(b[1]) for b in kept_blocks)
+        dropped_count = len(calls_with_results) - kept_call_count
 
         # Step 3: assemble. The summary sits between the goal and the verbatim
         # history so the model reads it as established background.
@@ -719,9 +740,10 @@ When you are done, summarize what you did and provide evidence of success."""
                     "content": self._compact_task_state(task, dropped_count, dropped_calls),
                 }
             )
-        for assistant_msg, tool_msg in kept:
+        for assistant_msg, tool_msgs in kept_blocks:
             messages.append(assistant_msg)
-            messages.append(tool_msg)
+            for tm in tool_msgs:
+                messages.append(tm)
         messages.extend(suffix)
 
         # Step 4: last resort. If the prefix, summary and a single mandatory
@@ -1633,7 +1655,159 @@ When you are done, summarize what you did and provide evidence of success."""
                 f"Scope protection: {resolved_str} is outside the workspace."
             )
 
-        return None
+    _TOOL_ALIASES: dict[str, str] = {
+        "Bash": "run_command", "bash": "run_command", "sh": "run_command",
+        "shell": "run_command", "terminal": "run_command", "execute_command": "run_command",
+        "Read": "read_file", "read": "read_file", "cat": "read_file",
+        "Edit": "edit_file", "edit": "edit_file",
+        "Write": "write_file", "write": "write_file",
+        "Glob": "glob", "Grep": "grep", "search": "grep",
+        "ListFiles": "list_files", "list_dir": "list_files", "ls": "list_files",
+    }
+
+    def _normalize_tool_arguments(self, call: ToolCall) -> None:
+        """Normalize tool argument aliases into standard schema parameters."""
+        name = call.tool_name
+        args = call.arguments
+        if not isinstance(args, dict):
+            return
+        if name in ("read_file", "write_file", "edit_file", "list_files"):
+            if "file_path" in args and "path" not in args:
+                args["path"] = args["file_path"]
+            elif "filepath" in args and "path" not in args:
+                args["path"] = args["filepath"]
+        if name == "edit_file":
+            if "old_str" in args and "old_string" not in args:
+                args["old_string"] = args["old_str"]
+            elif "old_text" in args and "old_string" not in args:
+                args["old_string"] = args["old_text"]
+            elif "old_content" in args and "old_string" not in args:
+                args["old_string"] = args["old_content"]
+            elif "search" in args and "old_string" not in args:
+                args["old_string"] = args["search"]
+            if "new_str" in args and "new_string" not in args:
+                args["new_string"] = args["new_str"]
+            elif "new_text" in args and "new_string" not in args:
+                args["new_string"] = args["new_text"]
+            elif "new_content" in args and "new_string" not in args:
+                args["new_string"] = args["new_content"]
+            elif "replace" in args and "new_string" not in args:
+                args["new_string"] = args["replace"]
+        if name == "run_command":
+            if "cmd" in args and "command" not in args:
+                args["command"] = args["cmd"]
+            elif "script" in args and "command" not in args:
+                args["command"] = args["script"]
+        if name in ("grep", "glob"):
+            if "query" in args and "pattern" not in args:
+                args["pattern"] = args["query"]
+
+    def _extract_tool_calls_from_content(self, content: str) -> list[dict[str, Any]]:
+        """Extract tool calls from model content when provider tool_calls is empty.
+
+        Protections:
+        - Quoted examples (preceded by words like 'example', 'e.g.', 'sample') are skipped.
+        - Tool names must resolve to registered tools or registered aliases.
+        - Validates arguments structure; ordinary JSON messages, schemas, and data payloads are ignored.
+        - Safe JSON decoding protects legitimate escape sequences (\n, \t, \") while tolerating Windows drive paths.
+        """
+        import re
+        if not content:
+            return []
+
+        def _safe_parse_json(text: str) -> Any:
+            try:
+                return json.loads(text)
+            except Exception:
+                # Targeted repair of unescaped Windows drive-letter paths (C:\...)
+                # Never do blanket text.replace("\\", "/") which corrupts \n, \t, \" in content/strings.
+                try:
+                    repaired = re.sub(
+                        r'[A-Za-z]:\\[^"\r\n]*',
+                        lambda m: re.sub(r'\\+', r'\\\\', m.group(0)),
+                        text
+                    )
+                    return json.loads(repaired)
+                except Exception:
+                    return None
+
+        _EXAMPLE_PREFIX_RE = re.compile(
+            r'(?:for\s+example|example(?:\s+\d+)?:|e\.g\.|sample\s+(?:call|usage|payload)|such\s+as|syntax:|schema:)\s*$',
+            re.IGNORECASE
+        )
+
+        extracted: list[dict[str, Any]] = []
+        known_tools = set(self.tools.keys()) | set(self._TOOL_ALIASES.keys())
+
+        # 1. XML tags: <tool_call> ... </tool_call>
+        for idx, match in enumerate(re.finditer(r"<tool_call>([\s\S]*?)</tool_call>", content), 1):
+            preceding = content[max(0, match.start() - 100):match.start()].strip()
+            if _EXAMPLE_PREFIX_RE.search(preceding):
+                continue
+            data = _safe_parse_json(match.group(1).strip())
+            if isinstance(data, dict):
+                name = data.get("name") or data.get("tool")
+                if name and (name in known_tools or name.lower() in [k.lower() for k in known_tools]):
+                    args = data.get("arguments") or data.get("args") or data.get("parameters", {})
+                    if isinstance(args, dict):
+                        extracted.append({
+                            "id": f"call_extracted_{idx}",
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(args),
+                            },
+                        })
+
+        if extracted:
+            return extracted
+
+        # 2. Markdown code blocks with explicit tool invocation tags:
+        # ```tool_call, ```function_call, ```action, ```tool, or strict ```json
+        code_block_pattern = re.compile(r"```(tool_call|function_call|action|tool|json)?\s*([\s\S]*?)```", re.IGNORECASE)
+        for idx, match in enumerate(code_block_pattern.finditer(content), 1):
+            tag = (match.group(1) or "").lower()
+            block_content = match.group(2).strip()
+            preceding = content[max(0, match.start() - 100):match.start()].strip()
+            if _EXAMPLE_PREFIX_RE.search(preceding):
+                continue
+
+            data = _safe_parse_json(block_content)
+            if isinstance(data, dict):
+                # Reject ordinary JSON responses or data payloads (e.g. schemas, status payloads, explanations)
+                disallowed_keys = {"status", "description", "properties", "type", "title", "error", "items", "result"}
+                if tag == "json" and any(k in data for k in disallowed_keys):
+                    continue
+
+                name = data.get("name") or data.get("tool") or (data.get("action") if tag == "action" else None)
+                if name and (name in known_tools or name.lower() in [k.lower() for k in known_tools]):
+                    args = data.get("arguments") or data.get("args") or data.get("parameters") or (data.get("action_input") if tag == "action" else {})
+                    if isinstance(args, dict):
+                        extracted.append({
+                            "id": f"call_extracted_{idx}",
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(args),
+                            },
+                        })
+            elif isinstance(data, list) and tag in ("tool_call", "function_call", "action", "tool"):
+                for sub_idx, item in enumerate(data, 1):
+                    if isinstance(item, dict):
+                        name = item.get("name") or item.get("tool")
+                        if name and (name in known_tools or name.lower() in [k.lower() for k in known_tools]):
+                            args = item.get("arguments") or item.get("args") or item.get("parameters", {})
+                            if isinstance(args, dict):
+                                extracted.append({
+                                    "id": f"call_extracted_{idx}_{sub_idx}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": json.dumps(args),
+                                    },
+                                })
+
+        return extracted
 
     async def _execute_tool_checked(self, call: ToolCall) -> ToolResult:
         """Execute a tool call with permission checking.
@@ -1641,6 +1815,16 @@ When you are done, summarize what you did and provide evidence of success."""
         Added validation to ensure required arguments are present and to
         provide structured errors for missing arguments, improving reliability.
         """
+        # Resolve tool aliases (e.g. Claude Code tool names like Bash, Read, Edit)
+        # Direct tool registrations always take precedence over alias resolution.
+        # An alias is only resolved if the target tool is actually registered in this runtime.
+        if call.tool_name not in self.tools:
+            target = self._TOOL_ALIASES.get(call.tool_name) or self._TOOL_ALIASES.get(call.tool_name.lower())
+            if target and target in self.tools:
+                call.tool_name = target
+
+        self._normalize_tool_arguments(call)
+
         tool = self.tools.get(call.tool_name)
         if not tool:
             self._reset_denial_tracking()
@@ -2515,19 +2699,94 @@ When you are done, summarize what you did and provide evidence of success."""
                     task.result += "\n\n" + response.content
 
             iter_calls: list[ToolCall] = []
-            if response.tool_calls:
+            tool_calls_to_process = list(response.tool_calls or [])
+            if not tool_calls_to_process and response.content:
+                extracted = self._extract_tool_calls_from_content(response.content)
+                if extracted:
+                    tool_calls_to_process = extracted
+
+            if tool_calls_to_process:
                 # Execute tool calls
-                for tool_call_data in response.tool_calls:
+                for tool_call_data in tool_calls_to_process:
                     await self._transition_execution(ExecutionState.WORKING)
-                    func = tool_call_data.get("function", {})
+                    func = tool_call_data.get("function", {}) if isinstance(tool_call_data, dict) else {}
+                    tool_name = func.get("name", "") if isinstance(func, dict) else ""
+                    raw_args = func.get("arguments", "{}") if isinstance(func, dict) else "{}"
+                    if not tool_name and isinstance(tool_call_data, dict):
+                        tool_name = tool_call_data.get("name") or tool_call_data.get("tool", "")
+                        raw_args = tool_call_data.get("arguments") or tool_call_data.get("args", "{}")
+
+                    import uuid as _uuid
+                    call_id = tool_call_data.get("id") or f"call_{_uuid.uuid4().hex[:8]}"
+                    parsed_args: dict[str, Any] = {}
+                    parse_err: str | None = None
+                    if isinstance(raw_args, dict):
+                        parsed_args = dict(raw_args)
+                    elif isinstance(raw_args, str):
+                        raw_str = raw_args.strip()
+                        if raw_str:
+                            try:
+                                parsed = json.loads(raw_str)
+                                if isinstance(parsed, dict):
+                                    parsed_args = parsed
+                                else:
+                                    parse_err = f"Arguments must be a JSON object, got {type(parsed).__name__}"
+                            except Exception as pe:
+                                cleaned = raw_str
+                                if cleaned.startswith("```"):
+                                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                                    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+                                try:
+                                    parsed = json.loads(cleaned)
+                                    if isinstance(parsed, dict):
+                                        parsed_args = parsed
+                                    else:
+                                        parse_err = f"Arguments must be a JSON object, got {type(parsed).__name__}"
+                                except Exception:
+                                    try:
+                                        repaired = re.sub(
+                                            r'[A-Za-z]:\\[^"\r\n]*',
+                                            lambda m: re.sub(r'\\+', r'\\\\', m.group(0)),
+                                            cleaned,
+                                        )
+                                        parsed = json.loads(repaired)
+                                        if isinstance(parsed, dict):
+                                            parsed_args = parsed
+                                        else:
+                                            parse_err = f"Arguments must be a JSON object, got {type(parsed).__name__}"
+                                    except Exception:
+                                        parse_err = f"Malformed JSON arguments: {pe}"
+
                     call = ToolCall(
-                        id=tool_call_data.get("id", ""),
-                        tool_name=func.get("name", ""),
-                        arguments=json.loads(func.get("arguments", "{}")),
+                        id=call_id,
+                        tool_name=tool_name,
+                        arguments=parsed_args,
+                        iteration=task.iterations,
+                        thought=response.content or "",
                     )
                     task.tool_calls.append(call)
                     iter_calls.append(call)
                     self.budget.record_tool_call()
+
+                    if parse_err:
+                        call.duration_ms = 0.0
+                        call.result = ToolResults.error(
+                            f"Malformed arguments for tool '{tool_name}': {parse_err}. "
+                            "Please provide valid JSON arguments matching the tool schema."
+                        )
+                        await self._emit_event(
+                            "tool.call", {"tool": call.tool_name, "args": {}, "quiet": False}
+                        )
+                        await self._emit_event(
+                            "tool.result",
+                            {
+                                "tool": call.tool_name,
+                                "status": call.result.status.value,
+                                "output_len": len(call.result.output),
+                                "error": call.result.error,
+                            },
+                        )
+                        continue
 
                     quiet = call.tool_name in _READONLY_TOOLS
                     if quiet:
