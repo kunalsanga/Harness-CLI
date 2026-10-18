@@ -35,6 +35,8 @@ class ErrorClassification(Enum):
     PERMANENT = "permanent"  # don't retry (bad request, auth, etc.)
     RATE_LIMITED = "rate_limited"  # try another model, not retry same
     MODEL_UNAVAILABLE = "model_unavailable"  # endpoint/model temporarily unavailable
+    PERMISSION_DENIED = "permission_denied"  # model or policy restriction
+    CONTEXT_OVERFLOW = "context_overflow"  # token context limit exceeded
     UNKNOWN = "unknown"
 
 
@@ -43,6 +45,7 @@ def classify_error(error: Exception) -> ErrorClassification:
     if isinstance(error, ProviderRequestError):
         return {
             ProviderErrorCategory.AUTHENTICATION: ErrorClassification.PERMANENT,
+            ProviderErrorCategory.PERMISSION: ErrorClassification.PERMISSION_DENIED,
             ProviderErrorCategory.INVALID_REQUEST: ErrorClassification.PERMANENT,
             ProviderErrorCategory.PAYMENT_REQUIRED: ErrorClassification.PERMANENT,
             ProviderErrorCategory.TOOL: ErrorClassification.PERMANENT,
@@ -51,8 +54,14 @@ def classify_error(error: Exception) -> ErrorClassification:
             ProviderErrorCategory.TIMEOUT: ErrorClassification.RETRYABLE,
             ProviderErrorCategory.NETWORK: ErrorClassification.RETRYABLE,
             ProviderErrorCategory.PROVIDER: ErrorClassification.RETRYABLE,
+            ProviderErrorCategory.CONTEXT_LENGTH: ErrorClassification.CONTEXT_OVERFLOW,
+            ProviderErrorCategory.CONFIGURATION: ErrorClassification.PERMANENT,
         }.get(error.category, ErrorClassification.UNKNOWN)
     error_str = str(error).lower()
+
+    # Model-specific permission/policy restrictions (e.g. app whitelisting)
+    if any(phrase in error_str for phrase in ("only available on", "restricted_model", "permission_denied")):
+        return ErrorClassification.PERMISSION_DENIED
 
     # Authentication and payment errors are configuration/account failures,
     # never reasons to rotate the shared OpenRouter credential across models.
@@ -89,14 +98,14 @@ def classify_error(error: Exception) -> ErrorClassification:
     # Retryable server errors (429 already handled as RATE_LIMITED above — don't double-classify)
     if any(code in error_str for code in ["500", "502", "503", "504"]):
         return ErrorClassification.RETRYABLE
-    if any(kw in error_str for kw in ["timeout", "timed out", "connection", "network"]):
+    if any(kw in error_str for kw in ["timeout", "timed out", "connection", "network", "408"]):
         return ErrorClassification.RETRYABLE
     if "overloaded" in error_str or "capacity" in error_str:
         return ErrorClassification.RETRYABLE
 
-    # Context overflow — try a bigger model
+    # Context overflow — treat as rate_limited to try another model
     if any(kw in error_str for kw in ["context", "token limit", "too long", "maximum context"]):
-        return ErrorClassification.RATE_LIMITED  # treat as "try another model"
+        return ErrorClassification.RATE_LIMITED
 
     return ErrorClassification.UNKNOWN
 
@@ -176,6 +185,7 @@ class ProviderAuthFailure(Exception):
 # Normalized error categories — the provider-specific strings are translated
 # into these once, here, so the AgentLoop and UI never parse provider text.
 ERROR_CATEGORY_AUTH = "auth"
+ERROR_CATEGORY_PERMISSION = "permission"
 ERROR_CATEGORY_INVALID_REQUEST = "invalid_request"
 ERROR_CATEGORY_RATE_LIMIT = "rate_limit"
 ERROR_CATEGORY_MODEL_UNAVAILABLE = "model_unavailable"
@@ -183,6 +193,7 @@ ERROR_CATEGORY_TIMEOUT = "timeout"
 ERROR_CATEGORY_NETWORK = "network"
 ERROR_CATEGORY_SERVER = "server"
 ERROR_CATEGORY_PAYMENT = "payment"
+ERROR_CATEGORY_CONTEXT_LENGTH = "context_length"
 ERROR_CATEGORY_UNKNOWN = "unknown"
 
 
@@ -191,6 +202,10 @@ def normalized_error_category(classification: "ErrorClassification", error_str: 
     if isinstance(error_str, ProviderRequestError):
         return error_str.category.value
     low = str(error_str or "").lower()
+    if classification == ErrorClassification.PERMISSION_DENIED:
+        return ERROR_CATEGORY_PERMISSION
+    if classification == ErrorClassification.CONTEXT_OVERFLOW:
+        return ERROR_CATEGORY_CONTEXT_LENGTH
     if classification == ErrorClassification.PERMANENT:
         if "402" in low or "payment required" in low:
             return ERROR_CATEGORY_PAYMENT
@@ -232,6 +247,16 @@ def extract_retry_after(error: Exception) -> float | None:
         except ValueError:
             pass
     return None
+
+
+def _safe_error_detail(e: Exception, secret: str = "") -> str:
+    msg = str(e).strip()
+    if secret:
+        msg = msg.replace(secret, "[REDACTED]")
+    import re
+    msg = re.sub(r'sk-[a-zA-Z0-9_\-]{15,}', '[REDACTED]', msg)
+    msg = re.sub(r'Bearer\s+\S+', 'Bearer [REDACTED]', msg)
+    return msg
 
 
 class FallbackEngine:
@@ -447,6 +472,47 @@ class FallbackEngine:
                                     "reason": classification.value,
                                 },
                             ))
+                    elif classification == ErrorClassification.PERMISSION_DENIED:
+                        self.health.record_failure(
+                            model_id, HealthEvent.AUTH_FAILED, latency_ms,
+                            cooldown_override=3600.0,
+                        )
+                        previous_reason = "permission_denied"
+                        remaining = self.health.get_state(model_id).cooldown_remaining()
+                        if self.event_bus is not None:
+                            await self.event_bus.emit(Event(
+                                type="model.cooldown",
+                                source="model_fallback",
+                                data={
+                                    "model": model_id,
+                                    "category": "permission",
+                                    "cooldown_seconds": round(remaining, 1),
+                                },
+                            ))
+                        if self.event_bus is not None and model_idx + 1 < len(model_chain):
+                            await self.event_bus.emit(Event(
+                                type="model.failover",
+                                source="model_fallback",
+                                data={
+                                    "from": model_id,
+                                    "to": model_chain[model_idx + 1][0],
+                                    "reason": "permission_denied",
+                                },
+                            ))
+                        break
+
+                    elif classification == ErrorClassification.CONTEXT_OVERFLOW:
+                        previous_reason = "context_overflow"
+                        if self.event_bus is not None and model_idx + 1 < len(model_chain):
+                            await self.event_bus.emit(Event(
+                                type="model.failover",
+                                source="model_fallback",
+                                data={
+                                    "from": model_id,
+                                    "to": model_chain[model_idx + 1][0],
+                                    "reason": "context_overflow",
+                                },
+                            ))
                         break
 
                     elif classification == ErrorClassification.PERMANENT:
@@ -510,7 +576,7 @@ class FallbackEngine:
                                     data={"from": model_id, "to": model_chain[model_idx + 1][0], "reason": previous_reason},
                                 ))
                             break
-                        detail = str(e).strip()[:240]
+                        detail = _safe_error_detail(e, secret)[:240]
                         status = e.status_code if isinstance(e, ProviderRequestError) else None
                         status_prefix = f"{status} " if status is not None else ""
                         result.final_error = (
@@ -571,7 +637,7 @@ class FallbackEngine:
                         # Unknown/programming errors are not model availability
                         # signals; fail instead of hiding them with rotation.
                         self.health.record_failure(model_id, HealthEvent.INVALID_RESPONSE, latency_ms)
-                        detail = str(e).strip()[:240] or "empty message"
+                        detail = _safe_error_detail(e, secret)[:240] or "empty message"
                         result.final_error = (
                             f"Unclassified provider request failure for {provider.name}: {detail}"
                         )
@@ -588,6 +654,7 @@ class FallbackEngine:
                 break
         if not result.final_error:
             auth_failures: list[str] = []
+            permission_failures: list[str] = []
             payment_failures: list[str] = []
             other_failures: list[str] = []
             rate_failures: list[str] = []
@@ -596,8 +663,11 @@ class FallbackEngine:
             for attempt in error_attempts:
                 error_str = attempt.get("error", "") or ""
                 error_lower = error_str.lower()
+                att_cat = attempt.get("category", "")
                 if "429" in error_str or "rate limit" in error_lower or "too many requests" in error_lower:
                     rate_failures.append(attempt.get("model", "unknown"))
+                elif att_cat == "permission" or "only available on" in error_lower:
+                    permission_failures.append(attempt.get("model", "unknown"))
                 elif "401" in error_str or "403" in error_str or "forbidden" in error_lower or "unauthorized" in error_lower:
                     auth_failures.append(attempt.get("model", "unknown"))
                 elif "402" in error_str or "payment required" in error_lower:

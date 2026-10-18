@@ -1,5 +1,23 @@
 # Agent Context Changelog
 
+## 2026-10-18 — Deterministic Git Push Workflow & Zero-Tool-Call Root Cause Resolution
+
+- Root cause diagnosed (3.2s zero-tool-call failure): `WorkerAgent` wrapped the user's task goal in an agent instruction preamble (`You are a specialized agent: ... Objective: <goal>`), causing `classify_workflow()` in `workflows.py` to evaluate the prompt as length > 50 characters and miss push keywords, bypassing deterministic workflows and falling through to rate-limited LLM free models.
+- Missing Git tools fixed: `AgentRole.GIT_RELEASE` in `agents/registry.py` was missing `git_*` tools in `allowed_tools`, causing `WorkerAgent._filter_tools()` to strip Git tools and fail with `"Tool not available: git_status"`. Added all Git tools to `GIT_RELEASE` and mapped `TaskIntent.GIT: AgentRole.GIT_RELEASE` in `runtime.py`. Also added Git tools to `AgentRole.CODER`.
+- Empty repo log handling: Updated `GitLogTool` in `tools/git.py` to recognize empty repositories without initial commits (`fatal: your current branch 'main' does not have any commits yet`) and return success with `"(no commits yet)"` instead of exiting with an error.
+- Deterministic push auto-configuration: `run_git_push_workflow()` in `workflows.py` unwraps `Objective:` prefixes, handles clean trees by proceeding directly to push/verify, automatically extracts remote URLs from user goals when unconfigured, and safely executes `git remote add origin <url>`.
+- Acceptance scenario verified: Added `tests/unit/test_deterministic_git_push_acceptance.py`. Harness CLI runtime successfully executes end-to-end Git push from an uncommitted repo to a local bare remote with **zero LLM model calls** permitted (`FailingProvider` returning HTTP 429).
+- Test results: Full unit suite **1,667 passed, 0 failed** in 116.24s. Targeted deterministic suite: 3 passed. No live API calls. No commit.
+
+## 2026-10-18 — OpenRouter & Provider Reliability Audit: fixes & verification
+
+- Root cause diagnosed: OpenRouter returned HTTP 403 for models with partner restrictions (`thinkingmachines/inkling-small:free`), which `fallback.py` and `http_adapters.py` treated as global provider auth failure (`AUTHENTICATION`), aborting the fallback chain and falsely claiming `OPENROUTER_API_KEY` was invalid.
+- Dynamic fallback preserved: `router.py` now ensures dynamic fallback routes (`openrouter/free`) are kept at the end of the fallback candidate list rather than being sliced off by `max_fallback_chain`.
+- Structured error classification: Added `ProviderErrorCategory.PERMISSION`, `CONTEXT_LENGTH`, `CONFIGURATION` to `base.py`; updated `fallback.py` to classify HTTP 403 as `PERMISSION_DENIED` and fail over cleanly with a 1-hour model cooldown instead of aborting the session.
+- Secret redaction: Added `_safe_error_detail()` in `fallback.py` to scrub bearer tokens and API keys from error messages, logs, and summaries.
+- Credential resolution: Enhanced `dotenv.py` and `credentials.py` to properly handle whitespace, empty environment strings, and cross-directory launches.
+- Tests: +24 unit regression tests in `tests/unit/test_openrouter_reliability_audit.py`. Full suite: **1,767 passed, 7 skipped, 0 failed**. Smoke tests pass. No commit.
+
 ## 2026-09-30 — Project intelligence facade wired (same takeover session)
 
 - Added `harness_core/intelligence/` — canonical `ProjectIntelligence` facade

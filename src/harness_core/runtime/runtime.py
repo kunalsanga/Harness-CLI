@@ -1049,7 +1049,7 @@ def _role_for_intent(intent: TaskIntent) -> AgentRole:
         TaskIntent.TEST: AgentRole.TESTER,
         TaskIntent.REFACTOR: AgentRole.CODER,
         TaskIntent.REVIEW: AgentRole.REVIEWER,
-        TaskIntent.GIT: AgentRole.CODER,
+        TaskIntent.GIT: AgentRole.GIT_RELEASE,
         TaskIntent.DEPLOY: AgentRole.CODER,
         TaskIntent.MIXED: AgentRole.CODER,
     }

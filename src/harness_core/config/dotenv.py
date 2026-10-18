@@ -62,11 +62,12 @@ def _load_single_env(path: Path) -> int:
         value = value.strip()
         # Strip surrounding quotes
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-            value = value[1:-1]
-        # Only set if not already in environment (explicit env wins)
-        if key and key not in os.environ:
-            os.environ[key] = value
-            loaded += 1
+            value = value[1:-1].strip()
+        # Only set if not already in environment with a non-empty value (explicit env wins)
+        if key and (key not in os.environ or not os.environ[key].strip()):
+            if value:
+                os.environ[key] = value
+                loaded += 1
     return loaded
 
 

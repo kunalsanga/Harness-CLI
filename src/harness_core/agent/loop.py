@@ -1017,6 +1017,8 @@ When you are done, summarize what you did and provide evidence of success."""
             task.git_commit = data["commit"]
         if data.get("push"):
             task.git_push = data["push"]
+            commit_part = f" ({data['commit'][:7]})" if data.get("commit") else ""
+            task.result = f"Project successfully pushed to {data['push']}{commit_part}."
         for op in result.completed_operations:
             self._completed_operations.add(op)
             task.completed_operations.append(op)
@@ -2060,6 +2062,7 @@ When you are done, summarize what you did and provide evidence of success."""
                 wf_result = await run_git_push_workflow(
                     ctx=self._workflow_context(),
                     plan=task.task_plan,
+                    goal=goal,
                 )
             elif workflow_name == "test":
                 from harness_core.agent.workflows import run_test_workflow

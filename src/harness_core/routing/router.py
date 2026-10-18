@@ -381,7 +381,7 @@ class ModelRouter:
                     prov_name, maybe_model = target_id.split("/", 1)
                     if prov_name.lower() in self.providers:
                         p = self.providers.get(prov_name.lower())
-                        target_id = maybe_model
+                        target_id = "openrouter/free" if prov_name.lower() == "openrouter" and maybe_model.lower() == "free" else maybe_model
             if p is None:
                 matches = self._filter_models([m for m in models if m.id == target_id], ctx)
                 if len(matches) == 1:
@@ -516,17 +516,27 @@ class ModelRouter:
         models: list[ModelInfo],
     ) -> list[tuple[str, ModelProvider]]:
         """Build a provider-neutral chain from discovered free model metadata."""
-        free_models = [m for m in models if m.is_free and m.supports_tools is True]
-        # Concrete free models first; provider dynamic routes (e.g. openrouter/free) last.
-        free_models.sort(key=lambda model: (
-            "dynamic-route" in model.tags,
+        requires_tools = bool(request.tools)
+        free_models = [m for m in models if m.is_free and (not requires_tools or m.supports_tools is True)]
+        concrete_models = [m for m in free_models if "dynamic-route" not in m.tags]
+        dynamic_models = [m for m in free_models if "dynamic-route" in m.tags]
+
+        concrete_models.sort(key=lambda model: (
             -model.context_window,
             model.provider,
             model.id,
         ))
+
+        # Ensure dynamic route (e.g. openrouter/free) is included at the end of the chain as the resilient fallback
+        max_chain = self.config.max_fallback_chain
+        if dynamic_models and max_chain > 1:
+            candidates = concrete_models[: max(1, max_chain - len(dynamic_models))] + dynamic_models
+        else:
+            candidates = concrete_models[:max_chain] + (dynamic_models if not concrete_models else [])
+
         chain: list[tuple[str, ModelProvider]] = []
         seen: set[tuple[str, str]] = set()
-        for model in free_models[: self.config.max_fallback_chain]:
+        for model in candidates:
             provider = self.providers.get(model.provider)
             if provider is None or (model.provider, model.id) in seen:
                 continue

@@ -166,6 +166,16 @@ class GitLogTool(Tool):
         except Exception as e:
             return ToolResults.from_exception(e, retryable=False)
         if rc != 0:
+            combined = f"{stdout}\n{stderr}".lower()
+            if (
+                "does not have any commits yet" in combined
+                or "unknown revision" in combined
+                or "ambiguous argument" in combined
+            ):
+                return ToolResults.success(
+                    "(no commits yet)",
+                    metadata={"operation": "log", "no_commits": True},
+                )
             return _git_error("log", stdout, stderr, rc)
         return ToolResults.success(
             stdout or "(no commits)",

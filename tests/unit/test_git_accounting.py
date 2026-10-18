@@ -224,3 +224,16 @@ class TestGitWorkflowAccounting:
             assert all(e.data.get("tool") for e in results)
 
         asyncio.run(_main())
+
+    def test_git_log_on_empty_repo(self, tmp_path: Path):
+        """GitLogTool must return (no commits yet) on a fresh repo instead of erroring."""
+        subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+        tool = GitLogTool(working_directory=str(tmp_path))
+
+        async def _main() -> None:
+            res = await tool.execute({})
+            assert res.status == ToolResultStatus.SUCCESS
+            assert "no commits" in res.output.lower()
+
+        asyncio.run(_main())
+

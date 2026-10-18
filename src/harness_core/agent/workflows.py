@@ -150,6 +150,7 @@ async def run_git_push_workflow(
     *,
     commit_message: str | None = None,
     model: ModelCaller | None = None,
+    goal: str = "",
 ) -> WorkflowResult:
     """End-to-end git push with bounded runtime execution.
 
@@ -171,19 +172,8 @@ async def run_git_push_workflow(
     if status.status == ToolResultStatus.ERROR:
         plan.fail_id(todo_ids[0], status.error or "git status failed")
         return WorkflowResult(False, "tool_failure", completed_ops)
-    if status.metadata.get("clean"):
-        # Nothing to commit; report and finish truthfully. The skip is
-        # authorized runtime evidence (clean tree), so it applies to
-        # required steps too (Phase 10.6).
-        for i in range(1, 4):
-            plan.skip_id(
-                todo_ids[i],
-                "Working tree clean — nothing to commit or push",
-                authorized=True,
-            )
-        await _advance(6, {"op": "clean_tree"})
-        return WorkflowResult(True, None, completed_ops)
-    await _advance(0, {"tool": "git_status", "files": status.metadata.get("files", [])})
+    is_clean = bool(status.metadata.get("clean"))
+    await _advance(0, {"tool": "git_status", "files": status.metadata.get("files", []), "clean": is_clean})
 
     # 2. Detect remote
     remote_result = await _run_tool(ctx, "git_remote")
@@ -192,6 +182,17 @@ async def run_git_push_workflow(
         plan.fail_id(todo_ids[1], remote_result.error or "git remote failed")
         return WorkflowResult(False, "tool_failure", completed_ops)
     remotes = remote_result.metadata.get("remotes", {})
+    if not remotes and goal:
+        import re
+        url_match = re.search(r"(https?://[^\s]+|git@[^\s]+:[^\s]+|[a-zA-Z]:\\[^\r\n\"]+\.git|/[^\r\n\"]+\.git)", goal)
+        if not url_match and ".git" in goal:
+            url_match = re.search(r"(\S+\.git)", goal)
+        if url_match:
+            raw_url = url_match.group(1).rstrip(">\"')").strip()
+            from harness_core.tools.git import _run_git
+            rc_add, out_add, err_add = await _run_git(["remote", "add", "origin", raw_url], str(ctx.workspace))
+            if rc_add == 0:
+                remotes = {"origin": raw_url}
     if not remotes:
         plan.fail_id(todo_ids[1], "No git remote configured")
         return WorkflowResult(False, "tool_failure", completed_ops)
@@ -205,38 +206,43 @@ async def run_git_push_workflow(
         return WorkflowResult(False, "tool_failure", completed_ops)
     await _advance(2, {"identity": identity.metadata})
 
-    # 4. Stage
-    add = await _run_tool(ctx, "git_add")
-    completed_ops.append("git_add")
-    if add.status == ToolResultStatus.ERROR:
-        plan.fail_id(todo_ids[3], add.error or "git add failed")
-        return WorkflowResult(False, "tool_failure", completed_ops)
-    await _advance(3, {"op": "staged"})
-
-    # 5. Commit (derive message if needed — single bounded model ask)
-    if not commit_message and model is not None:
-        try:
-            commit_message = await model.ask(
-                "Write a one-line git commit message (imperative, <72 chars) for: "
-                "the user's current workspace changes. Return ONLY the message, no quotes.",
-                max_tokens=80,
-            )
-            commit_message = (commit_message or "").strip().strip('"').strip("'")
-        except Exception:
-            commit_message = None
-    if not commit_message:
-        commit_message = "Update project"
-
-    commit = await _run_tool(ctx, "git_commit", message=commit_message)
-    completed_ops.append("git_commit")
-    if commit.status == ToolResultStatus.ERROR:
-        plan.fail_id(todo_ids[4], commit.error or "git commit failed")
-        return WorkflowResult(False, "tool_failure", completed_ops)
-    if commit.metadata.get("nothing_to_commit"):
-        plan.skip_id(todo_ids[4], "Nothing to commit", authorized=True)
+    # 4. Stage & 5. Commit (only if tree is not clean)
+    if is_clean:
+        plan.skip_id(todo_ids[3], "Working tree clean — nothing to stage", authorized=True)
+        plan.skip_id(todo_ids[4], "Working tree clean — nothing to commit", authorized=True)
     else:
-        ctx.git_commit = commit.metadata.get("commit_hash")
-        await _advance(4, {"commit_hash": ctx.git_commit})
+        # Stage
+        add = await _run_tool(ctx, "git_add")
+        completed_ops.append("git_add")
+        if add.status == ToolResultStatus.ERROR:
+            plan.fail_id(todo_ids[3], add.error or "git add failed")
+            return WorkflowResult(False, "tool_failure", completed_ops)
+        await _advance(3, {"op": "staged"})
+
+        # Commit (derive message if needed — single bounded model ask)
+        if not commit_message and model is not None:
+            try:
+                commit_message = await model.ask(
+                    "Write a one-line git commit message (imperative, <72 chars) for: "
+                    "the user's current workspace changes. Return ONLY the message, no quotes.",
+                    max_tokens=80,
+                )
+                commit_message = (commit_message or "").strip().strip('"').strip("'")
+            except Exception:
+                commit_message = None
+        if not commit_message:
+            commit_message = "feat: Update project"
+
+        commit = await _run_tool(ctx, "git_commit", message=commit_message)
+        completed_ops.append("git_commit")
+        if commit.status == ToolResultStatus.ERROR:
+            plan.fail_id(todo_ids[4], commit.error or "git commit failed")
+            return WorkflowResult(False, "tool_failure", completed_ops)
+        if commit.metadata.get("nothing_to_commit"):
+            plan.skip_id(todo_ids[4], "Nothing to commit", authorized=True)
+        else:
+            ctx.git_commit = commit.metadata.get("commit_hash")
+            await _advance(4, {"commit_hash": ctx.git_commit})
 
     # 6. Push
     push = await _run_tool(ctx, "git_push")
@@ -425,11 +431,22 @@ def classify_workflow(goal: str) -> str | None:
     g = (goal or "").lower().strip()
     if not g:
         return None
+    # If wrapped in WorkerAgent prompt, unwrap the real objective:
+    if "objective:" in g:
+        for line in g.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("objective:"):
+                g = line_str.split("objective:", 1)[1].strip()
+                break
     words = g.split()
     first_5 = " ".join(words[:5]) if len(words) >= 5 else g
-    is_short = len(g) < 50
+    is_short = len(g) < 120
     # Be specific: "push" wins over "test" wins over "explain".
-    if any(k in first_5 for k in _GIT_KEYWORDS) or (is_short and any(k in g for k in _GIT_KEYWORDS)):
+    if (
+        any(k in first_5 for k in _GIT_KEYWORDS)
+        or (is_short and any(k in g for k in _GIT_KEYWORDS))
+        or any(k in g for k in ("push this project", "push project", "git push", "push to github", "push to remote", "push to this github"))
+    ):
         return "git_push"
     if any(k in first_5 for k in _TEST_KEYWORDS) or (is_short and any(k in g for k in _TEST_KEYWORDS)):
         return "test"

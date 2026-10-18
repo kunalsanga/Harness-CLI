@@ -326,7 +326,11 @@ class AgentRegistry:
             description="Manages commits, changelogs, tags, and deployment scripts",
             capabilities=["git_management", "changelog", "release"],
             preferred_task_types=["release", "versioning"],
-            allowed_tools=["read_file", "write_file", "run_command"],
+            allowed_tools=[
+                "read_file", "write_file", "run_command",
+                "git_status", "git_diff", "git_log", "git_remote",
+                "git_identity", "git_add", "git_commit", "git_push",
+            ],
             workspace_scope=WorkspaceScope.PROJECT,
             model_policy="coding",
             system_instructions=(
@@ -343,7 +347,10 @@ class AgentRegistry:
             description="Implements code changes, fixes bugs, and writes new features",
             capabilities=["code_writing", "bug_fixing", "feature_implementation", "refactoring"],
             preferred_task_types=["implementation", "bug_fix", "refactoring"],
-            allowed_tools=["read_file", "write_file", "edit_file", "list_files", "grep", "glob", "run_command"],
+            allowed_tools=[
+                "read_file", "write_file", "edit_file", "list_files", "grep", "glob", "run_command",
+                "git_status", "git_diff", "git_log", "git_remote", "git_identity", "git_add", "git_commit",
+            ],
             workspace_scope=WorkspaceScope.PROJECT,
             model_policy="coding",
             system_instructions=(

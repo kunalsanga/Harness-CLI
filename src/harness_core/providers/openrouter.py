@@ -51,8 +51,10 @@ def _openrouter_error_category(code, error_type: str, message: str) -> ProviderE
         status = 0
     if error_type in {"provider_unavailable", "model_not_found"}:
         return ProviderErrorCategory.MODEL_UNAVAILABLE
-    if error_type in {"rate_limit", "rate_limited"}:
+    if error_type in {"rate_limit", "rate_limited", "provider_rate_limit"}:
         return ProviderErrorCategory.RATE_LIMIT
+    if error_type in {"forbidden", "permission_denied", "model_permission"}:
+        return ProviderErrorCategory.PERMISSION
     return _error_category(status, message)
 
 
@@ -107,6 +109,7 @@ class OpenRouterProvider(ModelProvider):
             id="openrouter/free",
             name="OpenRouter free router",
             provider=self.name,
+            context_window=131072,
             supports_tools=True,
             supports_streaming=True,
             is_free=True,
@@ -176,9 +179,10 @@ class OpenRouterProvider(ModelProvider):
             detail = self._extract_provider_detail(e.response) if hasattr(e, "response") and e.response is not None else str(e)
             model_id = request.model or body.get("model", "")
             from harness_core.providers.http_adapters import _error_category
-            raise ProviderRequestError(_error_category(status, detail), detail or f"OpenRouter HTTP {status}", provider=self.name, model=model_id, status_code=status, retry_after=_retry_after(e.response), provider_code=_error_code(e.response)) from e
+            err_msg = f"{detail} (HTTP {status})" if detail and str(status) not in detail else (detail or f"OpenRouter HTTP {status}")
+            raise ProviderRequestError(_error_category(status, detail), err_msg, provider=self.name, model=model_id, status_code=status, retry_after=_retry_after(e.response), provider_code=_error_code(e.response)) from e
         except httpx.TimeoutException as e:
-            raise ProviderRequestError(ProviderErrorCategory.TIMEOUT, "OpenRouter request timed out", provider=self.name, model=request.model or body.get("model", "")) from e
+            raise ProviderRequestError(ProviderErrorCategory.TIMEOUT, "OpenRouter request timed out (timeout)", provider=self.name, model=request.model or body.get("model", "")) from e
         except httpx.NetworkError as e:
             raise ProviderRequestError(ProviderErrorCategory.NETWORK, "Could not connect to OpenRouter", provider=self.name, model=request.model or body.get("model", "")) from e
 
@@ -197,6 +201,12 @@ class OpenRouterProvider(ModelProvider):
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
         content = message.get("content") or ""
         tool_calls = message.get("tool_calls") or []
+        resp_meta: dict[str, Any] = {}
+        if isinstance(data.get("id"), str):
+            resp_meta["request_id"] = data["id"]
+        if isinstance(message.get("reasoning"), str):
+            resp_meta["reasoning"] = message["reasoning"]
+
         if not content and not tool_calls and isinstance(data.get("error"), dict):
             err_msg = data["error"].get("message", "")[:500]
             # OpenRouter wraps provider failures in HTTP 200. The structured
@@ -220,6 +230,7 @@ class OpenRouterProvider(ModelProvider):
             provider=self.name,
             usage=_normalize_openrouter_usage(data.get("usage")),
             finish_reason=choice.get("finish_reason", "") if isinstance(choice, dict) else "",
+            metadata=resp_meta,
         )
 
     async def stream(self, request: CompletionRequest) -> AsyncGenerator[str, None]:
@@ -336,18 +347,23 @@ class OpenRouterProvider(ModelProvider):
     async def health_check(self) -> bool:
         """Check if the provider is available AND the API key is valid.
 
-        First checks if the key is non-empty, then verifies it against
-        the /auth/key endpoint which validates the actual credential.
+        Validates the key against OpenRouter key endpoints (/key or /auth/key).
         """
         if not self.api_key:
             return False
         try:
             client = await self._get_client()
-            # /auth/key validates the actual API key (returns 401 if invalid)
-            response = await client.get("/auth/key")
-            return response.status_code == 200
+            # /key endpoint is OpenRouter's official key inspection endpoint
+            response = await client.get("/key")
+            if response.status_code == 200:
+                return True
+            if response.status_code == 401:
+                return False
+            # Fallback to /auth/key
+            auth_response = await client.get("/auth/key")
+            return auth_response.status_code == 200
         except Exception:
-            # Fallback: check if models endpoint works (less reliable)
+            # Fallback: check if models endpoint works
             try:
                 client = await self._get_client()
                 response = await client.get("/models")

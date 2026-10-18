@@ -12,6 +12,7 @@ class ProviderErrorCategory(str, Enum):
     """Provider-neutral failure categories used by routing and failover."""
 
     AUTHENTICATION = "authentication"
+    PERMISSION = "permission"
     RATE_LIMIT = "rate_limit"
     MODEL_UNAVAILABLE = "model_unavailable"
     NETWORK = "network"
@@ -19,11 +20,13 @@ class ProviderErrorCategory(str, Enum):
     PROVIDER = "provider"
     INVALID_REQUEST = "invalid_request"
     PAYMENT_REQUIRED = "payment_required"
+    CONTEXT_LENGTH = "context_length"
     TOOL = "tool"
+    CONFIGURATION = "configuration"
     UNKNOWN = "unknown"
 
 
-class ProviderRequestError(Exception):
+class ProviderRequestError(RuntimeError):
     """Normalized provider request error; vendor details stay in the adapter."""
 
     def __init__(

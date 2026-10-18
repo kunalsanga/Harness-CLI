@@ -223,6 +223,18 @@ class CredentialResolver:
             value = os.environ.get(key, "").strip()
             if value:
                 return value
+        # Ensure dotenv files (.env in cwd, harness root, ~/.harness.env) are loaded
+        if not getattr(self, "_dotenv_loaded", False):
+            self._dotenv_loaded = True
+            try:
+                from harness_core.config.dotenv import load_dotenv
+                load_dotenv()
+                for key in env_keys:
+                    value = os.environ.get(key, "").strip()
+                    if value:
+                        return value
+            except Exception:
+                pass
         return None
 
     @property

@@ -537,15 +537,19 @@ class InteractiveShell:
                 elif exit_code is not None and exit_code != 0:
                     self.console.print(f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
                     if error:
-                        first_line = error.split("\n")[0]
+                        first_line = _safe_str(error.split("\n")[0].strip())
                         if first_line:
-                            self.console.print(f"  [red]  {_safe_str(first_line) if self.verbose else 'Tool execution failed.'}[/]", highlight=False)
+                            self.console.print(f"  [red]  {first_line}[/]", highlight=False)
                 else:
                     self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
             elif status != "success" and status != "permission_denied":
                 # In rich mode, still surface failures dimly outside Live if verbose
                 if self.verbose and exit_code not in (None, 0):
                     self.console.print(f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
+                    if error:
+                        first_line = _safe_str(error.split("\n")[0].strip())
+                        if first_line:
+                            self.console.print(f"  [red]  {first_line}[/]", highlight=False)
 
         async def on_model_error(event: Any) -> None:
             # Retain the diagnostic for accurate final classification; never
@@ -870,17 +874,28 @@ class InteractiveShell:
         try:
             models = await self._router.refresh_models(force=True) if self._router else []
             for provider in (self._router.providers.values() if self._router else []):
-                models.extend(await provider.routing_hints("free"))
+                hints = provider.routing_hints("free")
+                import inspect
+                if inspect.isawaitable(hints):
+                    hints = await hints
+                if isinstance(hints, list):
+                    models.extend(hints)
+            models = list({(m.provider, m.id): m for m in models}.values())
             health = getattr(self._router, "health", None)
-            table = Table(title="Configured / Discovered Models")
+            is_free_mode = self.free or (getattr(self._router, "config", None) and getattr(self._router.config, "routing_mode", "") == "free")
+            table = Table(title=f"Configured / Discovered Models{' (Free Mode)' if is_free_mode else ''}")
             table.add_column("Model", style="cyan", max_width=40)
             table.add_column("Provider", style="green")
+            table.add_column("Tier")
             table.add_column("Source")
             table.add_column("Health")
             table.add_column("Cooldown")
             table.add_column("Tools")
-            for model in models[:60]:
+            # If in free mode, prioritize free models
+            display_models = sorted(models, key=lambda m: (not m.is_free if is_free_mode else 0, m.id))
+            for model in display_models[:60]:
                 model_id = model.id
+                tier = "[green]Free[/]" if model.is_free else "[yellow]Paid[/]"
                 state = health.get_state(model_id) if health is not None else None
                 if state is not None:
                     status = state.display_status
@@ -890,7 +905,7 @@ class InteractiveShell:
                     status, cooldown = "Unknown", "—"
                 configured = "Configured" if model_id in {m.id for p in (self._router.providers.values() if self._router else []) for m in getattr(p, "configured_models", [])} else "Discovered"
                 tools = "Supported" if model.supports_tools is True else "Unsupported" if model.supports_tools is False else "Unknown"
-                table.add_row(model.name or model_id, model.provider, configured, status, cooldown, tools)
+                table.add_row(model.name or model_id, model.provider, tier, configured, status, cooldown, tools)
             self.console.print(table)
         except Exception as e:
             self.console.print(f"  [red]✗ Unable to retrieve models[/]")
@@ -1610,70 +1625,29 @@ class InteractiveShell:
         self._setup_session()
         self._print_welcome()
         try:
-            self._execution_task: asyncio.Task | None = None
-            
-            async def get_input() -> str | None:
-                return await self._read_input()
-                
-            input_task = asyncio.create_task(get_input())
-            
             while True:
-                if self._execution_task:
-                    done, pending = await asyncio.wait(
-                        [self._execution_task, input_task],
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
+                try:
+                    user_input = await self._read_input()
+                except (EOFError, KeyboardInterrupt):
+                    break
                     
-                    if self._execution_task in done:
-                        try:
-                            self._execution_task.result()
-                        except Exception as e:
-                            self.console.print(f"  [red]Execution failed.[/] { _safe_str(e) if self.verbose else ''}")
-                        self._execution_task = None
-                        
-                    if input_task in done:
-                        user_input = input_task.result()
-                        input_task = asyncio.create_task(get_input())
-                        
-                        if user_input is None:
-                            if self._execution_task:
-                                self._execution_task.cancel()
-                            break
-                        user_input = user_input.strip()
-                        if not user_input:
-                            continue
-                            
-                        if user_input.startswith("/"):
-                            if user_input.lower() in ("/exit", "/quit"):
-                                if self._execution_task:
-                                    self._execution_task.cancel()
-                                break
-                            await self._handle_command(user_input)
-                            continue
-                            
-                        # If execution is running, this is a steering command
-                        if self._execution_task and self._event_bus:
-                            from harness_core.observability.events import Event
-                            await self._event_bus.emit(Event(type="steering.received", source="cli", data={"message": user_input}))
-                        else:
-                            self._execution_task = asyncio.create_task(self._execute_task(user_input))
-                else:
-                    user_input = await input_task
-                    input_task = asyncio.create_task(get_input())
+                if user_input is None:
+                    break
                     
-                    if user_input is None:
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
+                    
+                if user_input.startswith("/"):
+                    if user_input.lower() in ("/exit", "/quit"):
                         break
-                    user_input = user_input.strip()
-                    if not user_input:
-                        continue
-                        
-                    if user_input.startswith("/"):
-                        if user_input.lower() in ("/exit", "/quit"):
-                            break
-                        await self._handle_command(user_input)
-                        continue
-                        
-                    self._execution_task = asyncio.create_task(self._execute_task(user_input))
+                    await self._handle_command(user_input)
+                    continue
+                    
+                # The execution runs and blockingly updates the Live UI.
+                # No prompt is shown while this runs, matching the spec.
+                await self._execute_task(user_input)
+                
         except KeyboardInterrupt:
             self.console.print("\n")
         except EOFError:

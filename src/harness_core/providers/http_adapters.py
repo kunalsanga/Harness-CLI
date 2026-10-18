@@ -26,17 +26,23 @@ def _error_category(status: int, message: str) -> ProviderErrorCategory:
     low = message.lower()
     if status == 401 or "unauthorized" in low or "invalid api key" in low:
         return ProviderErrorCategory.AUTHENTICATION
-    if status == 403 or "forbidden" in low:
-        return ProviderErrorCategory.AUTHENTICATION
+    if status == 403 or "forbidden" in low or "permission" in low or "only available on" in low or "access denied" in low:
+        return ProviderErrorCategory.PERMISSION
     if status == 429 or "rate limit" in low or "too many requests" in low:
         return ProviderErrorCategory.RATE_LIMIT
-    if status == 402 or "payment required" in low:
+    if status == 402 or "payment required" in low or "insufficient credits" in low:
         return ProviderErrorCategory.PAYMENT_REQUIRED
-    if status in (404, 410, 502, 503, 504) or any(
-        phrase in low for phrase in ("model unavailable", "no endpoints", "not found")
+    if status == 408 or "request timeout" in low:
+        return ProviderErrorCategory.TIMEOUT
+    if status == 413 or any(
+        kw in low for kw in ("context length", "context window", "maximum context", "token limit", "too long", "too many tokens")
+    ):
+        return ProviderErrorCategory.CONTEXT_LENGTH
+    if status in (404, 410, 502, 503) or any(
+        phrase in low for phrase in ("model unavailable", "no endpoints", "not found", "provider unavailable", "model not found")
     ):
         return ProviderErrorCategory.MODEL_UNAVAILABLE
-    if status in (400, 413, 422):
+    if status in (400, 422) or any(kw in low for kw in ("malformed", "invalid parameter", "unsupported parameter")):
         return ProviderErrorCategory.INVALID_REQUEST
     if status >= 500:
         return ProviderErrorCategory.PROVIDER

@@ -23,7 +23,7 @@ async def _safe_generate(provider, request):
     try:
         return await provider.generate(request)
     except Exception as e:
-        if "429" in str(e):
+        if "429" in str(e) or "rate limit" in str(e).lower() or getattr(e, "status_code", None) == 429:
             pytest.skip("Rate limited (429) by OpenRouter")
         raise
 
