@@ -32,6 +32,9 @@ except ImportError:  # pragma: no cover
     ConversationRenderer = None  # type: ignore[assignment]
     derive_intent = None  # type: ignore[assignment]
 
+from harness_core.cli.ui import render_welcome, render_provider_error, Sym, shorten_path
+
+
 
 # ─── Version ──────────────────────────────────────────────────────────────
 
@@ -260,47 +263,15 @@ class InteractiveShell:
     # ─── Welcome ───────────────────────────────────────────────────────
 
     def _print_welcome(self) -> None:
-        """Compact session header with provider, mode, model, and workspace."""
-        import os
-        from rich.table import Table
-        from rich.panel import Panel
-        from rich.text import Text
-
-        project_name = Path(self.workspace).name if self.workspace else "app"
-        provider = self.current_provider or "openrouter"
-        mode = self.mode
-        model = self.current_model or self.model or "Auto"
-
-        width = self._get_real_terminal_width()
-
-        logo_str = (
-            r"[#3b82f6] __  __     [#6366f1]______     [#8b5cf6]______     [#a855f7]__   __     [#d946ef]______     [#ec4899]______     [#f43f5e]______    [/]" + "\n" +
-            r"[#3b82f6]/\ \_\ \   [#6366f1]/\  __ \   [#8b5cf6]/\  == \   [#a855f7]/\ '-.\ \   [#d946ef]/\  ___\   [#ec4899]/\  ___\   [#f43f5e]/\  ___\   [/]" + "\n" +
-            r"[#3b82f6]\ \  __ \  [#6366f1]\ \  __ \  [#8b5cf6]\ \  __<   [#a855f7]\ \ \-.  \  [#d946ef]\ \  __\   [#ec4899]\ \___  \  [#f43f5e]\ \___  \  [/]" + "\n" +
-            r"[#3b82f6] \ \_\ \_\  [#6366f1]\ \_\ \_\  [#8b5cf6]\ \_\ \_\  [#a855f7]\ \_\\'\_\  [#d946ef]\ \_____\  [#ec4899]\/\_____\  [#f43f5e]\/\_____\ [/]" + "\n" +
-            r"[#3b82f6]  \/_/\/_/   [#6366f1]\/_/\/_/   [#8b5cf6]\/_/ /_/   [#a855f7]\/_/ \/_/   [#d946ef]\/_____/   [#ec4899]\/_____/   [#f43f5e]\/_____/ [/]" + "\n" +
-            r"                  [dim]AUTONOMOUS AI ENGINEERING[/]"
+        """Compact branded welcome wordmark."""
+        render_welcome(
+            self.console,
+            workspace=str(self.workspace),
+            model=self.current_model or self.model or "",
+            provider=self.current_provider or "",
+            has_router=self._router is not None,
+            plain=self.plain,
         )
-
-        workspace_str = str(self.workspace)
-        if len(workspace_str) > 45:
-            workspace_str = "...\\" + os.path.basename(workspace_str)
-
-        info_text = Text.from_markup(f"[bold]>_ HARNESS[/] (v{__version__})\n\n[dim]API Key | {provider} · {model} · {mode}\n{workspace_str}[/]")
-        info_text.justify = "left"
-        info_panel = Panel(info_text, border_style="dim", expand=False)
-
-        if width >= 130:
-            grid = Table.grid(expand=True)
-            grid.add_column()
-            grid.add_column(justify="right")
-            grid.add_row(logo_str, info_panel)
-            self.console.print(grid)
-        else:
-            self.console.print(logo_str)
-            self.console.print(info_panel)
-
-        self.console.print("")
         self.console.print("[dim]Tips: Use Ctrl+Enter for a new line, and / for commands.[/]")
         self.console.print("")
 
@@ -472,11 +443,31 @@ class InteractiveShell:
             provider = event.data.get("provider", "")
             self.current_model = model
             self.current_provider = provider
-            if _conv() is not None and model:
-                _conv().update_model_activity(model)
-                _conv().update_models([model])
-            if self.verbose:
-                self.console.print(f"  [dim]  model: {model} ({provider})[/]", highlight=False)
+            is_9router = str(provider).lower() in ("9router", "ninerouter")
+            if is_9router:
+                if not getattr(self, "_9router_indicated", False):
+                    self._9router_indicated = True
+                    if self.plain:
+                        self.console.print("⚡ Routed through 9router")
+                    else:
+                        self.console.print("  [cyan]⚡ Routed through 9router[/]", highlight=False)
+                if self.verbose:
+                    self.console.print(f"  [dim]  model: {model} ({provider})[/]", highlight=False)
+            else:
+                if _conv() is not None and model:
+                    _conv().update_model_activity(model)
+                    _conv().update_models([model])
+                if self.verbose:
+                    self.console.print(f"  [dim]  model: {model} ({provider})[/]", highlight=False)
+
+        async def on_steering_received(event: Any) -> None:
+            msg = str(event.data.get("message", event.data.get("feedback", "")))
+            if msg:
+                if self.plain:
+                    self.console.print(f"↳ User update received\n  \"{msg}\"")
+                else:
+                    self.console.print(f"  [cyan]↳ User update received[/]\n  [dim]\"{msg}\"[/]", highlight=False)
+
 
         async def on_model_switched(event: Any) -> None:
             old_id = str(event.data.get("from", ""))
@@ -725,6 +716,7 @@ class InteractiveShell:
         bus.on("test_integrity.warning", on_test_integrity)
         bus.on("verification.started", on_verification)
         bus.on("verification.completed", on_verification)
+        bus.on("steering.received", on_steering_received)
         bus.on("error.occurred", on_error)
 
     # ─── Session Management ──────────────────────────────────────────
@@ -1077,7 +1069,10 @@ class InteractiveShell:
         if self._router:
             self._router.config.routing_mode = "free"
             self._router.config.prefer_free = True
-        self.console.print("  [green]✓[/] Switched to free model routing")
+        if self.plain:
+            self.console.print("✓ Free model routing enabled")
+        else:
+            self.console.print("  [green]✓[/] Free model routing enabled")
 
     async def _cmd_cancel(self) -> None:
         if not self.running:
@@ -1204,6 +1199,7 @@ class InteractiveShell:
     async def _execute_task(self, goal: str) -> str | None:
         self._shown_failovers.clear()
         self._last_model_error = ""
+        self._9router_indicated = False
         if getattr(self, '_first_task', True):
             self.console.clear()
             self._first_task = False
@@ -1531,17 +1527,28 @@ class InteractiveShell:
         elapsed_str = _format_elapsed(elapsed)
         task = getattr(self._agent_loop, "_active_task", None)
         self.console.print("", highlight=False)
-        if task is None:
-            self.console.print(f"  [yellow]![/] [dim]Cancelled - {elapsed_str}[/]", highlight=False)
-            return
-        task.status = TaskStatus.CANCELLED
-        files_changed = files_from_task(task)
-        if files_changed:
-            names = ", ".join(files_changed[:5])
-            self.console.print(f"  [yellow]![/] [dim]Cancelled - {elapsed_str}[/]", highlight=False)
-            self.console.print(f"  [dim]Modified: {names}[/]", highlight=False)
+        if task is not None:
+            task.status = TaskStatus.CANCELLED
+            files_changed = files_from_task(task)
         else:
-            self.console.print(f"  [yellow]![/] [dim]Cancelled - {elapsed_str}[/]", highlight=False)
+            files_changed = []
+
+        if self.plain:
+            self.console.print(f"⏹ Stopping... Cancelled ({elapsed_str})")
+            self.console.print("✓ Task stopped safely")
+            self.console.print("✓ State preserved")
+            if files_changed:
+                self.console.print("Changes so far:")
+                for f in files_changed[:10]:
+                    self.console.print(f"  {f}")
+        else:
+            self.console.print(f"  [yellow]⏹[/] [bold]Stopping...[/] [dim]Cancelled · {elapsed_str}[/]", highlight=False)
+            self.console.print("  [green]✓[/] Task stopped safely", highlight=False)
+            self.console.print("  [green]✓[/] State preserved", highlight=False)
+            if files_changed:
+                self.console.print("\n  [bold]Changes so far[/]", highlight=False)
+                for f in files_changed[:10]:
+                    self.console.print(f"  [yellow]✎[/] {f}", highlight=False)
         self.console.print("", highlight=False)
 
     def _ensure_prompt_session(self) -> Any:

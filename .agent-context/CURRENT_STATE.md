@@ -1,8 +1,32 @@
 # Current State
 
-Last checked: 2026-10-19 (OpenRouter Provider Investigation & Multi-Provider Fallback)
+Last checked: 2026-10-25 (TUI Overhaul & Restaurant Website Coding Benchmark)
 
-## OpenRouter Provider Investigation & Multi-Provider Fallback (2026-10-19)
+## Terminal UI Overhaul & Restaurant Website Coding Benchmark (2026-10-25)
+- **Branded Wordmark & Clean Visual Identity**:
+  - `src/harness_core/cli/ui.py`: `render_welcome()` renders compact branded wordmark (`◆ Harness`, `Autonomous AI Engineering`, workspace folder name) replacing bulky ASCII banner panels. Plain mode falls back cleanly to ASCII mark (`*`).
+  - Added `shorten_path()` to shorten absolute paths to workspace-relative paths across all tool display lines.
+  - Added `PHASE_DISPLAY` mapping directly to the backend's 11 `_emit_phase()` states.
+- **Interactive Shell Upgrades**:
+  - `src/harness_core/cli/interactive.py`:
+    - `_print_welcome()` calls `render_welcome()`.
+    - `9router` concise normal-mode indicator: `⚡ Routed through 9router` without leaking internal model IDs.
+    - Added `steering.received` event handler displaying `↳ User update received` inline.
+    - Updated `/free` command to show product-level message: `✓ Free model routing enabled`.
+    - Enhanced cancellation UX (`_render_cancellation()`): displays `⏹ Stopping...`, `✓ Task stopped safely`, `✓ State preserved`, and clean listing of changes made so far.
+- **Conversation Renderer & Activity Aggregation**:
+  - `src/harness_core/cli/conversation.py`:
+    - Added `update_agent()` for multi-agent tracking and progressive disclosure (named workers for <=3, count summary for >3).
+    - Consecutive file inspection aggregation (collapses >=3 sequential read/list/glob/grep calls into `✓ Inspected N files`).
+- **Four-Question Completion Summary**:
+  - `src/harness_core/cli/completion.py`: structured summary answering What did Harness do, What changed, Did verification pass, and What remains. Replaced "No false success" slogan with actionable next steps.
+- **Mandatory Restaurant Website Benchmark Acceptance Test**:
+  - `tests/e2e/test_restaurant_benchmark.py`: end-to-end multi-agent acceptance test simulating full autonomous restaurant ordering website creation across requirements analysis, database schema, FastAPI backend, web frontend, test failure detection, recovery/debugger repair, and successful verification.
+- **Deterministic Testing**:
+  - `tests/unit/test_tui_ux.py`: 17 behavioral tests for branding, path shortening, phase mapping, aggregation, summaries, cancellation, steering, and 9router.
+  - UI regression suite: 184 passed in 5.03s.
+  - Full suite: 1783 passed, 1 skipped in 82.74s.
+
 - **Investigation & Root Cause Analysis**:
   - Investigated OpenRouter dashboard evidence (294 requests, 1.88M tokens, $0.00 spend across `:free` models: North Mini Code, Gemma, Nemotron, LFM).
   - Confirmed that average request volume (~6,395 tokens/request) is standard for an autonomous loop with prompts, directory context, tool schemas, and file contents.

@@ -479,6 +479,10 @@ class ConversationRenderer:
         self.state.todos = list(items or [])
         self._refresh()
 
+    def update_agent(self, agent_id: str, status: str = "running") -> None:
+        self.state.update_agent(agent_id, status)
+        self._refresh()
+
     def update_models(self, models: list[str]) -> None:
         self.state.models_used = list(dict.fromkeys(
             [*self.state.models_used, *(str(model) for model in models if model)]
