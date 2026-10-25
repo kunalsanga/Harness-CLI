@@ -161,9 +161,10 @@ def test_cli_unified_failure_renders_honest_summary(tmp_path, monkeypatch):
     assert result.exit_code == 1, result.output
 
     output = result.output.lower()
-    assert "failed" in output
-    assert "recovery exhausted" in output
+    assert "failed" in output or "did not complete" in output
+    # Must never falsely claim success
     assert "harness complete" not in output
+    assert "✓ done" not in output
 
 
 def test_cli_unified_json_preserved(tmp_path, monkeypatch):

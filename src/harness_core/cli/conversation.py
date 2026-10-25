@@ -37,6 +37,19 @@ from rich.text import Text
 
 from harness_core.cli.ui import Color, Sym, fmt_elapsed, shorten_path, PHASE_DISPLAY, PHASE_ICON
 
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
+def format_token_count(tokens: int, estimated: bool = False, concise: bool = False) -> str:
+    """Format a token count with k suffix and optional estimation tag."""
+    if tokens >= 1000:
+        val = f"{tokens / 1000:.1f}k"
+    else:
+        val = str(tokens)
+    if concise:
+        return f"~{val} (est)" if estimated else val
+    return f"~{val} tokens (est)" if estimated else f"{val} tokens"
+
 
 # ── Intent-derived thinking ───────────────────────────────────────────────
 
@@ -137,6 +150,14 @@ class ConversationState:
     workspace: str = ""
     # Activity aggregation: track consecutive reads for collapsing
     _consecutive_reads: int = 0
+    stage: str = "Connecting…"
+    current_turn_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    tokens_estimated: bool = False
+    file_change_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    current_diff_preview: dict[str, Any] | None = None
+    test_summary: dict[str, Any] | None = None
 
     def update_agent(self, name: str, status: str) -> None:
         if name not in self.agents:
@@ -221,6 +242,7 @@ class ConversationRenderer:
             # before the first execution.state event arrives. The canonical
             # TaskExecutionTimeline value from the event overwrites this.
             started_at=time.monotonic(),
+            stage="Connecting…",
         )
         self._thinking_shown = False
         self._active = True
@@ -255,6 +277,10 @@ class ConversationRenderer:
                 self.console.print("", highlight=False)
             except Exception:
                 pass
+        try:
+            self.console.show_cursor(True)
+        except Exception:
+            pass
 
     def _refresh(self) -> None:
         if not self._active:
@@ -287,6 +313,16 @@ class ConversationRenderer:
     def update_phase(self, phase: str) -> None:
         self.state.phase = phase
         self.state.display_phase = PHASE_DISPLAY.get(phase, "")
+        if phase == "understanding":
+            self.state.stage = "Investigating…"
+        elif phase == "planning":
+            self.state.stage = "Planning…"
+        elif phase == "verifying":
+            self.state.stage = "Verifying…"
+        elif phase == "repairing":
+            self.state.stage = "Fixing…"
+        elif phase == "working":
+            self.state.stage = "Building…"
         self._refresh()
 
     def update_execution(self, data: dict[str, Any]) -> None:
@@ -316,11 +352,23 @@ class ConversationRenderer:
 
     def tool_started(self, tool: str, args: dict[str, Any]) -> None:
         display = _compact_tool_display(tool, args)
-        # For run_command failures we want "Running pytest..." style while running
         if tool == "run_command":
             cmd = args.get("command", "")
             short = cmd[:45] + "..." if len(cmd) > 45 else cmd
             display = f"Run {short}" if short else display
+            cmd_lower = str(cmd).lower()
+            if any(w in cmd_lower for w in ("pytest", "test", "unittest", "cargo test", "npm test")):
+                self.state.stage = "Running tests…"
+            else:
+                self.state.stage = "Running command…"
+        elif tool in ("read_file", "list_files", "grep", "glob"):
+            self.state.stage = "Reading files…"
+        elif tool in ("write_file", "edit_file"):
+            self.state.stage = "Editing code…"
+        elif tool.startswith("git_"):
+            self.state.stage = "Git operation…"
+        elif tool.startswith("mcp_"):
+            self.state.stage = f"Calling {tool}…"
         self.state.current_tool = tool
         self.state.add_running(display, tool=tool)
         self._refresh()
@@ -330,12 +378,26 @@ class ConversationRenderer:
         detail = summary.partition(":")[2].strip() if ":" in summary else ""
         if tool == "run_command":
             display = _compact_tool_display(tool, {"command": detail})
+            cmd_lower = detail.lower()
+            if any(w in cmd_lower for w in ("pytest", "test", "unittest", "cargo test", "npm test")):
+                self.state.stage = "Running tests…"
+            else:
+                self.state.stage = "Running command…"
         elif tool in ("read_file", "write_file", "edit_file", "list_files"):
             display = _compact_tool_display(tool, {"path": detail})
+            if tool in ("read_file", "list_files"):
+                self.state.stage = "Reading files…"
+            else:
+                self.state.stage = "Editing code…"
         elif tool in ("glob", "grep"):
             display = _compact_tool_display(tool, {"pattern": detail})
+            self.state.stage = "Reading files…"
         else:
             display = _compact_tool_display(tool, {})
+            if tool.startswith("mcp_"):
+                self.state.stage = f"Calling {tool}…"
+            elif tool.startswith("git_"):
+                self.state.stage = "Git operation…"
         self.state.current_tool = tool
         self.state.add_running(display, tool=tool)
         self._refresh()
@@ -343,6 +405,69 @@ class ConversationRenderer:
     def tool_completed(self, tool: str, status: str) -> None:
         self.state.complete_last(status)
         self.state.current_tool = ""
+        self._refresh()
+
+    def update_tokens(
+        self,
+        output_tokens: int = 0,
+        input_tokens: int | None = None,
+        estimated: bool = False,
+        delta: int | None = None,
+    ) -> None:
+        """Update turn token accounting (exact or estimated)."""
+        if delta is not None:
+            self.state.current_turn_tokens += delta
+        elif output_tokens > 0:
+            self.state.current_turn_tokens = output_tokens
+        if input_tokens is not None:
+            self.state.input_tokens = input_tokens
+        self.state.output_tokens = self.state.current_turn_tokens
+        if estimated:
+            self.state.tokens_estimated = True
+        self._refresh()
+
+    def update_file_changed(
+        self,
+        path: str,
+        added: int = 0,
+        removed: int = 0,
+        diff: str = "",
+    ) -> None:
+        """Record live file edit and refresh diff preview."""
+        stats = self.state.file_change_stats.setdefault(path, {"added": 0, "removed": 0})
+        stats["added"] += added
+        stats["removed"] += removed
+        self.state.current_diff_preview = {
+            "path": path,
+            "added": added,
+            "removed": removed,
+            "diff": diff,
+        }
+        self.state.stage = "Editing code…"
+        self._refresh()
+
+    def update_test_completed(
+        self,
+        passed: int = 0,
+        total: int = 0,
+        success: bool = True,
+        command: str = "",
+    ) -> None:
+        """Record live test completion results."""
+        failed = max(0, total - passed)
+        self.state.test_summary = {
+            "passed": passed,
+            "total": total,
+            "failed": failed,
+            "success": success,
+            "command": command,
+        }
+        self.state.stage = "Running tests…"
+        self._refresh()
+
+    def set_stage(self, stage: str) -> None:
+        """Set the active stage label."""
+        self.state.stage = stage
         self._refresh()
 
     def update_todos(self, completed: int, total: int) -> None:
@@ -366,6 +491,8 @@ class ConversationRenderer:
 
     def update_model_activity(self, model: str = "") -> None:
         self.state.model_activity = f"Requesting {self._model_display_name(model)}" if model else ""
+        if model:
+            self.state.stage = "Considering…"
         if self.state.execution_state == "thinking":
             self.state.display_phase = "✦ Considering…"
         self._refresh()
@@ -462,14 +589,22 @@ class ConversationRenderer:
             width = max(12, self.console.size.width - 10)
             for index, item in enumerate(self.state.todos[:limit]):
                 status = str(item.get("status", "pending")).lower()
-                icon = {
-                    "completed": "✓", "complete": "✓",
-                    "in_progress": "●", "active": "●", "failed": "✗",
-                }.get(status, "○")
+                is_unverified = bool(item.get("unverified") or (item.get("evidence") or {}).get("unverified"))
+                cat = str(item.get("category", "")).lower()
+                if is_unverified or (getattr(self.state, "failed", False) and cat in ("implement", "verify", "test") and status != "completed"):
+                    icon = "!"
+                    color = "yellow"
+                else:
+                    icon = {
+                        "completed": "✓", "complete": "✓",
+                        "in_progress": "●", "active": "●", "failed": "✗",
+                    }.get(status, "○")
+                    color = "green" if icon == "✓" else "red" if icon == "✗" else "cyan" if icon == "●" else "dim"
                 title = str(item.get("title") or item.get("description") or "").replace("\n", " ")
+                if is_unverified:
+                    title += " (unverified)"
                 if len(title) > width - 7:
                     title = title[: max(1, width - 10)] + "..."
-                color = "green" if icon == "✓" else "red" if icon == "✗" else "cyan" if icon == "●" else "dim"
                 
                 is_last = (index == limit - 1 and len(self.state.todos) <= limit)
                 tree_prefix = "└─ " if is_last else "├─ "
@@ -517,14 +652,109 @@ class ConversationRenderer:
                 txt.append(display, style="dim")
             lines.append(txt)
 
+        # Test results status if recent
+        if self.state.test_summary:
+            t = self.state.test_summary
+            p = t.get("passed", 0)
+            f = t.get("failed", 0)
+            st_style = "green" if t.get("success") else "red"
+            msg = f"  ✓ Tests completed  {p} passed" if f == 0 else f"  ✗ Tests failed  {p} passed, {f} failed"
+            lines.append(Text(msg, style=st_style))
+
+        # Diff preview box if a file was edited
+        if self.state.current_diff_preview:
+            diff_box = self._render_diff_preview(self.state.current_diff_preview)
+            if diff_box:
+                lines.append(diff_box)
+
+        # Status line (spinner + stage + elapsed + token indicator)
+        if self._active:
+            lines.append(self._render_status_line())
+
         # No placeholder.  If nothing is happening, show nothing.
         return Group(*lines) if lines else Text("")
+
+    def _render_status_line(self) -> Text:
+        """Render the live animated status line (spinner + stage + elapsed + tokens)."""
+        idx = int(time.monotonic() * 10) % len(_SPINNER_FRAMES)
+        spinner = _SPINNER_FRAMES[idx]
+
+        elapsed_sec = int(time.monotonic() - self.state.started_at) if self.state.started_at else 0
+        mins, secs = divmod(max(0, elapsed_sec), 60)
+        time_str = f"{mins:02d}:{secs:02d}"
+
+        stage = self.state.stage or "Working…"
+        tok_str = ""
+        if self.state.current_turn_tokens > 0:
+            tok_formatted = format_token_count(self.state.current_turn_tokens, self.state.tokens_estimated)
+            tok_str = f" · ↓ {tok_formatted}"
+
+        txt = Text()
+        txt.append(f"  {spinner} ", style="bold cyan")
+        txt.append(stage, style="bold")
+        txt.append(f"   {time_str}{tok_str}", style="dim")
+        return txt
+
+    def _render_diff_preview(self, preview: dict[str, Any]) -> Any:
+        """Render a compact 2-5 line diff preview box for live file modifications."""
+        raw_path = str(preview.get("path", ""))
+        short_path = shorten_path(raw_path)
+        added = preview.get("added", 0)
+        removed = preview.get("removed", 0)
+        diff_text = str(preview.get("diff", "")).strip()
+
+        # Terminal width adaptation (min 24, max 80)
+        width = max(24, min(self.console.size.width - 4, 80))
+        header = f" {short_path}  +{added} -{removed} "
+
+        content_lines: list[tuple[str, str]] = []
+        rem_lines: list[tuple[str, str]] = []
+        add_lines: list[tuple[str, str]] = []
+        for line in diff_text.splitlines():
+            if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+                continue
+            if line.startswith("-") and len(rem_lines) < 2:
+                rem_lines.append((line[: width - 6], "red"))
+            elif line.startswith("+") and len(add_lines) < 2:
+                add_lines.append((line[: width - 6], "green"))
+            if len(rem_lines) >= 2 and len(add_lines) >= 2:
+                break
+        content_lines = rem_lines + add_lines
+        if not content_lines:
+            for line in diff_text.splitlines():
+                if not (line.startswith("+++") or line.startswith("---") or line.startswith("@@")):
+                    style = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
+                    content_lines.append((line[: width - 6], style))
+                    if len(content_lines) >= 4:
+                        break
+
+        if not content_lines:
+            return None
+
+        box_lines = []
+        top_border = f"  ┌─{header}" + "─" * max(2, width - len(header) - 4) + "┐"
+        box_lines.append(Text(top_border, style="dim cyan"))
+        for text, style in content_lines:
+            pad = max(0, width - len(text) - 6)
+            row = Text("  │ ", style="dim cyan")
+            row.append(text, style=style)
+            row.append(" " * pad + " │", style="dim cyan")
+            box_lines.append(row)
+        bottom_border = "  └" + "─" * (width - 4) + "┘"
+        box_lines.append(Text(bottom_border, style="dim cyan"))
+        return Group(*box_lines)
 
     def _render_plain(self) -> None:
         # Plain mode: one line per tool, printed immediately
         if self.state.items:
             icon, display, status = self.state.items[-1]
-            line = f"  {icon} {display} ({self._elapsed_str()})"
+            elapsed_sec = int(time.monotonic() - self.state.started_at) if self.state.started_at else 0
+            mins, secs = divmod(max(0, elapsed_sec), 60)
+            time_str = f"{mins:02d}:{secs:02d}"
+            tok_str = ""
+            if self.state.current_turn_tokens > 0:
+                tok_str = f" · ↓ {format_token_count(self.state.current_turn_tokens, self.state.tokens_estimated)}"
+            line = f"  [{self.state.stage}] {icon} {display} ({time_str}{tok_str})"
             if line != self._last_plain_line:
                 self._last_plain_line = line
                 self.console.print(line, highlight=False)
@@ -541,6 +771,7 @@ class ConversationRenderer:
         """
         if not text or not text.strip():
             return
+        self.state.stage = "Preparing response…"
         clean = text.strip()
         if self.plain:
             for line in clean.splitlines():
@@ -551,15 +782,12 @@ class ConversationRenderer:
             return
 
         # Rich mode: progressive reveal via Live + Markdown
-        # We chunk by paragraphs for natural streaming cadence without
-        # blocking the event loop for long.
         from rich.live import Live
         from rich.markdown import Markdown
         from rich.padding import Padding
 
         paragraphs = clean.split("\n\n")
         shown: list[str] = []
-        # Use a transient Live that updates in place, then leaves final Markdown
         try:
             with Live(console=self.console, refresh_per_second=12, transient=False) as live:
                 for para in paragraphs:
@@ -568,11 +796,7 @@ class ConversationRenderer:
                     live.update(Padding(md, (0, 0, 0, 2)))
                     if delay:
                         time.sleep(min(delay, 0.08))
-                # Final frame stays
         except Exception:
-            # Fallback: just print
-            from rich.markdown import Markdown
-            from rich.padding import Padding
             self.console.print(Padding(Markdown(clean), (0, 0, 0, 2)))
         self.console.print("", highlight=False)
 
@@ -585,8 +809,12 @@ class ConversationRenderer:
         model: str = "",
         models_used: list[str] | None = None,
         phase_durations: dict[str, float] | None = None,
+        token_usage: dict[str, Any] | None = None,
+        files_changed: list[str] | None = None,
+        file_change_stats: dict[str, dict[str, int]] | None = None,
+        test_results: dict[str, Any] | None = None,
     ) -> None:
-        """Tiny completion indicator.  One line.  Optional error detail."""
+        """Completion indicator with duration, tokens, file changes, and test results."""
         elapsed_str = fmt_elapsed(elapsed)
         if status == "cancelled":
             mark, label, style = "!", "Cancelled", "yellow"
@@ -611,6 +839,49 @@ class ConversationRenderer:
             names = [self._model_display_name(name) for name in model_list]
             label_key = "Model" if len(names) == 1 else "Models"
             self.console.print(f"    {label_key}  {'  →  '.join(names)}", style="dim", highlight=False)
+
+        # Token usage accounting
+        usage = token_usage or {
+            "input_tokens": self.state.input_tokens,
+            "output_tokens": self.state.output_tokens or self.state.current_turn_tokens,
+            "estimated": self.state.tokens_estimated,
+        }
+        in_tok = usage.get("input_tokens") or 0
+        out_tok = usage.get("output_tokens") or usage.get("current_turn_output_tokens") or 0
+        is_est = bool(usage.get("estimated", False))
+        if in_tok > 0 or out_tok > 0:
+            in_fmt = format_token_count(in_tok, concise=True)
+            out_fmt = format_token_count(out_tok, concise=True)
+            tag = "estimated" if is_est else "exact"
+            self.console.print(f"    Tokens  {in_fmt} in, {out_fmt} out ({tag})", style="dim", highlight=False)
+
+        # Files changed & stats
+        stats_map = dict(file_change_stats or self.state.file_change_stats)
+        file_list = files_changed or list(stats_map.keys())
+        if file_list:
+            parts = []
+            for f in file_list:
+                short_f = shorten_path(str(f))
+                st = stats_map.get(f) or stats_map.get(str(f))
+                if st and (st.get("added") or st.get("removed")):
+                    parts.append(f"{short_f} (+{st['added']} -{st['removed']})")
+                else:
+                    parts.append(short_f)
+            self.console.print(f"    Files  {', '.join(parts)}", style="dim", highlight=False)
+
+        # Test results
+        tests = test_results or self.state.test_summary
+        if tests:
+            passed = tests.get("passed", 0)
+            failed = tests.get("failed", 0)
+            if failed > 0:
+                self.console.print(f"    Tests  {passed} passed, {failed} failed", style="red", highlight=False)
+            else:
+                self.console.print(f"    Tests  {passed} passed", style="green", highlight=False)
+        elif not success and file_list:
+            self.console.print("    Tests  None run (task stopped before tests)", style="dim", highlight=False)
+            self.console.print("    Verification  Not completed (task stopped before verification)", style="dim", highlight=False)
+
         durations = phase_durations or self.state.phase_durations
         phase_labels = ("planning", "thinking", "working", "repairing", "verifying")
         summary = "  ".join(

@@ -143,6 +143,7 @@ class MockProvider(ModelProvider):
         self._name = name
         self.api_key = "sk-or-v1-secret-key"
         self._generate_fn = AsyncMock()
+        self.configured_models: list[ModelInfo] = []
 
     @property
     def name(self) -> str:
@@ -155,7 +156,7 @@ class MockProvider(ModelProvider):
         yield ""
 
     async def list_models(self):
-        return []
+        return list(self.configured_models)
 
     async def health_check(self) -> bool:
         return True
@@ -287,3 +288,93 @@ async def test_secret_redaction_in_fallback_error() -> None:
     assert secret not in str(result.attempts)
     assert secret not in (result.final_error or "")
     assert "[REDACTED]" in str(result.attempts)
+
+
+# ─── 6. Multi-Provider Fallback & Provider Diversity ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_account_quota_skips_same_provider_and_fails_over_to_distinct_provider() -> None:
+    """When Provider A exhausts its account quota, all remaining models from Provider A
+    must be skipped immediately, failing over directly to Provider B without redundant calls."""
+    engine = FallbackEngine(fallback_config=FallbackConfig(retry=RetryConfig(max_retries=0)))
+    provider_a = MockProvider("openrouter")
+    provider_b = MockProvider("groq")
+
+    called_models: list[str] = []
+
+    async def fail_openrouter(req: CompletionRequest) -> CompletionResponse:
+        called_models.append(req.model)
+        raise ProviderRequestError(
+            ProviderErrorCategory.RATE_LIMIT,
+            "Free model request limit reached for today. Upgrade or wait for daily reset.",
+            status_code=429,
+            model=req.model,
+        )
+
+    async def succeed_groq(req: CompletionRequest) -> CompletionResponse:
+        called_models.append(req.model)
+        return CompletionResponse(
+            content="Hello from Groq",
+            model=req.model,
+            provider="groq",
+            usage={},
+        )
+
+    provider_a._generate_fn = fail_openrouter
+    provider_b._generate_fn = succeed_groq
+
+    # Chain has two OpenRouter models followed by one Groq model
+    chain = [
+        ("openrouter/model-1:free", provider_a),
+        ("openrouter/model-2:free", provider_a),
+        ("groq/model-1", provider_b),
+    ]
+
+    result = await engine.execute(CompletionRequest(messages=[{"role": "user", "content": "hi"}]), chain)
+
+    assert result.succeeded is True
+    assert result.model_used == "groq/model-1"
+    assert result.provider_used == "groq"
+    # openrouter/model-1 was called and failed
+    # openrouter/model-2 was SKIPPED immediately without making an HTTP call
+    # groq/model-1 was called and succeeded
+    assert called_models == ["openrouter/model-1:free", "groq/model-1"]
+    skipped_attempts = [a for a in result.attempts if a.get("status") == "skipped"]
+    assert len(skipped_attempts) == 1
+    assert skipped_attempts[0]["model"] == "openrouter/model-2:free"
+    assert "account quota exhausted" in skipped_attempts[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_free_chain_ensures_provider_diversity() -> None:
+    """When multiple distinct providers offer free models, the fallback chain
+    must include models from both providers rather than filling all slots with one provider."""
+    provider_or = MockProvider("openrouter")
+    provider_groq = MockProvider("groq")
+
+    models = [
+        ModelInfo(id="openrouter/m1:free", name="m1", provider="openrouter", is_free=True, supports_tools=True, context_window=128000),
+        ModelInfo(id="openrouter/m2:free", name="m2", provider="openrouter", is_free=True, supports_tools=True, context_window=100000),
+        ModelInfo(id="openrouter/m3:free", name="m3", provider="openrouter", is_free=True, supports_tools=True, context_window=90000),
+        ModelInfo(id="groq/llama-3.3-70b-versatile", name="llama", provider="groq", is_free=True, supports_tools=True, context_window=32768),
+        ModelInfo(id="openrouter/free", name="dynamic route", provider="openrouter", is_free=True, supports_tools=True, context_window=131072, tags=["dynamic-route"]),
+    ]
+    provider_or.configured_models = [m for m in models if m.provider == "openrouter"]
+    provider_groq.configured_models = [m for m in models if m.provider == "groq"]
+
+    router = ModelRouter(
+        providers=[provider_or, provider_groq],
+        config=RouterConfig(routing_mode="free", max_fallback_chain=4),
+    )
+
+    req = CompletionRequest(messages=[{"role": "user", "content": "test"}], tools=[{"type": "function"}])
+    chain = await router.select_models(req)
+
+    chain_providers = [prov.name for _, prov in chain]
+    chain_models = [mid for mid, _ in chain]
+
+    # Groq must be present in the chain despite having a smaller context window than openrouter models
+    assert "groq" in chain_providers
+    assert "openrouter" in chain_providers
+    assert "groq/llama-3.3-70b-versatile" in chain_models
+

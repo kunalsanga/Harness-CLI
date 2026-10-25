@@ -181,3 +181,26 @@ def test_provider_request_error_classifies_without_string_parsing() -> None:
     assert classify_error(err).value == "rate_limited"
     auth = ProviderRequestError(ProviderErrorCategory.AUTHENTICATION, "whatever", provider="p")
     assert classify_error(auth).value == "permanent"
+
+
+def test_create_providers_auto_discovers_configured_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import MagicMock, patch
+    from harness_core.config.credentials import ProviderCredential
+
+    mock_creds = [
+        ProviderCredential(provider="openrouter", api_key="sk-or-test", source="env"),
+        ProviderCredential(provider="groq", api_key="gsk-test", source="env"),
+    ]
+    with patch("harness_core.config.credentials.CredentialResolver.list_configured_providers", return_value=mock_creds):
+        # Default auto_discover=False returns only openrouter
+        default_providers = create_providers({})
+        assert len(default_providers) == 1
+        assert default_providers[0].name == "openrouter"
+
+        # Explicit auto_discover=True returns all configured providers
+        discovered = create_providers({}, auto_discover=True)
+        assert len(discovered) == 2
+        names = [p.name for p in discovered]
+        assert "openrouter" in names
+        assert "groq" in names
+

@@ -298,10 +298,20 @@ class FallbackEngine:
         result = FallbackResult()
         previous_reason = ""
 
+        exhausted_providers: set[str] = set()
         for model_idx, (model_id, provider) in enumerate(model_chain):
             if time.time() - overall_start > self.config.total_timeout_seconds:
                 result.final_error = "Total timeout exceeded across all fallback models"
                 break
+
+            # If the provider was identified as account-quota exhausted, skip its models immediately
+            if provider.name in exhausted_providers:
+                result.attempts.append({
+                    "model": model_id,
+                    "status": "skipped",
+                    "reason": f"provider {provider.name} account quota exhausted",
+                })
+                continue
 
             # Check if model is healthy before trying
             # Fail-fast rule: a model with an active cooldown or known-unavailable
@@ -433,6 +443,33 @@ class FallbackEngine:
                                     "cooldown_seconds": round(remaining, 1),
                                 },
                             ))
+
+                        # Detect shared account-level or provider-wide quota exhaustion
+                        raw_low = raw.lower()
+                        is_account_quota = any(kw in raw_low for kw in (
+                            "free model limit", "free model request limit",
+                            "daily rate limit", "daily limit", "quota exceeded",
+                            "account rate limit", "credits exceeded", "credit limit",
+                            "free-models-per-day", "free tier limit", "free model daily",
+                            "resource_exhausted",
+                        ))
+                        if is_account_quota:
+                            exhausted_providers.add(provider.name)
+                            # Only abort early if all remaining models in the chain share exhausted providers.
+                            # If another non-exhausted provider is in the chain, allow immediate failover to it.
+                            remaining_providers = {
+                                p.name for _, p in model_chain[model_idx + 1:]
+                                if p.name not in exhausted_providers
+                            }
+                            if not remaining_providers:
+                                result.final_error = (
+                                    f"Account-wide free tier or rate limit reached for {provider.name}. "
+                                    f"Please wait for cooldown before retrying."
+                                )
+                                result.error_category = ERROR_CATEGORY_RATE_LIMIT
+                                result.total_latency_ms = (time.time() - overall_start) * 1000
+                                return result
+
                         if self.event_bus is not None and model_idx + 1 < len(model_chain):
                             await self.event_bus.emit(Event(
                                 type="model.failover",
@@ -603,7 +640,35 @@ class FallbackEngine:
                             model_id, health_event, latency_ms,
                             cooldown_override=retry_after,
                         )
-                        # Retry with backoff if we have retries left
+                        # Timeouts must NEVER retry the same hung endpoint. A timed-out
+                        # request indicates an unresponsive or overloaded endpoint.
+                        # Immediately fail over to the next candidate model.
+                        if category == ERROR_CATEGORY_TIMEOUT:
+                            previous_reason = "timeout"
+                            remaining = self.health.get_state(model_id).cooldown_remaining()
+                            if self.event_bus is not None:
+                                await self.event_bus.emit(Event(
+                                    type="model.cooldown",
+                                    source="model_fallback",
+                                    data={
+                                        "model": model_id,
+                                        "category": category,
+                                        "cooldown_seconds": round(remaining, 1),
+                                    },
+                                ))
+                            if self.event_bus is not None and model_idx + 1 < len(model_chain):
+                                await self.event_bus.emit(Event(
+                                    type="model.failover",
+                                    source="model_fallback",
+                                    data={
+                                        "from": model_id,
+                                        "to": model_chain[model_idx + 1][0],
+                                        "reason": "timeout",
+                                    },
+                                ))
+                            break
+
+                        # Retry with backoff if we have retries left (for network/5xx)
                         if retry_attempt < self.config.retry.max_retries:
                             delay = self.config.retry.delay_for_attempt(retry_attempt)
                             await asyncio.sleep(delay)

@@ -125,6 +125,8 @@ def _friendly_model_error(detail: str) -> str:
     # credential is the common cause, so default to the credential message.
     if "auth/access failure" in value:
         return "Provider authentication failed. Check the configured provider credential."
+    if "free tier" in value or "quota" in value or "daily limit" in value:
+        return "Free-tier request limit or daily quota reached. Retry after provider cooldown."
     if "429" in value or "rate limit" in value or "too many requests" in value:
         return "Configured models are rate limited. Retry after the provider cooldown."
     if "timeout" in value or "timed out" in value:
@@ -328,7 +330,7 @@ class InteractiveShell:
             from harness_core.tools.shell import RunCommandTool
 
             self._event_bus = EventBus()
-            providers = create_providers(load_project_provider_config(self.workspace))
+            providers = create_providers(load_project_provider_config(self.workspace), auto_discover=True)
             self._providers = providers
             self._provider = providers[0]
             self.current_provider = self._provider.name
@@ -370,6 +372,18 @@ class InteractiveShell:
             except Exception:
                 intelligence = None
             tools = [ReadFileTool(), WriteFileTool(), EditFileTool(), ListFilesTool(), GlobTool(intelligence), GrepTool(intelligence), RunCommandTool(working_directory=self.workspace), GitStatusTool(), GitDiffTool(), GitLogTool(), GitIdentityTool(), GitAddTool(), GitCommitTool(), GitPushTool(), GitRemoteTool()]
+            # Discover and attach configured MCP tools
+            self._mcp_client = None
+            try:
+                from harness_core.mcp.manager import init_mcp_tools_from_workspace
+                mcp_tools, mcp_client, _ = await init_mcp_tools_from_workspace(self.workspace)
+                if mcp_tools:
+                    tools.extend(mcp_tools)
+                    self._mcp_client = mcp_client
+                    if self.verbose:
+                        self.console.print(f"  [dim]Discovered {len(mcp_tools)} MCP tools[/]")
+            except Exception:
+                pass
             self._tools = tools
             agent_config = AgentConfig(role=AgentRole.BUILD, max_iterations=self.max_iterations, model_preference=self.model, routing_mode=effective_mode)
             self._agent_loop = AgentLoop(provider=self._provider, tools=tools, workspace_root=Path(self.workspace), config=agent_config, event_bus=self._event_bus, router=self._router, task_aware=self._task_aware, intelligence=intelligence)
@@ -572,6 +586,10 @@ class InteractiveShell:
         async def on_model_completed(event: Any) -> None:
             if _conv() is not None:
                 _conv().update_model_activity("")
+                out_tok = event.data.get("output_tokens") or event.data.get("total_output_tokens", 0)
+                in_tok = event.data.get("input_tokens")
+                est = bool(event.data.get("estimated", False))
+                _conv().update_tokens(output_tokens=out_tok, input_tokens=in_tok, estimated=est)
 
         async def on_tool_started(event: Any) -> None:
             if _conv() is not None:
@@ -649,8 +667,20 @@ class InteractiveShell:
             pass
 
         async def on_test_completed(event: Any) -> None:
-            # Test results are surfaced in completion status.
-            pass
+            if _conv() is not None:
+                passed = int(event.data.get("passed", 0))
+                total = int(event.data.get("total", 0))
+                success = bool(event.data.get("success", True))
+                cmd = str(event.data.get("command", ""))
+                _conv().update_test_completed(passed=passed, total=total, success=success, command=cmd)
+
+        async def on_file_changed(event: Any) -> None:
+            if _conv() is not None:
+                path = str(event.data.get("path", ""))
+                added = int(event.data.get("added", 0))
+                removed = int(event.data.get("removed", 0))
+                diff = str(event.data.get("diff", ""))
+                _conv().update_file_changed(path, added, removed, diff)
 
         async def on_task_paused(event: Any) -> None:
             # Pause status is surfaced in completion status.
@@ -681,6 +711,7 @@ class InteractiveShell:
         bus.on("tool.started", on_tool_started)
         bus.on("tool.completed", on_tool_terminal)
         bus.on("tool.failed", on_tool_terminal)
+        bus.on("file.changed", on_file_changed)
         bus.on("model.error", on_model_error)
         bus.on("task.completed", on_task_completed)
         bus.on("task.failed", on_task_failed)
@@ -1242,7 +1273,11 @@ class InteractiveShell:
         try:
             # Stage 1: Execute through the canonical EngineeringRuntime.
             # Events flow through the shared EventBus to the UI handlers.
-            outcome = await runtime.execute_interactive(goal)
+            task_deadline = getattr(self, "timeout_seconds", None)
+            if task_deadline and task_deadline > 0:
+                outcome = await runtime.execute_interactive(goal, timeout_seconds=task_deadline)
+            else:
+                outcome = await runtime.execute_interactive(goal)
             if conv is not None:
                 try:
                     conv.stop()
@@ -1262,6 +1297,9 @@ class InteractiveShell:
             files_changed: list[str] = []
             models_used: list[str] = []
             execution_timing: dict[str, float] = {}
+            token_usage: dict[str, Any] = {}
+            file_change_stats: dict[str, dict[str, int]] = {}
+            test_results: dict[str, Any] | None = None
             if graph:
                 for task in graph.tasks.values():
                     if task.result:
@@ -1274,6 +1312,17 @@ class InteractiveShell:
                         fname = f.replace("\\", "/").split("/")[-1]
                         if fname and fname not in files_changed:
                             files_changed.append(fname)
+                    if getattr(task, "file_change_stats", None):
+                        file_change_stats.update(task.file_change_stats)
+                    if getattr(task, "token_usage", None):
+                        token_usage.update(task.token_usage)
+                    if getattr(task, "tests_run", None) is not None:
+                        test_results = {
+                            "passed": getattr(task, "tests_passed", 0) or 0,
+                            "total": getattr(task, "tests_run", 0) or 0,
+                            "failed": max(0, (getattr(task, "tests_run", 0) or 0) - (getattr(task, "tests_passed", 0) or 0)),
+                            "success": (getattr(task, "tests_passed", 0) == getattr(task, "tests_run", 0)),
+                        }
 
             from harness_core.cli.completion import CompletionFormatter, NextActionEngine
             fmt = CompletionFormatter(plain=self.plain)
@@ -1292,6 +1341,10 @@ class InteractiveShell:
                         model=self.current_model,
                         models_used=models_used,
                         phase_durations=execution_timing,
+                        token_usage=token_usage,
+                        files_changed=files_changed,
+                        file_change_stats=file_change_stats,
+                        test_results=test_results,
                     )
                 except Exception:
                     # Fallback markdown print
@@ -1334,6 +1387,17 @@ class InteractiveShell:
                 diagnostic = str(error_msg or self._last_model_error)
                 error_line = _safe_str(diagnostic) if self.verbose and diagnostic else _friendly_model_error(diagnostic)
                 self.console.print(f"  {error_line}", highlight=False)
+                if files_changed:
+                    files_str = ", ".join(files_changed)
+                    self.console.print(
+                        f"  [yellow]Note: Partial changes were saved in {len(files_changed)} file(s): {files_str}.[/]\n"
+                        f"  [yellow]These changes are UNVERIFIED. Inspect or revert them before retrying.[/]",
+                        highlight=False,
+                    )
+                v_status = outcome.state.verification_status.value if outcome.state.verification_status else "not_started"
+                if v_status in ("not_started", "failed"):
+                    v_reason = outcome.state.verification_summary or "task stopped before verification ran"
+                    self.console.print(f"  [dim]Verification: {v_status.title()} ({v_reason})[/]", highlight=False)
                 self.console.print("", highlight=False)
             if run and self.session_manager:
                 try:
@@ -1653,6 +1717,11 @@ class InteractiveShell:
         except EOFError:
             pass
         finally:
+            if getattr(self, "_mcp_client", None):
+                try:
+                    self._mcp_client.shutdown_all()
+                except Exception:
+                    pass
             for provider in self._providers or ([self._provider] if self._provider else []):
                 try:
                     await provider.close()

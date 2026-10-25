@@ -648,6 +648,12 @@ class Task:
     # Harness 2.0: set when budget-driven compaction trimmed tool history.
     compaction_note: str | None = None
     execution_timeline: TaskExecutionTimeline = field(default_factory=TaskExecutionTimeline)
+    files_changed: list[str] = field(default_factory=list)
+    file_change_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    token_usage: dict[str, Any] = field(default_factory=dict)
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    tokens_estimated: bool = False
 
 
 class TaskPhase(Enum):
@@ -686,6 +692,11 @@ class AgentConfig:
     # so this is an enforced limit rather than a hint. Keep it comfortably
     # below the smallest context window the router may select.
     context_token_budget: int = 120_000
+    # Project instructions discovery configuration
+    instruction_budget_tokens: int = 4_000
+    instruction_files: list[str] = field(
+        default_factory=lambda: [".harness/instructions.md", "AGENTS.md", "CLAUDE.md"]
+    )
 
 
 # ── Canonical ToolResult constructors ─────────────────────────────────────────────────────

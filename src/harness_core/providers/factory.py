@@ -10,8 +10,19 @@ from harness_core.config.credentials import CredentialResolver
 from harness_core.providers.base import ModelProvider
 
 
-def _provider_configs(raw: Any) -> list[dict[str, Any]]:
+def _provider_configs(raw: Any, auto_discover: bool = False) -> list[dict[str, Any]]:
     if not raw:
+        if auto_discover:
+            resolver = CredentialResolver()
+            discovered = []
+            for cred in resolver.list_configured_providers():
+                if cred.provider in {"openrouter", "groq", "gemini", "anthropic", "openai", "nvidia"}:
+                    discovered.append({"id": cred.provider, "enabled": True})
+            if discovered:
+                # Ensure openrouter is first if present, followed by alternative providers
+                openrouter_entry = [d for d in discovered if d["id"] == "openrouter"]
+                other_entries = [d for d in discovered if d["id"] != "openrouter"]
+                return openrouter_entry + other_entries
         # Preserve the existing default until users choose another provider.
         return [{"id": "openrouter", "enabled": True}]
     if isinstance(raw, dict):
@@ -44,6 +55,7 @@ def create_providers(
     config: dict[str, Any] | None = None,
     *,
     provider_ids: list[str] | None = None,
+    auto_discover: bool = False,
 ) -> list[ModelProvider]:
     """Create configured adapters using existing credentials and config.
 
@@ -69,7 +81,7 @@ def create_providers(
     from harness_core.providers.openrouter import OpenRouterProvider
 
     root = config or {}
-    configured = _provider_configs(root.get("providers"))
+    configured = _provider_configs(root.get("providers"), auto_discover=auto_discover)
     selected = set(provider_ids or [])
     resolver = CredentialResolver()
     providers: list[ModelProvider] = []

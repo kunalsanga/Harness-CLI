@@ -7,7 +7,9 @@ HTTP/SSE/streamable HTTP where supported.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -75,6 +77,7 @@ class MCPClient:
         self._processes: dict[str, subprocess.Popen] = {}
         self._tools: dict[str, list[MCPTool]] = {}
         self._initialized: dict[str, bool] = {}
+        atexit.register(self.shutdown_all)
 
     def add_server(self, config: MCPServerConfig) -> None:
         """Register an MCP server configuration."""
@@ -108,9 +111,10 @@ class MCPClient:
             return True  # Already running
 
         try:
+            cmd = shutil.which(config.command) or config.command
             env = {**dict(__import__("os").environ), **config.env}
             process = subprocess.Popen(
-                [config.command] + config.args,
+                [cmd] + config.args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -148,9 +152,12 @@ class MCPClient:
                 await self._discover_tools(name)
                 return True
 
+            # Failed to initialize: kill process to prevent zombie leaks
+            self.shutdown_server(name)
             return False
 
         except Exception:
+            self.shutdown_server(name)
             return False
 
     async def _discover_tools(self, server_name: str) -> list[MCPTool]:
@@ -208,8 +215,11 @@ class MCPClient:
         }
 
         response = await self._send_request(server_name, request)
-        if response and "result" in response:
-            return response["result"]
+        if response:
+            if "result" in response:
+                return response["result"]
+            if "error" in response:
+                return {"error": response["error"], "isError": True}
         return None
 
     async def _send_request(
@@ -225,10 +235,35 @@ class MCPClient:
             process.stdin.write(message.encode("utf-8"))
             process.stdin.flush()
 
-            # Read response (line-delimited JSON)
-            response_line = process.stdout.readline().decode("utf-8").strip()
-            if response_line:
-                return json.loads(response_line)
+            config = self._servers.get(server_name)
+            timeout = config.timeout_seconds if config else 30.0
+
+            req_id = request.get("id")
+
+            def _read_json() -> dict[str, Any] | None:
+                while True:
+                    line = process.stdout.readline()
+                    if not line:
+                        return None
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        continue
+                    if text.startswith("{"):
+                        try:
+                            data = json.loads(text)
+                            # In JSON-RPC 2.0, if request has an id, response must match that id.
+                            # Skip notifications (no id) and stale/mismatched responses.
+                            if req_id is not None and data.get("id") != req_id:
+                                continue
+                            return data
+                        except json.JSONDecodeError:
+                            continue
+                return None
+
+            return await asyncio.wait_for(
+                asyncio.to_thread(_read_json),
+                timeout=timeout,
+            )
 
         except Exception:
             return None
@@ -251,18 +286,25 @@ class MCPClient:
             pass
 
     def shutdown_server(self, name: str) -> bool:
-        """Shutdown an MCP server process."""
-        process = self._processes.get(name)
-        if process and process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except Exception:
+        """Shutdown an MCP server process, close pipes, and clean up state."""
+        self._initialized.pop(name, None)
+        process = self._processes.pop(name, None)
+        if process:
+            if process.poll() is None:
                 try:
-                    process.kill()
+                    process.terminate()
+                    process.wait(timeout=2)
                 except Exception:
-                    pass
-            self._initialized.pop(name, None)
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
             return True
         return False
 

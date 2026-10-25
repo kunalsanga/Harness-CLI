@@ -47,7 +47,7 @@ _SHELL_WRAP = re.compile(
     re.I,
 )
 _CD_PREFIX = re.compile(
-    r"^\s*cd\s+(/d\s+)?(\"[^\"]+\"|'[^']+'|\S+)\s*(&&|\||;)\s*",
+    r"^\s*cd\s+(?:/d\s+)?(?:\"[^\"]+\"|'[^']+'|.+?)\s*(&&|\||;)\s*",
     re.I,
 )
 
@@ -55,6 +55,7 @@ _CD_PREFIX = re.compile(
 def normalize_shell_command(command: str) -> str:
     """Strip cd wrappers and shell-format guessing so retries compare equal."""
     cmd = (command or "").strip()
+    cmd = cmd.replace(r"\ ", " ")
     for _ in range(4):
         next_cmd = _SHELL_WRAP.sub("", cmd).strip().strip('"')
         next_cmd = _CD_PREFIX.sub("", next_cmd).strip()
@@ -75,6 +76,21 @@ def classify_command_failure(
     blob = f"{stdout}\n{stderr}\n{command}"
     if timed_out:
         return FailureDiagnosis("timeout", f"Command timed out: {command[:80]}")
+    is_file_inspection = bool(
+        re.search(r"^\s*(cat|type|head|tail|ls|dir)\b", command.strip(), re.I)
+    ) or " | tail" in command or " | head" in command
+    if is_file_inspection:
+        tool_tip = "read_file" if any(k in command for k in ("cat", "type", "head", "tail")) else "list_files"
+        msg = f"Shell file inspection commands are discouraged; use dedicated '{tool_tip}' tool."
+        if _first_line(stderr):
+            msg = f"{_first_line(stderr)} — {msg}"
+        return FailureDiagnosis(
+            "file_inspection_via_shell",
+            msg,
+            retry_shell_format=False,
+        )
+    if "python3" in command.lower() and _MISSING_EXE.search(blob):
+        return FailureDiagnosis("missing_executable", "python3 is not recognized; use 'python' on Windows")
     if _MISSING_EXE.search(blob):
         return FailureDiagnosis("missing_executable", _first_line(stderr) or "Executable not found")
     if _PERMISSION.search(blob):

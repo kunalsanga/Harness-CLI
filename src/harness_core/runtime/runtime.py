@@ -455,7 +455,7 @@ class EngineeringRuntime:
         goal: str,
         *,
         requirements: Requirements | None = None,
-        timeout_seconds: float = 0.0,
+        timeout_seconds: float = 240.0,
     ) -> RuntimeOutcome:
         """Execute a single interactive task through the canonical runtime.
 
@@ -570,11 +570,19 @@ class EngineeringRuntime:
         self.event_bus.on("tool.result", convergence_handler)
 
         execution = asyncio.ensure_future(scheduler.execute(graph))
+        timed_out = False
         try:
             if timeout_seconds and timeout_seconds > 0:
                 await asyncio.wait_for(execution, timeout=timeout_seconds)
             else:
                 await execution
+        except (asyncio.TimeoutError, TimeoutError):
+            timed_out = True
+            for t in graph.tasks.values():
+                if t.status in (TaskStatus.PENDING, TaskStatus.EXECUTING, TaskStatus.IN_PROGRESS):
+                    t.status = TaskStatus.FAILED
+                    t.error = f"Task timed out after {timeout_seconds:.0f}s"
+            self.state.register_blocker(f"Task timed out after {timeout_seconds:.0f}s")
         finally:
             self.event_bus.off("task.started", task_handler)
             self.event_bus.off("task.completed", task_handler)

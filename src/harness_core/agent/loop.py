@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
+import platform
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+logger = logging.getLogger(__name__)
 
 from harness_core.agent.completion import can_complete_task, completion_blockers
 from harness_core.runtime.steering import SteeringBuffer
@@ -236,7 +241,20 @@ class AgentLoop:
         intelligence: "ProjectIntelligence | None" = None,
     ) -> None:
         self.provider = provider
-        self.tools = {t.schema.name: t for t in tools}
+        # Protect native tools against malicious or buggy shadowing
+        self.tools = {}
+        for t in tools:
+            name = t.schema.name
+            if name not in self.tools:
+                self.tools[name] = t
+            else:
+                logger.debug("Tool '%s' already registered, ignoring duplicate", name)
+
+        self.tool_aliases: dict[str, str] = dict(self._TOOL_ALIASES)
+        for t in tools:
+            for a in getattr(t, "aliases", []):
+                if a not in self.tools and a not in self._TOOL_ALIASES:
+                    self.tool_aliases[a] = t.schema.name
         self.workspace_root = workspace_root or Path.cwd()
         self.config = config or AgentConfig()
         self.event_bus = event_bus or EventBus()
@@ -387,6 +405,89 @@ class AgentLoop:
         """Invalidate the cached snapshot for a file after a write/edit."""
         self.context_reuse.invalidate(path)
 
+    def _load_project_instructions(self) -> str:
+        """Discover and load project-level instruction files into system prompt context.
+
+        Precedence (deterministic):
+        1. .harness/instructions.md (Harness-native project instructions)
+        2. AGENTS.md (Standard cross-agent engineering instructions)
+        3. CLAUDE.md (Claude Code compatibility instructions)
+
+        Safety & Constraints:
+        - Files must resolve within the workspace_root; directory traversals and escaping symlinks are rejected.
+        - Deduplication: If a secondary file has identical content (or hash) to an already-loaded file, it is skipped.
+        - Bounded budget: Total instructions are bounded by `config.instruction_budget_tokens` (default 4,000 tokens / ~16k chars).
+        - Section framing: Each included instruction block is explicitly framed with its relative source path.
+        - Non-disruptive: Missing or unreadable files are skipped gracefully without breaking startup.
+        - Tool separation: These instructions provide context only and never alter tool permissions or path confinement.
+        """
+        candidate_files = (
+            self.config.instruction_files
+            if self.config and self.config.instruction_files
+            else [".harness/instructions.md", "AGENTS.md", "CLAUDE.md"]
+        )
+
+        workspace = Path(self.workspace_root)
+        try:
+            workspace_resolved = workspace.resolve()
+        except Exception:
+            return ""
+
+        budget_tokens = (
+            self.config.instruction_budget_tokens
+            if self.config and hasattr(self.config, "instruction_budget_tokens")
+            else 4_000
+        )
+        max_chars = max(budget_tokens * 4, 500)
+        current_chars = 0
+        seen_hashes: set[str] = set()
+        sections: list[str] = []
+
+        for rel_name in candidate_files:
+            if current_chars >= max_chars:
+                break
+
+            target = workspace / rel_name
+            try:
+                resolved = target.resolve()
+                # Ensure the path does not escape the workspace root
+                resolved.relative_to(workspace_resolved)
+            except (ValueError, OSError, RuntimeError):
+                # Path escapes workspace root via symlink or traversal -> ignore safely
+                continue
+
+            if not resolved.is_file():
+                continue
+
+            try:
+                raw_text = resolved.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:
+                continue
+
+            if not raw_text:
+                continue
+
+            # Deduplication: skip if content hash matches an already included instruction file
+            norm_content = "\n".join(line.strip() for line in raw_text.splitlines() if line.strip())
+            content_hash = hashlib.sha256(norm_content.encode("utf-8")).hexdigest()
+            if content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
+
+            # Check remaining budget
+            remaining_chars = max_chars - current_chars
+            if len(raw_text) > remaining_chars:
+                notice = "\n\n[... Project instructions truncated to budget ...]"
+                allowed = max(0, remaining_chars - len(notice))
+                truncated_text = raw_text[:allowed].rstrip() + notice
+                sections.append(f"[{rel_name}]\n{truncated_text}")
+                current_chars += len(truncated_text)
+                break
+            else:
+                sections.append(f"[{rel_name}]\n{raw_text}")
+                current_chars += len(raw_text)
+
+        return "\n\n".join(sections)
 
     def _system_prompt(self) -> str:
         """Build the workspace-aware system prompt."""
@@ -419,6 +520,24 @@ file more than twice."""
         snapshot = self._workspace_snapshot_text()
         if snapshot:
             base += f"\n\nCURRENT WORKSPACE (already discovered, do not re-probe):\n{snapshot}"
+
+        instructions = self._load_project_instructions()
+        if instructions:
+            base += f"\n\nPROJECT INSTRUCTIONS:\n{instructions}"
+
+        if platform.system() == "Windows":
+            base += """
+
+WINDOWS EXECUTION ENVIRONMENT:
+- Operating System: Windows. The execution shell is PowerShell.
+- Working Directory: The shell tool ('run_command') already runs directly in the workspace root.
+  NEVER prepend commands with 'cd <workspace>', 'cd /c/Users/...', or 'cd .'.
+- Executables: Use 'python' (NOT 'python3'). Use Windows-compatible command syntax.
+- Paths: Always double-quote paths that contain spaces (e.g. "path with spaces/file.js").
+  NEVER use Unix-style backslash space escaping (do NOT write 'New\\ folder').
+- File Tools vs Shell: ALWAYS use dedicated tools ('read_file', 'edit_file', 'write_file', 'list_files', 'grep', 'glob')
+  instead of shell commands ('cat', 'type', 'head', 'tail', 'ls', 'dir').
+  Dedicated file tools are faster, safer, avoid shell quoting pitfalls, and preserve encodings."""
 
         return base + """
 
@@ -487,6 +606,8 @@ When you are done, summarize what you did and provide evidence of success."""
             return f"{name}: {str(args.get('pattern', ''))[:80]}"
         if name.startswith("git_"):
             return name
+        if name.startswith("mcp_"):
+            return f"{name}: {str(list(args.keys()))[:60]}"
         return name
 
     @staticmethod
@@ -1390,6 +1511,9 @@ When you are done, summarize what you did and provide evidence of success."""
         elif item.status == TodoStatus.FAILED:
             await self._emit_todo_event("todo.failed", item)
             await self._emit_todo_update(task)
+        elif item.status == TodoStatus.IN_PROGRESS:
+            await self._emit_todo_event("todo.started", item)
+            await self._emit_todo_update(task)
 
     async def _postprocess_result(self, task: Task, call: ToolCall, result: ToolResult) -> None:
         """Enrich a tool result with diagnosis, test accounting, and git state."""
@@ -1415,6 +1539,11 @@ When you are done, summarize what you did and provide evidence of success."""
                     hint += (
                         "\nDo NOT retry with different shell wrappers (cd, cmd /c, powershell). "
                         "Fix the underlying command or use the workspace-aware run_command."
+                    )
+                elif diagnosis.category == "file_inspection_via_shell":
+                    hint += (
+                        "\nDo NOT use shell commands to view or list files. "
+                        "Use the dedicated 'read_file', 'list_files', or 'grep' tools instead."
                     )
                 if result.error:
                     result.error = result.error + hint
@@ -1456,6 +1585,29 @@ When you are done, summarize what you did and provide evidence of success."""
                 remote = result.metadata.get("remote", "origin")
                 branch = result.metadata.get("branch", "")
                 task.git_push = f"{remote}/{branch}" if branch else remote
+        elif tool in ("write_file", "edit_file"):
+            if result.status == ToolResultStatus.SUCCESS:
+                path = str(result.metadata.get("path") or call.arguments.get("path") or call.arguments.get("file_path") or "")
+                if path:
+                    if path not in task.files_changed:
+                        task.files_changed.append(path)
+                    diff = str(result.metadata.get("diff", ""))
+                    added = int(result.metadata.get("added", 0))
+                    removed = int(result.metadata.get("removed", 0))
+                    stats = task.file_change_stats.setdefault(path, {"added": 0, "removed": 0})
+                    stats["added"] += added
+                    stats["removed"] += removed
+                    await self._emit_event(
+                        "file.changed",
+                        {
+                            "path": path,
+                            "added": added,
+                            "removed": removed,
+                            "total_added": stats["added"],
+                            "total_removed": stats["removed"],
+                            "diff": diff,
+                        },
+                    )
 
     @staticmethod
     def _parse_commit_hash(output: str) -> str:
@@ -1531,6 +1683,7 @@ When you are done, summarize what you did and provide evidence of success."""
             did_commit=did_commit,
             did_push=did_push,
             tests_run=task.tests_run,
+            task_failed=(task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PAUSED)),
         )
         if changed:
             for item in changed:
@@ -1574,6 +1727,55 @@ When you are done, summarize what you did and provide evidence of success."""
     _CWD_TOOLS = {"run_command", "git_status", "git_diff", "git_log", "git_add",
                   "git_commit", "git_push", "git_remote", "git_identity"}
 
+    # Path parameter names commonly used in arbitrary tools (including MCP)
+    _PATH_PARAM_NAMES = frozenset({
+        "path", "file_path", "filepath", "file", "dest", "destination",
+        "source", "src", "target", "dir", "directory", "folder",
+        "cwd", "root", "output_path", "input_path", "out_dir", "outdir", "filename",
+    })
+
+    def _inspect_mcp_path_confinement(self, args: Any, key_context: str = "") -> str | None:
+        """Recursively inspect MCP arguments for paths escaping workspace boundary.
+
+        Secures arbitrary MCP tools against:
+        - Traversal sequences (e.g. `../../evil`)
+        - Absolute POSIX paths (e.g. `/etc/passwd`)
+        - Windows drive paths (e.g. `C:\\Windows\\System32`)
+        - UNC network paths (e.g. `\\\\server\\share\\file` or `//server/share`)
+        - Escaping symlinks (resolved via resolve_in_workspace)
+        - Arbitrary parameter keys (e.g. `dest`, `source`, `target`, `dir`, etc.)
+        - Deeply nested structures (dicts within dicts, lists of paths)
+        """
+        if isinstance(args, dict):
+            for k, v in args.items():
+                err = self._inspect_mcp_path_confinement(v, f"{key_context}.{k}" if key_context else str(k))
+                if err:
+                    return err
+        elif isinstance(args, list):
+            for i, v in enumerate(args):
+                err = self._inspect_mcp_path_confinement(v, f"{key_context}[{i}]")
+                if err:
+                    return err
+        elif isinstance(args, str):
+            val = args.strip()
+            if not val or len(val) > 4096 or "\n" in val:
+                return None
+            # Ignore web URLs
+            if val.startswith(("http://", "https://", "ws://", "wss://")):
+                return None
+            raw_key = key_context.split(".")[-1].split("[")[0].lower()
+            is_path_key = raw_key in self._PATH_PARAM_NAMES
+            import re
+            is_abs_or_traversal = bool(
+                re.match(r"^([a-zA-Z]:[/\\]|//|\\\\|/)", val)
+                or re.search(r"(?:^|[/\\])\.\.(?:[/\\]|$)", val)
+            )
+            if is_path_key or is_abs_or_traversal:
+                _, err = resolve_in_workspace(self.workspace_root, val)
+                if err is not None:
+                    return f"{err} (parameter '{key_context}')"
+        return None
+
     def _confine_call(self, call: ToolCall) -> ToolResult | None:
         """Enforce the workspace boundary on paths and working directory.
 
@@ -1582,7 +1784,11 @@ When you are done, summarize what you did and provide evidence of success."""
         name = call.tool_name
         args = call.arguments
 
-        if name in self._PATH_TOOLS_REQUIRED or name in self._PATH_TOOLS_OPTIONAL:
+        is_mcp = name.startswith("mcp_") or bool(
+            getattr(self.tools.get(name), "schema", None)
+            and "mcp" in getattr(self.tools.get(name).schema, "tags", [])
+        )
+        if name in self._PATH_TOOLS_REQUIRED or name in self._PATH_TOOLS_OPTIONAL or is_mcp:
             raw = args.get("path") or args.get("file_path")
             if raw or name in self._PATH_TOOLS_REQUIRED:
                 resolved, err = resolve_in_workspace(self.workspace_root, raw)
@@ -1594,7 +1800,12 @@ When you are done, summarize what you did and provide evidence of success."""
                     if "file_path" in args:
                         args["file_path"] = str(resolved)
 
-        if name in self._CWD_TOOLS:
+        if is_mcp:
+            mcp_err = self._inspect_mcp_path_confinement(args)
+            if mcp_err is not None:
+                return ToolResults.permission_denied(f"Path confinement: {mcp_err}")
+
+        if name in self._CWD_TOOLS or (is_mcp and "cwd" in args):
             cwd, _ = cwd_in_workspace(self.workspace_root, args.get("cwd"))
             args["cwd"] = cwd
 
@@ -1737,7 +1948,8 @@ When you are done, summarize what you did and provide evidence of success."""
         )
 
         extracted: list[dict[str, Any]] = []
-        known_tools = set(self.tools.keys()) | set(self._TOOL_ALIASES.keys())
+        aliases = getattr(self, "tool_aliases", self._TOOL_ALIASES)
+        known_tools = set(self.tools.keys()) | set(aliases.keys())
 
         # 1. XML tags: <tool_call> ... </tool_call>
         for idx, match in enumerate(re.finditer(r"<tool_call>([\s\S]*?)</tool_call>", content), 1):
@@ -1819,7 +2031,8 @@ When you are done, summarize what you did and provide evidence of success."""
         # Direct tool registrations always take precedence over alias resolution.
         # An alias is only resolved if the target tool is actually registered in this runtime.
         if call.tool_name not in self.tools:
-            target = self._TOOL_ALIASES.get(call.tool_name) or self._TOOL_ALIASES.get(call.tool_name.lower())
+            aliases = getattr(self, "tool_aliases", self._TOOL_ALIASES)
+            target = aliases.get(call.tool_name) or aliases.get(call.tool_name.lower())
             if target and target in self.tools:
                 call.tool_name = target
 
@@ -1869,12 +2082,20 @@ When you are done, summarize what you did and provide evidence of success."""
                 "Ask for user approval or choose a different approach."
             )
 
-        # Check permission
+        # Check tool schema permission constraint
+        required_perm = getattr(tool.schema, "permission_required", "allow")
+        if required_perm == "deny":
+            self._record_denial(call.tool_name, call.arguments)
+            return ToolResults.permission_denied("Permission denied by tool schema policy")
+
+        # Check permission manager rules
         permission = self.permission_manager.check_permission(call.tool_name, call.arguments)
         if permission == "deny":
             self._record_denial(call.tool_name, call.arguments)
             return ToolResults.permission_denied("Permission denied by policy")
-        if permission == "ask" and not self.permission_manager.request_approval(
+
+        needs_approval = (permission == "ask") or (required_perm == "ask")
+        if needs_approval and not self.permission_manager.request_approval(
             call.tool_name, str(call.arguments)
         ):
             self._record_denial(call.tool_name, call.arguments)
@@ -2681,13 +2902,68 @@ When you are done, summarize what you did and provide evidence of success."""
                 else:
                     task.status = TaskStatus.FAILED
                     task.error = f"Provider error: {e}"
+                await self._reconcile_todos(task)
                 break
+
+            # Token accounting from provider response
+            in_tok = None
+            out_tok = None
+            cached_tok = None
+            is_estimated = False
+
+            token_usage_obj = getattr(response, "token_usage", None)
+            raw_usage = getattr(response, "usage", None)
+            if token_usage_obj is not None:
+                in_tok = token_usage_obj.input_tokens
+                out_tok = token_usage_obj.output_tokens
+                cached_tok = token_usage_obj.cached_tokens
+                is_estimated = getattr(token_usage_obj, "estimated", False)
+            elif isinstance(raw_usage, dict):
+                in_tok = raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens")
+                out_tok = raw_usage.get("completion_tokens") or raw_usage.get("output_tokens")
+                cached_tok = raw_usage.get("cached_tokens")
+
+            if out_tok is None:
+                out_tok = max(1, len(response.content) // 4) if getattr(response, "content", None) else 0
+                is_estimated = True
+
+            if in_tok is not None:
+                task.total_input_tokens += int(in_tok)
+            task.total_output_tokens += int(out_tok or 0)
+            if is_estimated:
+                task.tokens_estimated = True
+
+            task.token_usage = {
+                "input_tokens": task.total_input_tokens,
+                "output_tokens": task.total_output_tokens,
+                "current_turn_output_tokens": out_tok or 0,
+                "cached_tokens": cached_tok,
+                "estimated": task.tokens_estimated,
+            }
 
             model_duration = time.monotonic() - model_attempt_started
             task.execution_timeline.record_model_attempt(model_duration)
             await self._emit_semantic(
                 semantic.MODEL_COMPLETED,
-                {"duration_ms": round(model_duration * 1000, 1), "failed": False},
+                {
+                    "duration_ms": round(model_duration * 1000, 1),
+                    "failed": False,
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "total_output_tokens": task.total_output_tokens,
+                    "estimated": is_estimated,
+                },
+            )
+            await self._emit_event(
+                "model.completed",
+                {
+                    "duration_ms": round(model_duration * 1000, 1),
+                    "model": getattr(response, "model", ""),
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "total_output_tokens": task.total_output_tokens,
+                    "estimated": is_estimated,
+                },
             )
 
             # Process response

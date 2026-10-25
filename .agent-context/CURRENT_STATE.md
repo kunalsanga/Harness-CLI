@@ -1,6 +1,136 @@
 # Current State
 
-Last checked: 2026-10-19 (REA Reverse Engineering & Claude Code Parity Sprint)
+Last checked: 2026-10-19 (OpenRouter Provider Investigation & Multi-Provider Fallback)
+
+## OpenRouter Provider Investigation & Multi-Provider Fallback (2026-10-19)
+- **Investigation & Root Cause Analysis**:
+  - Investigated OpenRouter dashboard evidence (294 requests, 1.88M tokens, $0.00 spend across `:free` models: North Mini Code, Gemma, Nemotron, LFM).
+  - Confirmed that average request volume (~6,395 tokens/request) is standard for an autonomous loop with prompts, directory context, tool schemas, and file contents.
+  - Confirmed $0.00 spend reflects 100% `:free` model usage, which is subject to OpenRouter's account-level daily free-tier request limits (~200 requests/day for zero-deposit accounts).
+  - Identified critical architectural gap: `create_providers()` previously defaulted to only `[{"id": "openrouter", "enabled": True}]` when `.harness/config.yaml` was absent, ignoring credentials present in `.env` (such as `GROQ_API_KEY`, `NVIDIA_API_KEY`). As a result, the fallback chain consisted entirely of models hosted on the single provider `openrouter`. When OpenRouter hit an account-wide limit, model rotation was futile because all requests hit the same exhausted API key.
+- **Multi-Provider Auto-Discovery**:
+  - `src/harness_core/providers/factory.py`: added `auto_discover: bool = False` to `_provider_configs()` and `create_providers()`. When enabled, dynamically discovers all configured providers with valid credentials from `CredentialResolver` (`openrouter`, `groq`, `gemini`, `anthropic`, `openai`, `nvidia`).
+  - `src/harness_core/cli/interactive.py` and `main.py`: passes `auto_discover=True` when loading project configuration so available credentials immediately provide genuine multi-provider fallback.
+- **Provider Diversity in Fallback Chains**:
+  - `src/harness_core/routing/router.py`: `_build_free_chain` enforces provider diversity across candidate models when multiple providers offer free models, ensuring alternative providers (e.g. Groq) are included rather than filling all chain slots with a single provider.
+- **Exhausted Provider Fast Failover**:
+  - `src/harness_core/routing/fallback.py`: tracks `exhausted_providers`. When a provider hits an account-wide quota limit (`is_account_quota`), subsequent candidate models belonging to that exhausted provider are skipped immediately without redundant HTTP requests, jumping directly to alternative non-exhausted providers in the chain.
+- **Deterministic Testing**:
+  - Added `test_account_quota_skips_same_provider_and_fails_over_to_distinct_provider` and `test_free_chain_ensures_provider_diversity` in `tests/unit/test_openrouter_reliability_audit.py`.
+  - Added `test_create_providers_auto_discovers_configured_credentials` in `tests/unit/test_provider_factory.py`.
+  - Full suite: **1,755 passed, 1 skipped, 0 failures** in 79.35s.
+
+## Task Completion Reliability & Honest Plan Reporting (2026-10-19)
+- **Timeout Immediate Failover**:
+  - `FallbackConfig`: reduced `model_attempt_timeout_seconds` from 90s to 45s, and `total_timeout_seconds` from 120s to 90s.
+  - `FallbackEngine`: when a request times out (`ERROR_CATEGORY_TIMEOUT`), the engine immediately breaks out of retry loops and fails over to the next candidate model in the chain without wasting another 45-90 seconds retrying the exact same hung endpoint.
+- **Provider Quota & Account-Wide Rate Limit Exhaustion**:
+  - Expanded detection for provider-wide and account-level daily quotas (`free model limit`, `daily rate limit`, `quota exceeded`, `resource_exhausted`, `free-models-per-day`).
+  - When quota exhaustion is detected and all remaining candidate models in the chain share the same provider, fails over promptly with clear guidance rather than stalling through redundant 429 requests.
+- **Bounded Interactive Task Deadlines**:
+  - `EngineeringRuntime.execute_interactive`: catches `(asyncio.TimeoutError, TimeoutError)` cleanly, marks tasks as failed with clear timeout blockers, and returns a truthful `RuntimeOutcome` instead of crashing or hanging indefinitely.
+  - `InteractiveShell`: passes a 240.0s task deadline default to `execute_interactive`.
+- **Honest Plan Item Reconciliation & Falsification Prevention**:
+  - `apply_tool_result`: file editing tools (`edit_file`, `write_file`) activate implementation TODOs to `IN_PROGRESS` with evidence, never prematurely marking them `COMPLETED` on intermediate edits.
+  - `reconcile_on_evidence`:
+    - Added `task_failed: bool = False` flag.
+    - When a task fails, aborts, or pauses: implementation TODOs are NEVER marked completed without verification; any unverified completed items are reverted to `FAILED` with `unverified=True` and explicit reason.
+    - Implementation items only complete during successful reconciliation when files were modified AND verification/tests have not failed.
+- **Diff Preview & Failure Reporting Truthfulness**:
+  - `ConversationRenderer._render_diff_preview`: generates balanced diff preview showing both removed (`-`) and added (`+`) lines instead of only displaying deletions.
+  - `ConversationRenderer._render_plan`: displays unverified items honestly with warning mark `!` (yellow), never a misleading green `✓` when a task fails.
+  - `InteractiveShell` & `ConversationRenderer.render_completion`: explicitly report partial edits and list the unverified files, and clearly state whether tests and verification were run or stopped beforehand.
+- **Test Baseline**:
+  - `tests/unit/test_task_completion_reliability.py`: 7 passed in 0.17s.
+  - Core focused regression suite (104 tests across failover, invariant, ux, routing, windows): 100% passed.
+
+## Windows Coding Reliability & Shell Execution (2026-10-19)
+- **Unified Diff Accuracy**:
+  - Fixed `EditFileTool.build_diff()` to split lines without `keepends=True`, use `lineterm=""`, and join with `"\n"`. Prevents merged diff lines (e.g. `-old;+new;`) when files lack trailing newlines, ensuring exact added/removed counts and clean diff preview boxes.
+- **Windows-Aware Execution & Normalization**:
+  - `RunCommandTool`:
+    - Executes via PowerShell (`powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ...`) with `$LASTEXITCODE` / `$?` returncode propagation and alias compatibility (`ls`, `cat`, `type`). Falls back to `cmd.exe /c`.
+    - Automatically strips redundant leading `cd <workspace> &&` / `cd <workspace>;` prefixes pointing to `cwd` or `.`.
+    - Normalizes POSIX drive notation `/c/Users/...` to `C:/Users/...`.
+    - Unescapes Unix-style backslash space escapes (`\ ` -> ` `).
+    - Rewrites `python3` to `python` when `python3` is not found on Windows PATH.
+- **Failure Diagnostics & Anti-Pattern Redirection**:
+  - `classify_command_failure` identifies shell file inspection attempts (`cat`, `type`, `head`, `tail`, `ls`, `dir`) as `file_inspection_via_shell`.
+  - In `_postprocess_result` and `RunCommandTool`: returns immediate actionable guidance redirecting the model to use dedicated tools (`read_file`, `list_files`, `grep`) instead of looping through shell commands.
+- **Windows System Prompt Context**:
+  - `AgentLoop._system_prompt()` injects explicit `WINDOWS EXECUTION ENVIRONMENT` rules when `platform.system() == "Windows"`:
+    - Specifies PowerShell shell environment and states that `run_command` already runs in workspace root (no `cd`).
+    - Mandates double-quoting paths with spaces and forbids Unix backslash escapes (`New\ folder`).
+    - Enforces dedicated file tools (`read_file`, `list_files`) over shell inspection commands.
+- **Provider Fallback & Shared Quota Handling**:
+  - Short-circuits fallback when explicit account-wide free-tier limit or daily quota exhaustion (`free model limit`, `daily rate limit`, `quota exceeded`) is detected, avoiding futile 5-minute timeout loops across identical provider endpoints.
+  - Interactive shell displays clear quota guidance and surfaces partial changes saved when tasks stop prematurely.
+- **Test Baseline**:
+  - `tests/unit/test_windows_reliability.py`: 16 passed in 1.96s.
+  - Core focused suite (125 tests across UX, failover, MCP, instructions, shell, git): 125 passed in 25.41s.
+- **Live Status & Non-Blocking Spinner**:
+  - `ConversationRenderer` animated spinner (`⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏`) smoothly updating at 10 fps via monotonic clock without separate threads or race conditions.
+  - Multi-stage progress indicators driven by real observable events: `Connecting…`, `Considering…`, `Investigating…`, `Reading files…`, `Editing code…`, `Running tests…`, `Preparing response…`.
+  - Terminal cleanup: `stop()` guarantees `show_cursor(True)` and clean shutdown of Live region on finish, failure, cancel, or Ctrl+C.
+- **Truthful Token Accounting**:
+  - Distinguishes current-turn generated output tokens (`↓ ...`) from total session and input tokens.
+  - Formatted cleanly (`120 tokens`, `1.2k tokens`). Provider-reported usage is labelled `exact`. Approximated or streaming character heuristics (`len(content)//4`) are explicitly labelled `(est)` (e.g. `↓ ~1.2k tokens (est)`).
+  - `AgentLoop` populates `task.token_usage`, `task.total_input_tokens`, `task.total_output_tokens`, `task.tokens_estimated` and emits `model.completed` with exact/estimated flags.
+- **Live Code-Change Visibility (Diff Preview)**:
+  - `WriteFileTool` and `EditFileTool` calculate exact `added` and `removed` line counts and unified diff snippets in `ToolResult.metadata`.
+  - `AgentLoop` records file change statistics on `task.file_change_stats` and `task.files_changed`, emitting `file.changed` events.
+  - `ConversationRenderer` renders a compact 2-5 line diff preview box (`src/app.py (+18 -6)`) with syntax-highlighted `-` and `+` lines adapting dynamically to terminal width.
+- **Live Test Results**:
+  - `AgentLoop` parses test suite outputs (pytest, unittest, npm) into passed/failed counts, emitting `test.completed`.
+  - Live status renders `✓ Tests completed  12 passed` or `✗ Tests failed  8 passed, 2 failed`.
+- **Turn Completion Summary**:
+  - Structured summary showing status, elapsed time, tool calls, model chain, exact vs estimated tokens (`Tokens: 3.2k in, 850 out (exact)`), file changes with per-file `(+added -removed)` stats, and test run outcomes.
+- **Test Baseline**:
+  - Deterministic suite: `tests/unit/test_claude_ux_parity.py` (12 passed in 1.02s).
+  - All UX-related unit tests: 106 passed in 12.82s.
+  - Core integration & parity suite: 153 passed in 22.11s.
+
+## MCP Security & Lifecycle Audit (2026-10-19)
+- **Arbitrary & Nested Path Confinement**:
+  - Implemented `AgentLoop._inspect_mcp_path_confinement()` to recursively inspect all MCP parameter keys and values.
+  - Secures arbitrary path parameter keys (`dest`, `source`, `target`, `filepath`, `dir`, etc.), nested dictionaries (`{"opts": {"target": "..."}}`), and list values against directory traversal (`../`), absolute paths (`/etc/passwd`), Windows drive paths (`C:\Windows\System32`), and UNC network paths (`\\server\share`).
+  - Server configuration `cwd` in `.mcp.json` is strictly confined within `workspace_root`; escapes fallback safely to workspace root.
+- **Process Lifecycle & Zombie/Handle Leak Prevention**:
+  - `MCPClient.shutdown_server()` terminates process, closes `stdin`/`stdout`/`stderr` streams, and unregisters from `_processes` to prevent file handle exhaustion.
+  - Registered `atexit.register(client.shutdown_all)` so all child MCP servers are terminated cleanly on interpreter exit or crash.
+  - Startup failure or initialization timeout terminates spawned subprocesses immediately.
+  - JSON-RPC protocol desynchronization guard: `_send_request` matches request `id`, safely skipping unsolicited notifications (`id: null`) or mismatched responses.
+- **Permission & Tool Shadowing Protection**:
+  - Core/native tools are protected against shadowing or hijacking by untrusted MCP servers in `AgentLoop.__init__`. MCP tools cannot overwrite existing tools or core aliases (`bash`, `read_file`, etc.).
+  - Enforced `tool.schema.permission_required` (`deny` or `ask` requiring `request_approval`) in `_execute_tool_checked()`.
+  - Non-autonomous (interactive) mode strictly denies unapproved MCP tool calls.
+- **Comprehensive Secret Redaction**:
+  - `MCPToolAdapter._sanitize_text()` scrubs server configuration arguments (sensitive flags like `--token`, `-t`, `--key`, `-k`, `--password`, `-p`, `--secret`), ambient system environment variables (`TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `AUTH`), and API key/bearer token patterns (`sk-`, `sk_`, `Bearer ...`).
+- **Test Baseline**:
+  - Focused MCP suite: **30 passed in 3.71s** (`tests/unit/test_mcp_tool_integration.py`).
+  - Full unit test suite: **1,717 passed, 1 skipped, 0 failed** in 74.17s.
+
+## Project Instructions Discovery & Injection (2026-10-19)
+- **Automatic Instruction Discovery in System Prompt**:
+  - Implemented `AgentLoop._load_project_instructions()` to discover `.harness/instructions.md`, `AGENTS.md`, and `CLAUDE.md`.
+  - Enforced deterministic precedence: `.harness/instructions.md` > `AGENTS.md` > `CLAUDE.md`.
+  - Workspace path confinement check: paths verified to resolve strictly inside `workspace_root`; directory traversal (`../`) and escaping symlinks rejected.
+  - SHA-256 content deduplication prevents injecting duplicated instruction blocks.
+  - Bounded token/character budget with clean truncation notice (`[... Project instructions truncated to budget ...]`).
+  - Section framing: `[{rel_name}]\n{content}`.
+  - Zero-file fallback: prompt unchanged when no instruction files exist.
+  - Test suite: `tests/unit/test_project_instructions.py` (10 passed in 0.54s).
+
+## Native MCP Tool Integration (2026-10-19)
+- **Adapter & Runtime Lifecycle**:
+  - `MCPToolAdapter` (`src/harness_core/mcp/adapter.py`): Canonical `Tool` subclass translating MCP tools into Harness `ToolSchema`, normalizing JSON schema parameters, and wrapping `MCPClient.call_tool()`.
+  - Handles MCP content blocks, `isError`, and JSON-RPC errors, returning canonical `ToolResults.success()` or `ToolResults.error()`.
+  - Secret redaction: Server environment variables (`env`) are scrubbed from outputs and errors.
+  - Configuration discovery (`src/harness_core/mcp/manager.py`): Supports `.harness/config.yaml` (`mcp:` section, both `servers:` map and flat map) and standard root `.mcp.json` (`mcpServers:`), with `.harness/config.yaml` taking deterministic precedence.
+  - Deterministic namespacing & collision avoidance: Tools assigned primary name `mcp_{server}_{tool}`. Unambiguous bare tool names exposed as aliases ONLY when no collision with native tools or other MCP servers exists.
+  - Execution guards: Path confinement (`_confine_call`), workspace boundary checks, and timeout handling apply to MCP tools identically to native tools.
+  - CLI integration: `harness mcp list` reads workspace-configured servers; `harness tools list` shows core + MCP tools; `InteractiveShell` discovers tools and ensures clean shutdown (`mcp_client.shutdown_all()`).
+  - Optionality: Zero overhead and identical behavior when no MCP servers are configured.
 
 ## REA Reverse Engineering & Claude Code Parity Sprint (2026-10-19)
 

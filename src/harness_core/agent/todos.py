@@ -265,6 +265,16 @@ def apply_tool_result(plan: TaskPlan, call: ToolCall, result: ToolResult) -> Tod
         plan.fail_id(item.id, result.error or result.output[:300] if result.output else "failed")
         item.evidence = evidence
         return item
+
+    # For implementation steps, a single file edit indicates work in progress,
+    # not full task completion. It activates the step to IN_PROGRESS.
+    # Completion of implementation items requires reconciliation / verification.
+    if cat == "implement":
+        if item.status == TodoStatus.PENDING:
+            plan.activate_id(item.id)
+        item.evidence = evidence
+        return item
+
     if item.status != TodoStatus.COMPLETED:
         plan.complete_id(item.id, evidence)
     return item
@@ -280,20 +290,40 @@ def reconcile_on_evidence(
     did_commit: bool,
     did_push: bool,
     tests_run: int = 0,
+    task_failed: bool = False,
 ) -> list[TodoItem]:
     """Complete remaining TODOs that have matching execution evidence."""
     changed: list[TodoItem] = []
+    # "Verify" is satisfied by either explicit verification (preferred) or
+    # by a successful test run that actually ran (secondary signal).
+    test_evidence = tests_passed is True and tests_run > 0
+
+    if task_failed:
+        # Honest reporting on failure: never complete pending implementation/test/verify
+        # items, and revert any implementation items that were prematurely marked
+        # completed without verification.
+        for item in plan.items:
+            cat = todo_category(item.description)
+            if cat in ("implement", "verify", "test"):
+                if item.status == TodoStatus.COMPLETED and not (verified is True or test_evidence):
+                    item.status = TodoStatus.FAILED
+                    item.evidence = {"unverified": True, "reason": "Task terminated before changes were verified"}
+                    changed.append(item)
+                elif item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
+                    plan.fail_id(item.id, "Task failed before this step completed")
+                    changed.append(item)
+        return changed
+
     for item in plan.items:
         if item.status not in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
             continue
         cat = todo_category(item.description)
-        # "Verify" is satisfied by either explicit verification (preferred) or
-        # by a successful test run that actually ran (secondary signal).
-        test_evidence = tests_passed is True and tests_run > 0
+        # Implementation is only completed if files were modified and verification/tests have not failed.
+        impl_ok = did_implement and (verified is not False) and (tests_passed is not False)
         ok = (
             (cat == "inspect" and did_inspect)
-            or (cat == "implement" and did_implement)
-            or (cat == "test" and tests_passed is True)
+            or (cat == "implement" and impl_ok)
+            or (cat == "test" and test_evidence)
             # "verify" + verify engine passed OR "verify" + successful test run
             or (cat == "verify" and (verified is True or test_evidence))
             or (cat == "commit" and did_commit)

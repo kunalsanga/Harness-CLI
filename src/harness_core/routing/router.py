@@ -527,12 +527,31 @@ class ModelRouter:
             model.id,
         ))
 
-        # Ensure dynamic route (e.g. openrouter/free) is included at the end of the chain as the resilient fallback
         max_chain = self.config.max_fallback_chain
-        if dynamic_models and max_chain > 1:
-            candidates = concrete_models[: max(1, max_chain - len(dynamic_models))] + dynamic_models
+
+        # Provider diversity: if multiple distinct providers offer free models,
+        # ensure alternative providers are represented in candidate selection
+        # so that a single provider's account quota limit does not exhaust the whole chain.
+        providers_present = {m.provider for m in concrete_models}
+        if len(providers_present) > 1 and max_chain > 1:
+            diverse_candidates: list[ModelInfo] = []
+            used_providers: set[str] = set()
+            for m in concrete_models:
+                if m.provider not in used_providers:
+                    diverse_candidates.append(m)
+                    used_providers.add(m.provider)
+            for m in concrete_models:
+                if m not in diverse_candidates:
+                    diverse_candidates.append(m)
+            ordered_concrete = diverse_candidates
         else:
-            candidates = concrete_models[:max_chain] + (dynamic_models if not concrete_models else [])
+            ordered_concrete = concrete_models
+
+        # Ensure dynamic route (e.g. openrouter/free) is included at the end of the chain as the resilient fallback
+        if dynamic_models and max_chain > 1:
+            candidates = ordered_concrete[: max(1, max_chain - len(dynamic_models))] + dynamic_models
+        else:
+            candidates = ordered_concrete[:max_chain] + (dynamic_models if not ordered_concrete else [])
 
         chain: list[tuple[str, ModelProvider]] = []
         seen: set[tuple[str, str]] = set()

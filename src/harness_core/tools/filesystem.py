@@ -94,9 +94,30 @@ class WriteFileTool(Tool):
         try:
             path = Path(arguments["path"])
             content = arguments["content"]
+            existed = path.exists()
+            old_content = path.read_text(encoding="utf-8", errors="replace") if existed else ""
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            return ToolResults.success(f"Written {len(content)} bytes to {path}")
+            if existed:
+                diff = EditFileTool.build_diff(old_content, content, path.name)
+                diff_lines = diff.splitlines()
+                added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
+                removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
+            else:
+                added = len(content.splitlines())
+                removed = 0
+                sample = "\n".join(f"+{l}" for l in content.splitlines()[:6])
+                diff = f"+++ b/{path.name}\n@@ +1,{added} @@\n{sample}"
+            return ToolResults.success(
+                f"Written {len(content)} bytes to {path}",
+                metadata={
+                    "path": str(path),
+                    "diff": diff,
+                    "added": added,
+                    "removed": removed,
+                    "created": not existed,
+                },
+            )
         except Exception as e:
             return ToolResults.from_exception(e, retryable=False)
 
@@ -184,14 +205,21 @@ class EditFileTool(Tool):
         """Bounded unified diff for events/verification."""
         import difflib
 
-        diff = difflib.unified_diff(
-            old_content.splitlines(keepends=True),
-            new_content.splitlines(keepends=True),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-            n=2,
+        # Split without keepends to ensure uniform newline handling
+        # and prevent "-old+new" concatenation when files lack trailing newlines.
+        old_lines = old_content.splitlines()
+        new_lines = new_content.splitlines()
+        diff = list(
+            difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                n=2,
+                lineterm="",
+            )
         )
-        text = "".join(diff)
+        text = "\n".join(diff)
         if len(text) > 4000:
             text = text[:4000] + "\n... [diff truncated]"
         return text
@@ -220,12 +248,19 @@ class EditFileTool(Tool):
             if exact_count == 1:
                 new_content = content.replace(old_string, new_string, 1)
                 path.write_text(new_content, encoding="utf-8")
+                diff = self.build_diff(content, new_content, path.name)
+                diff_lines = diff.splitlines()
+                added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
+                removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
                 return ToolResults.success(
                     f"Edited {path} (exact match)",
                     metadata={
+                        "path": str(path),
                         "match_type": "exact",
                         "replacements": 1,
-                        "diff": self.build_diff(content, new_content, path.name),
+                        "diff": diff,
+                        "added": added,
+                        "removed": removed,
                     },
                 )
             if exact_count > 1:
@@ -254,13 +289,20 @@ class EditFileTool(Tool):
                 )
                 new_content = "".join(new_content_lines)
                 path.write_text(new_content, encoding="utf-8")
+                diff = self.build_diff(content, new_content, path.name)
+                diff_lines = diff.splitlines()
+                added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
+                removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
                 return ToolResults.success(
                     f"Edited {path} (whitespace-tolerant match at line {start + 1})",
                     metadata={
+                        "path": str(path),
                         "match_type": "whitespace",
                         "replacements": 1,
                         "line_start": start + 1,
-                        "diff": self.build_diff(content, new_content, path.name),
+                        "diff": diff,
+                        "added": added,
+                        "removed": removed,
                     },
                 )
             if len(ws_matches) > 1:

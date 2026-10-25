@@ -183,7 +183,7 @@ def run(
         from harness_core.tools.shell import RunCommandTool
 
         provider_config = load_project_provider_config(Path.cwd())
-        providers = create_providers(provider_config)
+        providers = create_providers(provider_config, auto_discover=True)
         provider = providers[0]
 
         async def close_providers() -> None:
@@ -333,6 +333,7 @@ def run(
                 plan_provider=provider,
                 event_bus=event_bus,
                 router=router,
+                tools=tools,
                 memory=memory,
                 project_id=project_id,
                 max_concurrency=max_parallel,
@@ -1716,11 +1717,25 @@ def tools_list(
             "parameters": s.parameters,
         })
 
+    try:
+        from harness_core.mcp.manager import init_mcp_client_from_workspace
+        client = init_mcp_client_from_workspace(Path.cwd())
+        for server in client.list_servers():
+            for t in client.list_tools(server.name):
+                tool_list.append({
+                    "name": f"mcp_{server.name}_{t.name}",
+                    "description": t.description,
+                    "source": f"MCP ({server.name})",
+                    "parameters": t.input_schema,
+                })
+    except Exception:
+        pass
+
     if json_output:
         print(json.dumps(tool_list, indent=2))
         return
 
-    table = Table(title=f"Tools ({len(tool_list)} core)")
+    table = Table(title=f"Tools ({len(tool_list)})")
     table.add_column("Name", style="cyan")
     table.add_column("Source", style="green")
     table.add_column("Description", max_width=50)
@@ -1766,8 +1781,8 @@ def mcp_list(
     json_output: bool = typer.Option(False, "--json", help="JSON output"),
 ) -> None:
     """List configured MCP servers."""
-    from harness_core.mcp.client import MCPClient
-    client = MCPClient()
+    from harness_core.mcp.manager import init_mcp_client_from_workspace
+    client = init_mcp_client_from_workspace(Path.cwd())
     servers = client.list_servers()
     status = client.get_status()
 
