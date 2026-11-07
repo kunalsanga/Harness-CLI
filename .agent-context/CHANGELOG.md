@@ -1,5 +1,232 @@
 # Agent Context Changelog
 
+## 2026-11-07 — Harness V2 Interactive Session History & Transcript Navigation
+
+- **Interactive `/sessions` Browser & Historical Transcript Viewer (`src/harness_core/cli/session_browser.py`)**:
+  - Implemented `InteractiveSessionBrowser` with keyboard navigation, date grouping (`Today`, `Yesterday`, `This Week`, `Month/Year`), full chronological transcript inspection, and explicit resume confirmation.
+  - Keyboard navigation: Up/Down arrow (`k`/`j`), PageUp/PageDown, Home/End.
+  - Transcript inspection: Enter opens full conversation transcript with user prompts, tool activity, Markdown assistant answers, and verification status. Up/Down/PageUp/PageDown scroll transcript.
+  - Search filtering: `/` activates live search in both session list and transcript views; typing filters items; Enter jumps to match; `n`/`N` navigates matches; Esc clears search.
+  - Strict read-only viewing guarantee: 0 LLM calls, 0 tool executions, 0 state mutations.
+  - Explicit resume dialog: pressing `R` opens `[Y/n]` resume confirmation; pressing `N`/`Esc` cancels back to browser; `Y`/`Enter` confirms resumption and context restore.
+  - Fallback support: non-TTY and `--plain` flag fall back to clean date-grouped static tables (`render_session_browser`).
+- **Accurate Derived Session Status (`derive_session_status`)**:
+  - Resolved false `Active` mislabeling on historical sessions: dynamically inspects latest run outcomes to derive `Completed`, `Failed`, `Paused`, `Interrupted`, `Active`, and `Archived`.
+  - Updated SQLite session lifecycle in `InteractiveShell` to mark sessions `completed` or `failed` on run completion.
+- **Verification Evidence**:
+  - `tests/unit/test_session_browser.py`: 36/36 passed in 2.77s.
+  - `tests/unit/test_readonly_explain_regression.py`: 16/16 passed in 0.27s.
+  - `tests/e2e/test_interactive_acceptance_hardening.py`: 16/16 passed in 2.83s.
+  - Real database audit (`~/.harness/sessions.db`): confirmed session `17006d8db86d` is accurately marked `Completed`, `f44265f95ddb` marked `Failed`, and abandoned sessions marked `Interrupted`.
+
+## 2026-11-07 — Read-Only Explanation Task Regression Resolution & Windows Shell Reliability
+
+- **Failure Analysis & Resolution on Session `f44265f95ddb`**:
+  - Resolved 5 distinct root causes from read-only task failure on `app1` (`explain this project`):
+    1. **Tool Aggregation Overwrite (`conversation.py`)**: Fixed `complete_last()` so a single failed read inside an aggregated block preserves successful reads (`✓ Inspected 20 files`) and isolates the failure (`✗ Read ...`) rather than masking the whole batch as failed.
+    2. **Windows PowerShell Statement Chaining & Quoting (`shell.py`)**: Added `translate_powershell_chain()` to convert POSIX `&&` and `||` to PowerShell 5.1 syntax (`cmd1; if ($?) { cmd2 }`), and quoted space-containing paths safely with `Set-Location -LiteralPath '...'`.
+    3. **Contradictory Plan Completion on Failed Tasks (`todos.py`)**: Added `_SUMMARIZE` category so "Summarize findings" is not completed by read tools. On task failure, `reconcile_on_evidence()` marks incomplete steps failed and reverts prematurely completed summary steps.
+    4. **Inappropriate Verification Failure on Read-Only Tasks (`state.py`, `runtime.py`, `conversation.py`)**: Added `VerificationStatus.SKIPPED`. Failed read-only tasks now report `Verification: Not applicable (read-only task)` with dim styling instead of `Verification: Failed`.
+    5. **Read-Only Inspection Bounding & Directory Diagnostics (`loop.py`, `filesystem.py`)**: Nudges read-only tasks to synthesize after 12 read operations, hard caps at 18 operations, and provides clear directory diagnostics when `read_file` is called on a folder.
+- **Verification Evidence**:
+  - `tests/unit/test_readonly_explain_regression.py`: 16/16 passed in 0.21s.
+  - Full unit test suite: **1,917 passed, 1 skipped, 0 failures** in 134.60s.
+  - Smoke tests and import checks passed.
+  - **Live Post-Fix Reproduction Run (Session `17006d8db86d`)**:
+    - Task `explain this project` in workspace `app1` completed cleanly in 19.6s (vs 35s failure).
+    - Tool calls reduced from 31 to 1 (`List .`).
+    - Input tokens reduced from 32.3k to 9.5k (-71%), output tokens increased from 97 to 686 (+607%).
+    - Produced complete, accurate architectural overview; 0 file modifications; previous failed session `f44265f95ddb` preserved intact.
+
+- **TaskForge Real-World Dogfooding & Implementation**:
+  - Validated autonomous cross-stack engineering in disposable workspace `app1` (FastAPI + React/TypeScript).
+  - Executed feature development: task priority filtering on the Dashboard.
+  - Performed independent self-diagnosis and resolved 4 engineering defects:
+    1. Input validation on `/api/v1/stats` and `/api/v1/tasks` (strict 400 rejection for unknown priorities).
+    2. Partitioned global distribution metrics from filtered population statistics on the Dashboard.
+    3. Added `AbortController` cancellation to eliminate asynchronous race conditions on rapid filter switching.
+    4. Resolved variable hoisting order in `Dashboard.tsx`.
+- **Automated & Live Verification**:
+  - Backend pytest: 11/11 passed in 1.16s (with 3 upstream deprecation warnings noted).
+  - Frontend typecheck: `tsc --noEmit` passed with 0 errors.
+  - Frontend automated tests: 5/5 passed in 31.6ms via Node 24 built-in `node:test`.
+  - Production build: `vite build` completed in 1.53s.
+  - Live daemons: FastAPI (`http://127.0.0.1:8000`) and Vite (`http://127.0.0.1:5173`) running with 8 seeded development tasks.
+- **Strategic Direction**:
+  - UI feature development frozen. Focus shifted to Session Recovery testing, 3-Project Generalization Benchmark, and Task Success Rate tracking.
+
+## 2026-11-06 — Harness V2: Premium Autonomous Coding Agent Experience
+
+- **Clean Fresh Launch & Branded Welcome**:
+  - Removed auto-hijack of past active/paused sessions on fresh launch in `interactive.py:_setup_session()`. `harness shell` now initializes clean without dumping old task recaps.
+  - Added session tag (`Session: <id[:8]>`) and `/sessions, /models, /diff, /help` command discovery in `ui.py:render_welcome()`.
+  - Fixed overwritten `session_id` in `InteractiveShell.__init__`.
+- **Date-Grouped Session Browser & Historical Viewer**:
+  - Built `src/harness_core/cli/session_browser.py`:
+    - `group_sessions_by_date()` organizing sessions into `Today`, `Yesterday`, `This Week`, `Month Year`.
+    - `render_session_browser()` displaying rich tabular session history with run counts, status colors, and keyword/workspace/status search.
+    - `render_historical_transcript()` providing read-only playback of past prompts, tool activities, Markdown outputs, and verification results without calling models or running tools.
+  - Rewired `/sessions` slash command to support browsing, searching, transcript viewing (`/sessions view <id>`), and resuming (`/sessions resume <id>`).
+- **Live File Activity Tracking & `/diff` Command**:
+  - Added `files_activity` tracking (`inspected`, `created`, `modified`, `deleted`, `failed`) and in-flight `Files` rendering in `ConversationRenderer`.
+  - Removed `workflow=True` gate in `on_tool_call` so all live tool executions start rendering immediately.
+  - Enhanced `/diff` command: renders syntax-highlighted git diff (`-U3`) with colored insertions/deletions, sensitive token/key redaction, and clean line capping.
+- **Dynamic Ladder & Failover Transparency**:
+  - Updated `on_model_switched` and `on_model_cooldown` to set explicit stage messages (`Failing over to Groq...`, `Retrying model...`), preventing silent hangs or frozen spinners during model switches.
+- **Verification Evidence**:
+  - Created `tests/unit/test_session_browser.py` (18/18 passed in 1.06s).
+  - Targeted suites: 203 passed in 4.00s.
+  - Full unit test suite: **1,901 passed, 1 skipped, 0 failures** in 104.96s.
+  - CLI smoke test and import check passed.
+
+## 2026-11-01 — Universal Multi-Provider Resilience & Intelligent API Key Failover
+
+- **Root Cause Fixes**:
+  - Unlocked NVIDIA NIM and Groq developer endpoints in all routing modes by marking them `is_free=True` with 0.0 cost.
+  - Merged project config with auto-discovered environment credentials in `factory._provider_configs()` so providers are never omitted when project configs override one provider.
+  - Implemented cross-provider candidate interleaving in `ModelRouter.select_models()` and `_build_free_chain()`, preventing single-provider monopolization of the fallback chain.
+  - Mapped token context overflows to `CONTEXT_OVERFLOW` in `fallback.classify_error()`.
+- **Azure OpenAI Integration**:
+  - Implemented `AzureOpenAIProvider` in `src/harness_core/providers/azure.py` supporting `/openai/deployments/...` native endpoints and OpenAI-compatible paths.
+  - Registered Azure in `CredentialResolver` with `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, and `AZURE_OPENAI_DEPLOYMENT`.
+- **CLI Auto-Discovery**:
+  - Updated `harness doctor`, `harness models list`, `harness models benchmark`, and `harness eval` to pass `auto_discover=True` to `create_providers()`.
+- **Regression Suite Verification**:
+  - Verified 1,883 unit tests passing cleanly with 0 regressions.
+  - Live failover verified: OpenRouter 429 quota exhaustion immediately routes to FreeLLMAPI/Groq with 0 interruption.
+
+## 2026-11-01 — Multi-Provider AI Routing, Fault Tolerance & Pre-Deployment Hardening
+
+- **Multi-Provider Adapters & Auto-Discovery**:
+  - Implemented `FreeLLMAPIProvider` with health check, `/models` discovery, and automatic fallback.
+  - Enhanced `OpenAIProvider` with custom `OPENAI_BASE_URL`, `OPENAI_MODEL`, `/models` health checking, and capability inference for GPT-4o/o1/o3-mini.
+  - Enhanced `NvidiaProvider` supporting `NVIDIA_NIM_API_KEY`/`NVIDIA_API_KEY`, custom base URL, and tool-calling capability detection.
+  - Enhanced `ProviderFactory` with auto-discovery and priority ordering (`HARNESS_PROVIDER_PRIORITY`).
+  - Added custom base URL resolution across all providers in `CredentialResolver`.
+- **Intelligent Automatic Failover**:
+  - `FallbackEngine`: Fixed failover on 401/403 and account quota exhaustion so that when provider A fails, the chain switches seamlessly to the next provider instead of aborting the task.
+  - Handled 402 payment errors with model/provider rotation.
+  - Maintained request state, conversation history, and tool outputs intact across failovers.
+  - Multi-provider representation in `ModelRouter.select_models()`.
+- **Token Attribution & Safety**:
+  - Added provider and model token usage tracking and estimated cost accounting to `Task` and `AgentLoop`.
+- **Pre-Deployment CLI Diagnostics**:
+  - Implemented `harness providers status`, `harness providers test`, `harness config validate`, `harness models list --provider <name>`, and interactive `/providers` slash command.
+  - Completely updated `.env.example`.
+- **Comprehensive Automated Verification**:
+  - Verified across 25 unit tests covering multi-provider adapters, intelligent failover scenarios, token attribution, and CLI diagnostics.
+
+## 2026-10-30 — TaskForge Recovery & Runtime Timeout Resilience
+
+- **Harness Runtime Timeout Resilience**:
+  - `src/harness_core/runtime/runtime.py`: Fixed `AttributeError: type object 'TaskStatus' has no attribute 'PENDING'` during task timeout handling by using safe status transition `if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED): t.status = TaskStatus.FAILED`.
+- **TaskForge Recovery (`Desktop/New folder/app1`)**:
+  - **FastAPI Backend**:
+    - Added CORS middleware (`http://localhost:5173`, `*`).
+    - Added tag support, advanced filtering, and overdue logic (`is_task_overdue`) preventing `TypeError` between `date` and `datetime`.
+    - Added `/api/v1/stats` computing live metrics directly from SQLite persistence.
+    - Verified with `test_main.py` (6/6 pytest suites passing in 1.50s).
+  - **React 18 + Vite Frontend**:
+    - Implemented `Dashboard.tsx`, `KanbanBoard.tsx`, `TaskList.tsx`, `TaskModal.tsx`, `App.tsx`, and `api.ts`.
+    - Non-interactive `npm install` completed with 0 vulnerabilities.
+    - Production build (`npm run build`) succeeded with 0 errors in 4.21s.
+
+## 2026-10-29 — Harness CLI: Focused Terminal UX Refinement
+
+- **Tool Event Deduplication**:
+  - Attached `call_id` and `tool` to `ActivityItem`.
+  - Deduped concurrent `tool.call` (workflow) and `tool.started` events; updated item display without duplicating rows or double-incrementing tool calls.
+  - Guaranteed zero frozen spinners on `renderer.stop()` by sweeping active items to clean success/cancelled states.
+- **Responsive Markdown Table Compaction & Monokai Syntax**:
+  - Implemented `compact_markdown_tables()` in `conversation.py` to transform wide 4+ column tables or tables exceeding terminal width into clean bullet card structures on narrow/80-column consoles.
+  - Enabled Monokai syntax highlighting (`code_theme="monokai"`) for Rich Markdown code blocks.
+- **Vertical Whitespace Elimination**:
+  - Guarded consecutive empty lines in `_renderable()` via `_add_sep()`.
+  - Removed leading `\n` in `InteractiveShell._get_prompt_html()`, eliminating multi-line vertical gaps between turns.
+- **Completion Footer Declutter**:
+  - Omitted zero-token lines (`input_tokens == 0 and output_tokens == 0`).
+  - Suppressed "Verification" status line on read-only tasks without file modifications when not started.
+  - Omitted redundant phase duration breakdowns when fewer than 2 distinct phases took meaningful time (`>= 1.0s`).
+- **Responsive Command Tables**:
+  - Applied `box=box.SIMPLE, pad_edge=False` to `/help`, `/status`, `/model`, `/models`, and `/session` commands.
+  - In `/models`, conditionally hid `Source` and `Tools` columns on narrow screens (<90 cols) to prevent horizontal wrapping.
+- **Verification**:
+  - Added `TestRefinedTerminalUX` to `tests/unit/test_tui_ux.py` (48/48 passed).
+  - 242 tests passing across focused UX and session test suites.
+
+## 2026-10-28 — HARNESS NEXT: Intelligence, Memory, Reliability & Terminal UX Transformation
+
+- **Competitor Reverse-Engineering & Forensic Benchmark**:
+  - Analyzed locally installed CLI tools via REA: Claude Code (2.1.310), Qwen Code (0.25.0), OpenAI Codex CLI (0.159.2), Cursor CLI, and Freebuff CLI.
+  - Formulated `competitor_research_and_audit.md` mapping architectural patterns to Harness engineering.
+- **Session Intelligence, Checkpointing & Disk Reconciliation**:
+  - `src/harness_core/session/domain.py`: Added `ReconciliationReport` with full git, workspace, and checkpoint drift analysis. Added `context_file_hashes` tracking file SHA-256 digests.
+  - `src/harness_core/session/storage.py`: Added cross-session workspace memory retrieval (`get_project_memories`).
+  - `src/harness_core/session/manager.py`:
+    - Added `reconcile_workspace(session_id, workspace_path)` to detect modified/missing files, check git HEAD drift, flag stale verification, and produce a structured resume recap.
+    - Added `sync_memory_file(workspace_path)` maintaining `.harness/MEMORY.md`.
+    - Added `rename_session` and `get_latest_session`.
+    - Enabled seamless transitions when archiving active sessions.
+- **Interactive Shell Upgrades & Session Commands**:
+  - `src/harness_core/cli/interactive.py`:
+    - Implemented `expand_file_mentions(text, workspace)` supporting `@path/to/file` context attachments.
+    - Added slash commands: `/continue`, `/resume [id]`, `/recap`, `/new [title]`, `/rename <title>`, `/archive`, `/export [json|markdown]`, `/compact`, `/ask <query>`, `/plan <task>`, `/review`, and `/sessions`.
+    - Added checkpoint creation and `user.message` / `assistant.message` event logging during task execution.
+- **CLI Flag Integration**:
+  - `src/harness_core/cli/main.py`: Added `--continue` (`-c`) and `--resume <id>` (`-r`) options to root CLI callback and `harness shell`.
+- **Deterministic Verification**:
+  - Added `tests/unit/test_harness_next.py` (11/11 passed).
+  - Verified `tests/unit/test_session_m4.py` (51/51 passed).
+  - Verified `tests/unit/test_interactive_shell.py` (53/53 passed).
+  - All 261 targeted regression tests pass cleanly.
+
+- **Findings & Root Causes**:
+  - Investigated terminal rendering lifecycle across `conversation.py`, `interactive.py`, and `ui.py`.
+  - Authored `findings_report.md` artifact detailing root causes: tool failure opacity, disconnected console prints, Windows cp1252 charmap encoding errors, Rich markup tag stripping, and stale live spinner lines.
+- **Architectural Fixes**:
+  - `src/harness_core/cli/conversation.py`:
+    - Introduced `ActivityItem(tuple)` subclass to store `(icon, display, status)` while adding `exit_code`, `error`, and `detail` with 100% backward compatibility for all existing callers unpacking 3-tuples.
+    - Updated `complete_last()` and `tool_completed()` to accept `exit_code`, `error`, and `detail`.
+    - Enhanced `_renderable()`: when a tool fails, renders an indented diagnostic line with `Exit <code: int>` and the first line of stderr/error.
+    - Enhanced `stop()`: sets `self._active = False` before `self._live.update(self._renderable())` so the live spinner line disappears cleanly and does not freeze into the terminal scroll history.
+    - Enhanced `render_completion()`: accepts `verification_status`, `verification_summary`, and `unverified_files`; unified failure and verification reporting.
+    - Added `markup=False` to `_render_plain()` to prevent Rich from silently stripping square bracket markup like `[exit 2: ...]`.
+    - Made `_render_prompt()` check encoding and use ASCII fallback `>` in plain mode / charmap consoles to prevent `UnicodeEncodeError`.
+  - `src/harness_core/cli/interactive.py`:
+    - Updated `on_tool_result()`: extracts `exit_code`, `error`, `stderr`, and `metadata.diagnosis_reason`, passing them directly to `_conv().tool_completed()`.
+    - Updated `on_tool_terminal()`: forwards `error_class` to `_conv().tool_completed()`.
+    - Refactored `_execute_task()`: passes `error_detail`, `verification_status`, `verification_summary`, and `unverified_files` into `conv.render_completion()`, eliminating duplicate/disconnected console prints.
+  - `src/harness_core/cli/ui.py`:
+    - Tested comprehensive Unicode character set (`❯✓✗⚠⚡◆↳`) in `is_unicode_supported()` and added safe fallback constants across `Sym`.
+- **Deterministic Testing**:
+  - `tests/unit/test_tui_ux.py`: 42/42 tests passed (including all 17 Claude Code parity scenarios).
+  - `tests/unit/test_claude_ux_parity.py`: 12/12 tests passed.
+  - Full regression suite: **1,797 passed, 1 skipped in 84.48s**.
+  - CLI smoke test: `uv run harness --help` and import check passed cleanly.
+
+- **REA Reconnaissance & Specification**:
+  - Reverse-engineered local Claude Code binary (`claude.exe` 2.1.302, Bun standalone bundle) and user session transcripts (`.claude/projects/`).
+  - Created UX specification artifact (`claude_code_ux_spec.md`) documenting startup flow, minimal prompt, model wait states, tool execution, and compact summary footers.
+- **Terminal Architecture & Reliability Fixes**:
+  - `src/harness_core/cli/interactive.py`:
+    - Removed `self.console.clear()` on first task submission in `_execute_task` to prevent screen wipe and preserve scrollback history.
+    - Eliminated terminal auto-wrapping bug by replacing full-width divider `─ * width` with a minimal prompt: `\n<style fg="#06b6d4">❯</style> `.
+    - Propagated 9router indication to conversation renderer to suppress upstream model leakage in completion.
+    - Added `model.cooldown` event handler to transition stage to `Retrying model…` during rate limits.
+  - `src/harness_core/cli/conversation.py`:
+    - Added `_clean_intro_narration()` to strip redundant throat-clearing/filler prefixes so answers begin immediately with helpful content.
+    - Eliminated nested `Live` re-rendering flicker in `stream_response()` on zero-delay / completed responses by rendering directly via Markdown.
+    - Polished tool activity timeline: when no plan is present, tool activity aligns cleanly without orphaned tree branches (`├─ `).
+    - Added `set_9router()` and updated `render_completion()` to display `Model  ⚡ Routed through 9router` without leaking internal model IDs.
+  - `src/harness_core/agent/loop.py`:
+    - Added direct communication rule to system prompt to prevent conversational filler.
+  - `src/harness_core/cli/ui.py`:
+    - Added `is_unicode_supported()` terminal encoding check and `Sym.PROMPT = "❯"`.
+- **Deterministic Testing & Full Verification**:
+  - Added and expanded `TestTerminalReliabilityAndClaudeParity` in `tests/unit/test_tui_ux.py` (27 passed).
+  - Full suite: **1,890 passed, 5 skipped, 0 failures** in 117.07s.
+  - Smoke test: `uv run harness --help` passed cleanly.
+
 ## 2026-10-25 — Terminal UI Overhaul & Restaurant Website Coding Benchmark
 
 - **Branded Wordmark & Clean Visual Identity**:

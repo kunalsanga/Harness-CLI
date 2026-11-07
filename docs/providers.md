@@ -5,71 +5,79 @@ runtime consume the ModelProvider contract through ModelRouter. Provider
 adapters own API formats, credentials, discovery, streaming, tool-call
 translation, and HTTP error normalization.
 
+## Supported Providers
+
+Harness supports multi-provider routing with automatic failover across:
+1. **OpenRouter**: Default multi-model gateway with dynamic free routing (`OPENROUTER_API_KEY`).
+2. **OpenAI**: Direct integration supporting GPT-4o, o1, o3-mini, and compatible gateways (`OPENAI_API_KEY`, optional `OPENAI_BASE_URL`, `OPENAI_MODEL`).
+3. **Azure OpenAI**: Dedicated Azure endpoints and model deployments (`AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`).
+4. **Groq**: Ultra low-latency LPU inference for open models (`GROQ_API_KEY`, optional `GROQ_BASE_URL`, `GROQ_MODEL`).
+5. **NVIDIA NIM**: Enterprise-grade inference endpoints for open models (`NVIDIA_NIM_API_KEY` / `NVIDIA_API_KEY`, optional `NVIDIA_NIM_BASE_URL`, `NVIDIA_NIM_MODEL`).
+6. **FreeLLMAPI**: Free model provider with automatic discovery and fallbacks (`FREELLMAPI_API_KEY`, optional `FREELLMAPI_BASE_URL`, `FREELLMAPI_MODEL`).
+7. **Additional Providers**: Anthropic, Google Gemini, Ollama (local), 9router, LiteLLM, and arbitrary OpenAI-compatible endpoints.
+
 ## Configure providers
 
 Credentials are resolved by CredentialResolver from a provider environment
 variable, local .env, or the Harness credential store. Keep .env local and
-never commit it. Provider selection and endpoint/model metadata live in
-.harness/config.yaml:
+never commit it. Provider priority and fallback settings live in
+`.harness/config.yaml` or environment variables:
 
-    providers:
-      openrouter:
-        enabled: true
-      anthropic:
-        enabled: true
-        model: claude-sonnet-4-20250514
-        supports_tools: true
-        supports_streaming: true
-      local-qwen:
-        type: openai-compatible
-        enabled: true
-        endpoint: http://localhost:8000/v1
-        api_key_env: LOCAL_LLM_KEY
-        model: qwen
-        supports_tools: true
-        is_local: true
+```yaml
+providers:
+  openrouter:
+    enabled: true
+  nvidia:
+    enabled: true
+    model: meta/llama-3.1-70b-instruct
+  freellmapi:
+    enabled: true
+  openai:
+    enabled: true
+    model: gpt-4o
 
-    routing:
-      strategy: auto
-      allow_paid_models: false
+routing:
+  strategy: auto
+  allow_paid_models: false
+  provider_priority: ["openrouter", "nvidia", "freellmapi", "openai"]
+```
 
-Common credentials include OPENROUTER_API_KEY, OPENAI_API_KEY,
-ANTHROPIC_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY, and GROQ_API_KEY.
-Ollama can run without a key. allow_paid_models remains opt-in; use free or
-local models unless paid model selection is explicitly enabled.
+Common environment variables:
+- `HARNESS_PROVIDER_PRIORITY`: Comma-separated list (e.g. `openrouter,nvidia,freellmapi,openai`)
+- `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`
+- `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`
+- `FREELLMAPI_API_KEY`, `FREELLMAPI_BASE_URL`, `FREELLMAPI_MODEL`
+- `NVIDIA_NIM_API_KEY`, `NVIDIA_NIM_BASE_URL`, `NVIDIA_NIM_MODEL`
 
 Capabilities are tri-state. A missing capability declaration means unknown,
 not supported or unsupported. For adapters whose catalog does not report
-capabilities, declare them for configured models in the project configuration.
+capabilities, Harness infers known capabilities (e.g. tool calling and context
+length for known instruct/chat models) or uses project configuration.
 The router only selects a candidate when its required capabilities are
 affirmatively known.
 
-## Adapters
+## Adapters & Auto-Discovery
 
-The factory currently constructs OpenRouter, OpenAI, Anthropic, Gemini,
-NVIDIA, Groq, Ollama, 9router, LiteLLM, and named OpenAI-compatible endpoint
-adapters. Catalog discovery is adapter-specific; Anthropic and configured
-compatible endpoints can use static model metadata. OpenRouter's catalog is
-discovered at runtime, and its dynamic free route is provided as a normalized
-routing hint by the OpenRouter adapter.
+The provider factory auto-discovers configured providers with available credentials.
+Catalog discovery is adapter-specific; OpenRouter, NVIDIA NIM, FreeLLMAPI, and OpenAI
+dynamically discover models from their `/models` or `/health` endpoints when available.
 
-There is no requirement that every adapter implement the same features. A
-provider may return unknown capabilities or an empty catalog. This does not
-make its model eligible for a request that requires an unknown capability.
+## Intelligent Failover & Routing
 
-## Routing and failover
+The router constructs a multi-provider model chain according to task requirements,
+cost policies, and provider priority. FallbackEngine coordinates execution with
+automatic fault tolerance:
+- **Rate Limit (429) & Quota Exhaustion**: Provider marked degraded/exhausted; router fails over to the next candidate provider.
+- **Authentication Failure (401/403)**: Emits `model.failover` and switches to the next configured provider.
+- **Model-Specific Payment Required (402)**: Rotates to the next candidate model or provider.
+- **Timeouts & Transient Network Errors (5xx)**: Exponential backoff with retry before rotating candidate.
+- **State Preservation**: Request messages, task state, and tool results are preserved intact across failover transitions.
+- **Token Usage Attribution**: Token counts and estimated costs are tracked and attributed per provider and per model on the Task.
 
-The router scores normalized ModelInfo candidates and filters by task
-requirements, health, free/local mode, and the explicit paid-model policy.
-FallbackEngine consumes provider-neutral error categories. Temporary
-availability, rate-limit, network, and timeout failures can use bounded
-failover. Authentication, invalid-request, payment, and tool errors do not
-cause open-ended model rotation. Calls retain the same request messages and
-task context across candidate attempts.
+## Pre-Deployment Verification Commands
 
-OpenRouter is the default adapter when a project has no explicit provider
-configuration. It is not a dependency of the agent, planner, scheduler, or
-router.
-
-Useful commands: harness providers list; harness providers configure <name>;
-harness models list; harness doctor.
+- `harness providers status`: Display status table with health, masked credentials, base URLs, and model count.
+- `harness providers test`: Non-destructive connectivity and latency probe across all configured providers.
+- `harness config validate`: Validate configuration files, priority order, and credentials without executing tasks.
+- `harness models list --provider <name>`: Discover and list models for a specific provider.
+- Interactive TUI: `/providers` and `/provider <name>` slash commands.

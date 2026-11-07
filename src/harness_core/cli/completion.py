@@ -331,6 +331,8 @@ class CompletionFormatter:
             out.append("Verification")
             if verification_status in ("passed", "not_started"):
                 out.append(f"  ✓ {verification_status.replace('_', ' ').title()}")
+            elif verification_status == "skipped":
+                out.append("  - Not applicable (read-only task)")
             else:
                 out.append(f"  ✗ {verification_status.replace('_', ' ').title()}")
             out.append("")

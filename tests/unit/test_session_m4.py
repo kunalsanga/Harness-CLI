@@ -541,3 +541,110 @@ class TestMemoryTypes:
         assert MemoryType.DECISION.value == "decision"
         assert MemoryType.TODO.value == "todo"
         assert MemoryType.WARNING.value == "warning"
+
+
+class TestReconciliationAndCommands:
+    """Test safe resume and workspace reconciliation."""
+
+    def test_rename_session(self, tmp_path):
+        mgr = SessionManager(SessionStorage(tmp_path / "test.db"))
+        s = mgr.create_session(title="Old Title")
+        renamed = mgr.rename_session(s.session_id, "New Strategic Goal")
+        assert renamed.title == "New Strategic Goal"
+        fetched = mgr.storage.get_session(s.session_id)
+        assert fetched.title == "New Strategic Goal"
+
+    def test_get_latest_session(self, tmp_path):
+        mgr = SessionManager(SessionStorage(tmp_path / "test.db"))
+        ws = str(tmp_path)
+        s1 = mgr.create_session(workspace_path=ws, title="Session 1")
+        time.sleep(0.01)
+        s2 = mgr.create_session(workspace_path=ws, title="Session 2")
+        latest = mgr.get_latest_session(workspace_path=ws)
+        assert latest is not None
+        assert latest.session_id == s2.session_id
+
+    def test_reconcile_workspace_clean(self, tmp_path):
+        mgr = SessionManager(SessionStorage(tmp_path / "test.db"))
+        ws = tmp_path / "project"
+        ws.mkdir()
+        code_file = ws / "main.py"
+        code_file.write_text("print('hello')", encoding="utf-8")
+        import hashlib
+        h = hashlib.sha256(b"print('hello')").hexdigest()
+
+        s = mgr.create_session(workspace_path=str(ws), title="Dev Work")
+        r = mgr.start_run(s.session_id, "Implement feature")
+        mgr.create_checkpoint(
+            session_id=s.session_id,
+            run_id=r.run_id,
+            changed_files=["main.py"],
+            verification_status="passed",
+            tests_passing=5,
+            tests_total=5,
+        )
+        # Store context file hashes
+        cp = mgr.storage.get_latest_checkpoint(s.session_id)
+        cp.context_file_hashes = {"main.py": h}
+        mgr.storage.delete_session(s.session_id)  # Clean & re-insert or update
+        mgr.storage.create_session(s)
+        mgr.storage.create_run(r)
+        mgr.storage.create_checkpoint(cp)
+
+        report = mgr.reconcile_workspace(s.session_id, str(ws))
+        assert report.session_id == s.session_id
+        assert len(report.externally_modified_files) == 0
+        assert len(report.missing_files) == 0
+        assert not report.stale_tests
+        assert "Session Resume" in report.recap
+
+    def test_reconcile_workspace_detects_external_modifications(self, tmp_path):
+        mgr = SessionManager(SessionStorage(tmp_path / "test.db"))
+        ws = tmp_path / "project"
+        ws.mkdir()
+        code_file = ws / "app.py"
+        code_file.write_text("def run(): pass", encoding="utf-8")
+        import hashlib
+        old_hash = hashlib.sha256(b"def run(): pass").hexdigest()
+
+        s = mgr.create_session(workspace_path=str(ws), title="App Dev")
+        r = mgr.start_run(s.session_id, "Build app")
+        cp = mgr.create_checkpoint(
+            session_id=s.session_id,
+            run_id=r.run_id,
+            changed_files=["app.py"],
+            verification_status="passed",
+        )
+        # Update checkpoint with hash
+        cp.context_file_hashes = {"app.py": old_hash}
+        with mgr.storage._get_conn() as conn:
+            import json
+            conn.execute("UPDATE checkpoints SET context_file_hashes = ? WHERE checkpoint_id = ?",
+                         (json.dumps(cp.context_file_hashes), cp.checkpoint_id))
+
+        # External change by user
+        code_file.write_text("def run(): raise RuntimeError('Manual edit')", encoding="utf-8")
+
+        report = mgr.reconcile_workspace(s.session_id, str(ws))
+        assert "app.py" in report.externally_modified_files
+        assert report.stale_tests is True
+        assert "External Modifications: app.py" in report.recap
+
+    def test_reconcile_workspace_detects_missing_files(self, tmp_path):
+        mgr = SessionManager(SessionStorage(tmp_path / "test.db"))
+        ws = tmp_path / "project"
+        ws.mkdir()
+
+        s = mgr.create_session(workspace_path=str(ws), title="App Dev")
+        r = mgr.start_run(s.session_id, "Create deleted file")
+        mgr.create_checkpoint(
+            session_id=s.session_id,
+            run_id=r.run_id,
+            changed_files=["deleted.py"],
+            verification_status="passed",
+        )
+
+        report = mgr.reconcile_workspace(s.session_id, str(ws))
+        assert "deleted.py" in report.missing_files
+        assert report.stale_tests is True
+        assert "Missing Files: deleted.py" in report.recap

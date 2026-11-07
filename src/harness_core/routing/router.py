@@ -9,6 +9,7 @@ Supports multiple providers.
 from __future__ import annotations
 
 import inspect
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
@@ -54,11 +55,27 @@ class RouterConfig:
     routing_mode: str = "auto"  # auto, free, best, fast, local, cheap
     prefer_free: bool = False
     allow_paid_models: bool = False
+    provider_priority: list[str] = field(default_factory=list)
     scoring_weights: ScoringWeights = field(default_factory=ScoringWeights)
     fallback: FallbackConfig = field(default_factory=FallbackConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     # Maximum models to consider in the fallback chain
-    max_fallback_chain: int = 4
+    max_fallback_chain: int = 8
+
+    def __post_init__(self) -> None:
+        if not self.allow_paid_models:
+            env_val = os.environ.get("HARNESS_ALLOW_PAID_MODELS", "").strip().lower()
+            if env_val in ("1", "true", "yes", "on"):
+                self.allow_paid_models = True
+        if not self.provider_priority and os.environ.get("HARNESS_PROVIDER_PRIORITY"):
+            self.provider_priority = [
+                p.strip().lower()
+                for p in os.environ.get("HARNESS_PROVIDER_PRIORITY", "").split(",")
+                if p.strip()
+            ]
+        env_chain = os.environ.get("HARNESS_MAX_FALLBACK_CHAIN")
+        if env_chain and env_chain.strip().isdigit():
+            self.max_fallback_chain = max(1, int(env_chain.strip()))
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RouterConfig:
@@ -67,20 +84,34 @@ class RouterConfig:
         budget_data = data.get("budget", {})
         fallback_data = data.get("fallback", {})
 
+        allow_paid = data.get("allow_paid_models")
+        if allow_paid is None:
+            env_val = os.environ.get("HARNESS_ALLOW_PAID_MODELS", "").strip().lower()
+            allow_paid = env_val in ("1", "true", "yes", "on")
+
+        priority = data.get("provider_priority") or data.get("providers_priority") or []
+        if not priority and os.environ.get("HARNESS_PROVIDER_PRIORITY"):
+            priority = [
+                p.strip().lower()
+                for p in os.environ.get("HARNESS_PROVIDER_PRIORITY", "").split(",")
+                if p.strip()
+            ]
+
         return cls(
             routing_mode=data.get("routing_mode", "auto"),
             prefer_free=data.get("prefer_free", False),
-            allow_paid_models=data.get("allow_paid_models", False),
+            allow_paid_models=allow_paid,
+            provider_priority=priority,
             scoring_weights=ScoringWeights(**weights_data) if weights_data else ScoringWeights(),
             budget=BudgetConfig.from_dict(budget_data) if budget_data else BudgetConfig(),
             fallback=FallbackConfig(
-                max_fallback_models=fallback_data.get("max_fallback_models", 3),
+                max_fallback_models=fallback_data.get("max_fallback_models", 5),
                 model_attempt_timeout_seconds=fallback_data.get(
                     "model_attempt_timeout_seconds", 90.0
                 ),
                 total_timeout_seconds=fallback_data.get("total_timeout_seconds", 120.0),
             ) if fallback_data else FallbackConfig(),
-            max_fallback_chain=data.get("max_fallback_chain", 4),
+            max_fallback_chain=data.get("max_fallback_chain", 8),
         )
 
 
@@ -473,7 +504,35 @@ class ModelRouter:
             return True
 
         limit = self.config.max_fallback_chain
-        for model, score in ranked[:limit]:
+
+        # Sort ranked candidates respecting provider_priority if configured
+        if self.config.provider_priority:
+            def _prov_idx(m: ModelInfo) -> int:
+                return self.config.provider_priority.index(m.provider) if m.provider in self.config.provider_priority else 99
+            ranked_sorted = sorted(ranked, key=lambda item: (_prov_idx(item[0]), -item[1]))
+        else:
+            ranked_sorted = ranked
+
+        # Multi-provider interleaving:
+        # Guarantee that distinct healthy providers are at the front of the fallback chain
+        # so that if the primary provider hits 429, timeout, or outage, the VERY NEXT model tried
+        # belongs to an alternative provider rather than exhausting retries on the same broken provider.
+        providers_present = {m.provider for m, _ in ranked_sorted}
+        if len(providers_present) > 1 and limit > 1:
+            diverse_ranked: list[tuple[ModelInfo, float]] = []
+            used_providers: set[str] = set()
+            for model, score in ranked_sorted:
+                if model.provider not in used_providers:
+                    diverse_ranked.append((model, score))
+                    used_providers.add(model.provider)
+            for model, score in ranked_sorted:
+                if (model.provider, model.id) not in {(m.provider, m.id) for m, _ in diverse_ranked}:
+                    diverse_ranked.append((model, score))
+            ordered_ranked = diverse_ranked
+        else:
+            ordered_ranked = ranked_sorted
+
+        for model, score in ordered_ranked[:limit]:
             await _try_add(model, score)
 
         # Free-model safety net (non-free modes): paid models may require
@@ -491,6 +550,28 @@ class ModelRouter:
                         continue
                     if await _try_add(model, score):
                         free_in_chain += 1
+
+        # Multi-provider failover readiness:
+        # If multiple distinct providers are available, ensure alternative providers
+        # are represented in the fallback chain so that provider-level failure
+        # (e.g. rate limit, credits exhausted, auth error) triggers automatic failover
+        # to an alternative provider rather than failing the task.
+        distinct_available_providers = {m.provider for m in filtered if self.providers.get(m.provider)}
+        chain_providers = {p.name for _, p in chain}
+        missing_providers = distinct_available_providers - chain_providers
+        if missing_providers and len(chain) < limit + 3:
+            # Sort missing providers by provider_priority if set
+            sorted_missing = list(missing_providers)
+            if self.config.provider_priority:
+                sorted_missing.sort(
+                    key=lambda p: self.config.provider_priority.index(p)
+                    if p in self.config.provider_priority
+                    else 99
+                )
+            for prov in sorted_missing:
+                prov_models = [m for m, _ in ranked if m.provider == prov and (prov, m.id) not in chain_ids]
+                if prov_models:
+                    await _try_add(prov_models[0], 0.75)
 
         if not chain:
             if active_routing_mode == "free":
@@ -521,11 +602,20 @@ class ModelRouter:
         concrete_models = [m for m in free_models if "dynamic-route" not in m.tags]
         dynamic_models = [m for m in free_models if "dynamic-route" in m.tags]
 
-        concrete_models.sort(key=lambda model: (
-            -model.context_window,
-            model.provider,
-            model.id,
-        ))
+        if self.config.provider_priority:
+            def _prov_rank(p: str) -> int:
+                return self.config.provider_priority.index(p) if p in self.config.provider_priority else 99
+            concrete_models.sort(key=lambda model: (
+                _prov_rank(model.provider),
+                -model.context_window,
+                model.id,
+            ))
+        else:
+            concrete_models.sort(key=lambda model: (
+                -model.context_window,
+                model.provider,
+                model.id,
+            ))
 
         max_chain = self.config.max_fallback_chain
 

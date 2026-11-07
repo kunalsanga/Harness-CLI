@@ -509,6 +509,10 @@ WORKSPACE RULES:
   tech stack, file names, test commands). Discover it yourself.
 - Inspect relevant files BEFORE modifying them.
 - Prefer acting over explaining. Do not answer a coding task with prose only.
+- DIRECT COMMUNICATION: Jump straight to the answer, explanation, or code.
+  NEVER start responses with meta-narration or throat-clearing (e.g. "Based on my analysis of the codebase...",
+  "Let me provide a comprehensive explanation...", "Certainly, I'll explain...", "I have examined the files...").
+  Begin directly with the top-level heading, key findings, or solution.
 
 CRITICAL: You MUST produce a text response (your final answer) after gathering
 enough information. Do NOT keep calling tools indefinitely. Once you have read
@@ -2073,6 +2077,14 @@ When you are done, summarize what you did and provide evidence of success."""
                 f"{call.tool_name} is not permitted. Use read-only tools only."
             )
 
+        # Read-only inspection budget: prevent runaway tool recursion on explanation tasks.
+        if self._is_read_only_task and self._readonly_tool_calls >= 18:
+            return ToolResults.error(
+                "Read-only inspection budget reached (18 operations). You have sufficient context. "
+                "Do not call any more tools; synthesize your findings and produce your final text response.",
+                retryable=False,
+            )
+
         # Check if this exact call was already denied
         if self._check_repeated_deny(call):
             self._consecutive_denials += 1
@@ -2665,6 +2677,10 @@ When you are done, summarize what you did and provide evidence of success."""
                 )
                 if plan_result.succeeded and plan_result.response:
                     plan_text = plan_result.response.content or ""
+                    if plan_result.model_used and plan_result.model_used not in task.models_used:
+                        task.models_used.append(plan_result.model_used)
+                    if plan_result.provider_used and plan_result.provider_used not in task.providers_used:
+                        task.providers_used.append(plan_result.provider_used)
                 else:
                     plan_text = ""
             else:
@@ -2703,7 +2719,7 @@ When you are done, summarize what you did and provide evidence of success."""
             if intent.read_only:
                 plan_steps = [
                     s for s in plan_steps
-                    if todo_category(s) == "inspect" or is_read_only_verb(s)
+                    if todo_category(s) in ("inspect", "summarize") or is_read_only_verb(s)
                 ]
                 if not plan_steps:
                     plan_steps = [
@@ -2836,6 +2852,8 @@ When you are done, summarize what you did and provide evidence of success."""
                     self._last_model_used = fallback_result.model_used
                     if fallback_result.model_used and fallback_result.model_used not in task.models_used:
                         task.models_used.append(fallback_result.model_used)
+                    if fallback_result.provider_used and fallback_result.provider_used not in task.providers_used:
+                        task.providers_used.append(fallback_result.provider_used)
                     if prev_model and fallback_result.model_used and fallback_result.model_used != prev_model:
                         task.model_fallbacks += 1
                         await self.event_bus.emit(
@@ -2845,6 +2863,7 @@ When you are done, summarize what you did and provide evidence of success."""
                                 data={
                                     "from": prev_model,
                                     "to": fallback_result.model_used,
+                                    "provider": fallback_result.provider_used,
                                     "reason": "unavailable",
                                 },
                             )
@@ -2941,6 +2960,20 @@ When you are done, summarize what you did and provide evidence of success."""
                 "estimated": task.tokens_estimated,
             }
 
+            # Attribute tokens to provider and model
+            curr_prov = getattr(response, "provider", "") or (fallback_result.provider_used if 'fallback_result' in locals() and fallback_result else "")
+            curr_mod = getattr(response, "model", "") or (fallback_result.model_used if 'fallback_result' in locals() and fallback_result else "")
+            if curr_prov:
+                if curr_prov not in task.provider_token_usage:
+                    task.provider_token_usage[curr_prov] = {"input_tokens": 0, "output_tokens": 0}
+                task.provider_token_usage[curr_prov]["input_tokens"] += int(in_tok or 0)
+                task.provider_token_usage[curr_prov]["output_tokens"] += int(out_tok or 0)
+            if curr_mod:
+                if curr_mod not in task.model_token_usage:
+                    task.model_token_usage[curr_mod] = {"input_tokens": 0, "output_tokens": 0}
+                task.model_token_usage[curr_mod]["input_tokens"] += int(in_tok or 0)
+                task.model_token_usage[curr_mod]["output_tokens"] += int(out_tok or 0)
+
             model_duration = time.monotonic() - model_attempt_started
             task.execution_timeline.record_model_attempt(model_duration)
             await self._emit_semantic(
@@ -2985,15 +3018,19 @@ When you are done, summarize what you did and provide evidence of success."""
                 # Execute tool calls
                 for tool_call_data in tool_calls_to_process:
                     await self._transition_execution(ExecutionState.WORKING)
-                    func = tool_call_data.get("function", {}) if isinstance(tool_call_data, dict) else {}
-                    tool_name = func.get("name", "") if isinstance(func, dict) else ""
-                    raw_args = func.get("arguments", "{}") if isinstance(func, dict) else "{}"
-                    if not tool_name and isinstance(tool_call_data, dict):
-                        tool_name = tool_call_data.get("name") or tool_call_data.get("tool", "")
-                        raw_args = tool_call_data.get("arguments") or tool_call_data.get("args", "{}")
-
                     import uuid as _uuid
-                    call_id = tool_call_data.get("id") or f"call_{_uuid.uuid4().hex[:8]}"
+                    if hasattr(tool_call_data, "tool_name"):
+                        tool_name = tool_call_data.tool_name
+                        raw_args = tool_call_data.arguments
+                        call_id = getattr(tool_call_data, "id", "") or f"call_{_uuid.uuid4().hex[:8]}"
+                    else:
+                        func = tool_call_data.get("function", {}) if isinstance(tool_call_data, dict) else {}
+                        tool_name = func.get("name", "") if isinstance(func, dict) else ""
+                        raw_args = func.get("arguments", "{}") if isinstance(func, dict) else "{}"
+                        if not tool_name and isinstance(tool_call_data, dict):
+                            tool_name = tool_call_data.get("name") or tool_call_data.get("tool", "")
+                            raw_args = tool_call_data.get("arguments") or tool_call_data.get("args", "{}")
+                        call_id = (tool_call_data.get("id") if isinstance(tool_call_data, dict) else "") or f"call_{_uuid.uuid4().hex[:8]}"
                     parsed_args: dict[str, Any] = {}
                     parse_err: str | None = None
                     if isinstance(raw_args, dict):
@@ -3392,17 +3429,21 @@ When you are done, summarize what you did and provide evidence of success."""
                     # Any write resets the read-only counter
                     self._readonly_tool_calls = 0
 
-                if self._readonly_tool_calls >= _MAX_READONLY_TOOL_CALLS:
-                    # Read-only tasks (explain/analyze/research) are expected to
-                    # read many files — do not force them to stop reading.
-                    if not _is_read_only_task:
-                        self._corrections.append(
-                            f"You have made {self._readonly_tool_calls} read-only tool calls "
-                            "without modifying any files. STOP calling tools and produce "
-                            "your final text response NOW. Summarize what you found and "
-                            "answer the user's question. Do not call any more tools."
-                        )
-                        self._readonly_tool_calls = 0  # Reset so we don't spam
+                _MAX_EXPLAIN_TOOL_CALLS = 12
+                if _is_read_only_task and self._readonly_tool_calls >= _MAX_EXPLAIN_TOOL_CALLS:
+                    self._corrections.append(
+                        f"You have performed {self._readonly_tool_calls} read operations. You now have "
+                        "sufficient project context for this explanation. STOP calling tools now and produce "
+                        "your comprehensive final text response summarizing your findings."
+                    )
+                elif not _is_read_only_task and self._readonly_tool_calls >= _MAX_READONLY_TOOL_CALLS:
+                    self._corrections.append(
+                        f"You have made {self._readonly_tool_calls} read-only tool calls "
+                        "without modifying any files. STOP calling tools and produce "
+                        "your final text response NOW. Summarize what you found and "
+                        "answer the user's question. Do not call any more tools."
+                    )
+                    self._readonly_tool_calls = 0  # Reset so we don't spam
 
             # Diagnosis mode budget: never loop forever in diagnosis
             if self._diagnosis_active:

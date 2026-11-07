@@ -25,9 +25,21 @@ class NvidiaProvider(ModelProvider):
         else:
             from harness_core.config.credentials import CredentialResolver
             credential = CredentialResolver().resolve("nvidia")
-            self.api_key = credential.api_key if credential else ""
-        self.base_url = base_url or os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-        self.default_model = default_model or os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k3")
+            self.api_key = (
+                credential.api_key
+                if credential and credential.api_key
+                else os.environ.get("NVIDIA_NIM_API_KEY") or os.environ.get("NVIDIA_API_KEY", "")
+            )
+        self.base_url = (
+            base_url
+            or os.environ.get("NVIDIA_NIM_BASE_URL")
+            or os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+        ).rstrip("/")
+        self.default_model = (
+            default_model
+            or os.environ.get("NVIDIA_NIM_MODEL")
+            or os.environ.get("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
+        )
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -117,6 +129,18 @@ class NvidiaProvider(ModelProvider):
         """List available models. 
         NVIDIA NIM hosts many models. Here we expose configured models or fetch from /models.
         """
+        def _supports_tools(m_id: str) -> bool:
+            low = m_id.lower()
+            return any(k in low for k in ("instruct", "chat", "coder", "nemotron", "llama-3", "mixtral", "qwen", "kimi"))
+
+        def _context_window(m_id: str) -> int:
+            low = m_id.lower()
+            if "llama-3.1" in low or "llama-3.3" in low or "nemotron" in low or "qwen2.5" in low:
+                return 128000
+            if "mixtral" in low:
+                return 32768
+            return 16384
+
         try:
             client = await self._get_client()
             response = await client.get("/models")
@@ -133,11 +157,12 @@ class NvidiaProvider(ModelProvider):
                         id=model_id,
                         name=model_id,
                         provider=self.name,
-                        supports_tools=None,
+                        context_window=_context_window(model_id),
+                        supports_tools=_supports_tools(model_id),
                         supports_streaming=True,
                         cost_per_1k_input=0.0,
                         cost_per_1k_output=0.0,
-                        is_free=False,
+                        is_free=True,
                     )
                 )
             
@@ -149,15 +174,45 @@ class NvidiaProvider(ModelProvider):
                         id=configured_model,
                         name=configured_model,
                         provider=self.name,
-                        supports_tools=None,
+                        context_window=_context_window(configured_model),
+                        supports_tools=_supports_tools(configured_model),
                         supports_streaming=True,
+                        is_free=True,
                     )
                 )
 
             return models
         except Exception:
-            # Fallback to a hardcoded list if /models endpoint is not available or fails
-            return []
+            # Fallback to standard NVIDIA NIM catalog when discovery is offline/unauthenticated
+            return [
+                ModelInfo(
+                    id="meta/llama-3.1-70b-instruct",
+                    name="Llama 3.1 70B Instruct (NVIDIA NIM)",
+                    provider=self.name,
+                    context_window=128000,
+                    supports_tools=True,
+                    supports_streaming=True,
+                    is_free=True,
+                ),
+                ModelInfo(
+                    id="nvidia/llama-3.1-nemotron-70b-instruct",
+                    name="Llama 3.1 Nemotron 70B (NVIDIA NIM)",
+                    provider=self.name,
+                    context_window=128000,
+                    supports_tools=True,
+                    supports_streaming=True,
+                    is_free=True,
+                ),
+                ModelInfo(
+                    id="mistralai/mixtral-8x22b-instruct-v0.1",
+                    name="Mixtral 8x22B Instruct (NVIDIA NIM)",
+                    provider=self.name,
+                    context_window=65536,
+                    supports_tools=True,
+                    supports_streaming=True,
+                    is_free=True,
+                ),
+            ]
 
     async def health_check(self) -> bool:
         """Check if provider is available by verifying auth and endpoint.

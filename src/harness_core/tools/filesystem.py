@@ -46,6 +46,11 @@ class ReadFileTool(Tool):
                     retryable=False,
                 )
             if not path.is_file():
+                if path.is_dir():
+                    return ToolResults.error(
+                        f"Cannot read '{path}': it is a directory, not a file. Use list_files to inspect directory contents.",
+                        retryable=False,
+                    )
                 return ToolResults.error(
                     f"Not a file: {path}",
                     retryable=False,

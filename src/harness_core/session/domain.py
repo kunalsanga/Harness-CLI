@@ -29,6 +29,7 @@ class SessionStatus(enum.Enum):
     FAILED = "failed"
     ABORTED = "aborted"
     ARCHIVED = "archived"
+    INTERRUPTED = "interrupted"
 
 
 class RunStatus(enum.Enum):
@@ -56,12 +57,13 @@ class MemoryType(enum.Enum):
 
 # Session: which transitions are legal
 SESSION_TRANSITIONS: dict[SessionStatus, set[SessionStatus]] = {
-    SessionStatus.ACTIVE: {SessionStatus.PAUSED, SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.ABORTED},
+    SessionStatus.ACTIVE: {SessionStatus.PAUSED, SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.ABORTED, SessionStatus.INTERRUPTED},
     SessionStatus.PAUSED: {SessionStatus.ACTIVE, SessionStatus.ABORTED, SessionStatus.ARCHIVED},
-    SessionStatus.COMPLETED: {SessionStatus.ARCHIVED},  # can archive, but not restart
+    SessionStatus.COMPLETED: {SessionStatus.ACTIVE, SessionStatus.ARCHIVED},  # allow continuing completed work
     SessionStatus.FAILED: {SessionStatus.ACTIVE, SessionStatus.ARCHIVED},  # allow retry
     SessionStatus.ABORTED: {SessionStatus.ARCHIVED},
     SessionStatus.ARCHIVED: set(),  # terminal
+    SessionStatus.INTERRUPTED: {SessionStatus.ACTIVE, SessionStatus.ARCHIVED},  # allow resuming interrupted sessions
 }
 
 RUN_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
@@ -239,6 +241,7 @@ class Checkpoint:
             "tests_passing": self.tests_passing,
             "tests_total": self.tests_total,
             "context_files": self.context_files,
+            "context_file_hashes": self.context_file_hashes,
             "repository_summary": self.repository_summary,
         }
 
@@ -288,4 +291,48 @@ class SessionEvent:
             "event_type": self.event_type,
             "timestamp": self.timestamp,
             "data": self.data,
+        }
+
+
+@dataclass
+class ReconciliationReport:
+    """Outcome of inspecting and reconciling workspace state upon session resume."""
+
+    session_id: str
+    workspace_path: str
+    session_title: str = ""
+    git_head: str = ""
+    git_branch: str = ""
+    git_dirty: bool = False
+    head_matches: bool = True
+    externally_modified_files: list[str] = field(default_factory=list)
+    missing_files: list[str] = field(default_factory=list)
+    stale_tests: bool = False
+    last_task: str = ""
+    last_outcome: str = ""
+    verification_status: str = ""
+    completed_steps: list[str] = field(default_factory=list)
+    unresolved_steps: list[str] = field(default_factory=list)
+    recommended_action: str = ""
+    recap: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "workspace_path": self.workspace_path,
+            "session_title": self.session_title,
+            "git_head": self.git_head,
+            "git_branch": self.git_branch,
+            "git_dirty": self.git_dirty,
+            "head_matches": self.head_matches,
+            "externally_modified_files": self.externally_modified_files,
+            "missing_files": self.missing_files,
+            "stale_tests": self.stale_tests,
+            "last_task": self.last_task,
+            "last_outcome": self.last_outcome,
+            "verification_status": self.verification_status,
+            "completed_steps": self.completed_steps,
+            "unresolved_steps": self.unresolved_steps,
+            "recommended_action": self.recommended_action,
+            "recap": self.recap,
         }

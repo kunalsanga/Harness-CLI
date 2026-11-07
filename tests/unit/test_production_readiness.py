@@ -180,7 +180,7 @@ class TestFallbackEngine:
         provider1.generate = AsyncMock(side_effect=Exception("401 Unauthorized"))
 
         provider2 = MagicMock()
-        provider2.name = "p2"
+        provider2.name = "p1"
         provider2.generate = AsyncMock(return_value=CompletionResponse(
             content="success",
             usage={"prompt_tokens": 10, "completion_tokens": 5},

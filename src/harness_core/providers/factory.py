@@ -10,30 +10,36 @@ from harness_core.config.credentials import CredentialResolver
 from harness_core.providers.base import ModelProvider
 
 
-def _provider_configs(raw: Any, auto_discover: bool = False) -> list[dict[str, Any]]:
-    if not raw:
-        if auto_discover:
-            resolver = CredentialResolver()
-            discovered = []
-            for cred in resolver.list_configured_providers():
-                if cred.provider in {"openrouter", "groq", "gemini", "anthropic", "openai", "nvidia"}:
-                    discovered.append({"id": cred.provider, "enabled": True})
-            if discovered:
-                # Ensure openrouter is first if present, followed by alternative providers
-                openrouter_entry = [d for d in discovered if d["id"] == "openrouter"]
-                other_entries = [d for d in discovered if d["id"] != "openrouter"]
-                return openrouter_entry + other_entries
-        # Preserve the existing default until users choose another provider.
-        return [{"id": "openrouter", "enabled": True}]
+def _provider_configs(raw: Any, auto_discover: bool = False, priority: list[str] | None = None) -> list[dict[str, Any]]:
+    entries_by_id: dict[str, dict[str, Any]] = {}
+
     if isinstance(raw, dict):
-        entries = []
         for name, value in raw.items():
             config = dict(value) if isinstance(value, dict) else {}
-            entries.append({"id": name, **config})
-        return entries
-    if isinstance(raw, list):
-        return [dict(item) for item in raw if isinstance(item, dict) and item.get("id")]
-    raise ValueError("providers configuration must be a mapping or list")
+            entries_by_id[str(name).strip().lower()] = {"id": name, **config}
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and item.get("id"):
+                name = str(item["id"]).strip().lower()
+                entries_by_id[name] = dict(item)
+    elif raw:
+        raise ValueError("providers configuration must be a mapping or list")
+
+    if auto_discover:
+        resolver = CredentialResolver()
+        for cred in resolver.list_configured_providers():
+            p_name = cred.provider.strip().lower()
+            if p_name in {"openrouter", "openai", "azure", "nvidia", "freellmapi", "groq", "gemini", "anthropic"}:
+                if p_name not in entries_by_id:
+                    entries_by_id[p_name] = {"id": p_name, "enabled": True}
+
+    if not entries_by_id:
+        return [{"id": "openrouter", "enabled": True}]
+
+    entries = list(entries_by_id.values())
+    preferred_order = priority or ["openrouter", "openai", "azure", "nvidia", "freellmapi", "groq", "anthropic", "gemini"]
+    entries.sort(key=lambda d: preferred_order.index(d["id"].strip().lower()) if d["id"].strip().lower() in preferred_order else 99)
+    return entries
 
 
 def load_project_provider_config(project_root: str | Path) -> dict[str, Any]:
@@ -81,7 +87,11 @@ def create_providers(
     from harness_core.providers.openrouter import OpenRouterProvider
 
     root = config or {}
-    configured = _provider_configs(root.get("providers"), auto_discover=auto_discover)
+    priority_list = root.get("providers_priority") or root.get("provider_priority")
+    if not priority_list and os.environ.get("HARNESS_PROVIDER_PRIORITY"):
+        priority_list = [p.strip().lower() for p in os.environ.get("HARNESS_PROVIDER_PRIORITY", "").split(",") if p.strip()]
+
+    configured = _provider_configs(root.get("providers"), auto_discover=auto_discover, priority=priority_list)
     selected = set(provider_ids or [])
     resolver = CredentialResolver()
     providers: list[ModelProvider] = []
@@ -111,6 +121,12 @@ def create_providers(
             provider = OpenRouterProvider(api_key=api_key, base_url=endpoint, default_model=model)
         elif name == "openai":
             provider = OpenAIProvider(**options)
+        elif name in {"azure", "azure-openai", "azure_openai"}:
+            from harness_core.providers.azure import AzureOpenAIProvider
+            provider = AzureOpenAIProvider(api_key=api_key, base_url=endpoint, default_model=model)
+        elif name == "freellmapi":
+            from harness_core.providers.freellmapi import FreeLLMAPIProvider
+            provider = FreeLLMAPIProvider(api_key=api_key, base_url=endpoint, default_model=model)
         elif name == "anthropic":
             provider = AnthropicProvider(api_key=api_key, base_url=endpoint or "https://api.anthropic.com", default_model=model or "claude-sonnet-4-20250514")
         elif name in {"gemini", "google"}:

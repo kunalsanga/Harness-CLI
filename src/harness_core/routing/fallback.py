@@ -43,6 +43,11 @@ class ErrorClassification(Enum):
 def classify_error(error: Exception) -> ErrorClassification:
     """Classify an error to determine retry strategy."""
     if isinstance(error, ProviderRequestError):
+        error_low = str(error).lower()
+        if any(phrase in error_low for phrase in (
+            "context window", "context length", "maximum context", "too many tokens", "prompt is too long"
+        )):
+            return ErrorClassification.CONTEXT_OVERFLOW
         return {
             ProviderErrorCategory.AUTHENTICATION: ErrorClassification.PERMANENT,
             ProviderErrorCategory.PERMISSION: ErrorClassification.PERMISSION_DENIED,
@@ -62,6 +67,13 @@ def classify_error(error: Exception) -> ErrorClassification:
     # Model-specific permission/policy restrictions (e.g. app whitelisting)
     if any(phrase in error_str for phrase in ("only available on", "restricted_model", "permission_denied")):
         return ErrorClassification.PERMISSION_DENIED
+
+    # Context window exceeded errors
+    if any(phrase in error_str for phrase in (
+        "context window exceeded", "context_length_exceeded", "maximum context length",
+        "context length exceeded", "too many tokens", "prompt is too long",
+    )):
+        return ErrorClassification.CONTEXT_OVERFLOW
 
     # Authentication and payment errors are configuration/account failures,
     # never reasons to rotate the shared OpenRouter credential across models.
@@ -573,6 +585,11 @@ class FallbackEngine:
                         # Shared credential and malformed-request failures affect
                         # the whole provider, so do not rotate through models.
                         if is_auth_error or is_auth_keyword:
+                            exhausted_providers.add(provider.name)
+                            remaining_providers = {
+                                p.name for _, p in model_chain[model_idx + 1:]
+                                if p.name not in exhausted_providers
+                            }
                             # Status code first so UI truncation still preserves
                             # 401-vs-403 classification. Credential hint is
                             # provider-specific and never includes secret values.
@@ -589,12 +606,28 @@ class FallbackEngine:
                                 "openai": "OPENAI_API_KEY",
                                 "anthropic": "ANTHROPIC_API_KEY",
                                 "gemini": "GEMINI_API_KEY",
-                                "nvidia": "NVIDIA_API_KEY",
+                                "nvidia": "NVIDIA_NIM_API_KEY or NVIDIA_API_KEY",
+                                "freellmapi": "FREELLMAPI_API_KEY",
                                 "groq": "GROQ_API_KEY",
                                 "9router": "NINE_ROUTER_API_KEY",
                             }
                             key_name = credential_hints.get(provider.name, "provider credentials")
                             prefix = f"{status} " if status is not None else ""
+                            if remaining_providers:
+                                previous_reason = "authentication_failed"
+                                if self.event_bus is not None and model_idx + 1 < len(model_chain):
+                                    await self.event_bus.emit(Event(
+                                        type="model.failover",
+                                        source="model_fallback",
+                                        data={
+                                            "from": model_id,
+                                            "to": model_chain[model_idx + 1][0],
+                                            "from_provider": provider.name,
+                                            "to_provider": model_chain[model_idx + 1][1].name,
+                                            "reason": "authentication_failed",
+                                        },
+                                    ))
+                                break
                             result.final_error = (
                                 f"{prefix}Authentication or access failed for provider {provider.name}. "
                                 f"Check {key_name}."
@@ -602,17 +635,32 @@ class FallbackEngine:
                             result.error_category = ERROR_CATEGORY_AUTH
                             result.total_latency_ms = (time.time() - overall_start) * 1000
                             return result
+
                         if is_payment:
                             # Model-specific payment responses can rotate to the
-                            # next free/local candidate; never invent a paid model.
+                            # next free or alternative candidate; do not disable the whole provider.
                             previous_reason = "payment_required"
-                            if self.event_bus is not None and model_idx + 1 < len(model_chain):
-                                await self.event_bus.emit(Event(
-                                    type="model.failover",
-                                    source="model_fallback",
-                                    data={"from": model_id, "to": model_chain[model_idx + 1][0], "reason": previous_reason},
-                                ))
-                            break
+                            if model_idx + 1 < len(model_chain):
+                                if self.event_bus is not None:
+                                    await self.event_bus.emit(Event(
+                                        type="model.failover",
+                                        source="model_fallback",
+                                        data={
+                                            "from": model_id,
+                                            "to": model_chain[model_idx + 1][0],
+                                            "from_provider": provider.name,
+                                            "to_provider": model_chain[model_idx + 1][1].name,
+                                            "reason": previous_reason,
+                                        },
+                                    ))
+                                break
+                            result.final_error = (
+                                f"Credits or payment required for provider {provider.name}."
+                            )
+                            result.error_category = ERROR_CATEGORY_PAYMENT
+                            result.total_latency_ms = (time.time() - overall_start) * 1000
+                            return result
+
                         detail = _safe_error_detail(e, secret)[:240]
                         status = e.status_code if isinstance(e, ProviderRequestError) else None
                         status_prefix = f"{status} " if status is not None else ""

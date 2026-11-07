@@ -10,6 +10,7 @@ from harness_core.session.domain import (
     Checkpoint,
     MemoryItem,
     MemoryType,
+    ReconciliationReport,
     Run,
     RunStatus,
     Session,
@@ -17,6 +18,7 @@ from harness_core.session.domain import (
     SessionStatus,
     can_transition,
 )
+from harness_core.session.manager import SessionManager
 from harness_core.session.storage import SessionStorage
 
 __all__ = [
@@ -29,5 +31,7 @@ __all__ = [
     "MemoryType",
     "SessionEvent",
     "SessionStorage",
+    "SessionManager",
+    "ReconciliationReport",
     "can_transition",
 ]

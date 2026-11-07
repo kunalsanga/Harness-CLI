@@ -47,7 +47,8 @@ _PROSE_MARKERS = (
     "i think", "i believe", "seems like", "feels like",
 )
 
-_INSPECT = ("inspect", "read", "analyze", "discover", "list", "understand", "identify", "review", "search", "explain", "summarize")
+_SUMMARIZE = ("summarize", "synthesize", "report", "document findings", "present findings")
+_INSPECT = ("inspect", "read", "analyze", "discover", "list", "understand", "identify", "review", "search", "explain")
 _IMPLEMENT = ("implement", "edit", "update", "improve", "add", "write", "create", "refactor", "enhance", "modify", "apply", "replace")
 _TEST = ("run test", "run tests", "pytest", "fix failing")
 _TEST_WORDS = ("test",)
@@ -59,6 +60,7 @@ _STAGE = ("stage",)
 # Category → tool names that produce evidence for that category
 _CATEGORY_TOOLS: dict[str, tuple[str, ...]] = {
     "inspect": ("read_file", "list_files", "glob", "grep", "git_status", "git_diff", "git_log"),
+    "summarize": (),
     "implement": ("write_file", "edit_file"),
     "test": ("run_command",),
     "verify": ("run_command",),
@@ -185,6 +187,8 @@ def todo_category(title: str) -> str:
         return "test"
     if _has(low, _IMPLEMENT):
         return "implement"
+    if _has(low, _SUMMARIZE):
+        return "summarize"
     if _has(low, _INSPECT):
         return "inspect"
     return "other"
@@ -299,9 +303,9 @@ def reconcile_on_evidence(
     test_evidence = tests_passed is True and tests_run > 0
 
     if task_failed:
-        # Honest reporting on failure: never complete pending implementation/test/verify
-        # items, and revert any implementation items that were prematurely marked
-        # completed without verification.
+        # Honest reporting on failure: never complete pending items on failed tasks,
+        # and revert any implementation or summary items that were prematurely marked
+        # completed without completion of the task.
         for item in plan.items:
             cat = todo_category(item.description)
             if cat in ("implement", "verify", "test"):
@@ -310,6 +314,18 @@ def reconcile_on_evidence(
                     item.evidence = {"unverified": True, "reason": "Task terminated before changes were verified"}
                     changed.append(item)
                 elif item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
+                    plan.fail_id(item.id, "Task failed before this step completed")
+                    changed.append(item)
+            elif cat == "summarize":
+                if item.status == TodoStatus.COMPLETED:
+                    item.status = TodoStatus.FAILED
+                    item.evidence = {"failed": True, "reason": "Task terminated before final summary was produced"}
+                    changed.append(item)
+                elif item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
+                    plan.fail_id(item.id, "Task failed before summary was produced")
+                    changed.append(item)
+            else:
+                if item.status in (TodoStatus.PENDING, TodoStatus.IN_PROGRESS):
                     plan.fail_id(item.id, "Task failed before this step completed")
                     changed.append(item)
         return changed
@@ -322,6 +338,7 @@ def reconcile_on_evidence(
         impl_ok = did_implement and (verified is not False) and (tests_passed is not False)
         ok = (
             (cat == "inspect" and did_inspect)
+            or (cat == "summarize" and (did_inspect or did_implement))
             or (cat == "implement" and impl_ok)
             or (cat == "test" and test_evidence)
             # "verify" + verify engine passed OR "verify" + successful test run

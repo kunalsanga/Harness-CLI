@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -149,12 +150,45 @@ def _friendly_model_error(detail: str) -> str:
     return "Task paused. The selected provider is temporarily unavailable.\n\nYour session is preserved.\n\nTry again or switch provider with /models."
 
 
+def expand_file_mentions(text: str, workspace_path: str | Path) -> str:
+    """Expand @path/to/file mentions in user input with file content snippets."""
+    import re
+    ws = Path(workspace_path).resolve()
+    pattern = re.compile(r'(?<!\w)@([a-zA-Z0-9_\-\./\\]+)')
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return text
+
+    replacements: list[str] = []
+    for m in matches:
+        rel = m.group(1)
+        if rel.endswith((".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".md", ".txt", ".yaml", ".yml", ".toml", ".sh", ".html", ".css", ".rs", ".go", ".c", ".cpp")) or "/" in rel or "\\" in rel:
+            target = (ws / rel).resolve()
+            try:
+                if target.is_relative_to(ws) and target.is_file() and target.exists():
+                    raw = target.read_text(encoding="utf-8", errors="replace")
+                    lines = raw.splitlines()
+                    if len(lines) > 300:
+                        content = "\n".join(lines[:300]) + f"\n... [truncated {len(lines) - 300} more lines]"
+                    else:
+                        content = raw
+                    block = f"\n[Referenced File: {rel}]\n```\n{content}\n```\n"
+                    replacements.append(block)
+            except Exception:
+                pass
+
+    if not replacements:
+        return text
+    return text + "\n" + "\n".join(replacements)
+
+
 # Unified slash commands — single source for completer + handler (spec §2)
 SLASH_COMMANDS: list[str] = [
-    "/help", "/status", "/model", "/models", "/session", "/diff", "/clear",
+    "/help", "/status", "/model", "/models", "/session", "/sessions", "/diff", "/clear",
     "/config", "/doctor", "/history", "/memory", "/verbose", "/free",
-    "/cancel", "/pause", "/resume", "/agents", "/plan", "/activity",
-    "/files", "/tests", "/exit", "/quit",
+    "/cancel", "/pause", "/resume", "/continue", "/recap", "/new", "/rename",
+    "/archive", "/export", "/compact", "/ask", "/plan", "/review",
+    "/agents", "/activity", "/files", "/tests", "/exit", "/quit",
 ]
 
 # Back-compat re-export for conversation helpers
@@ -212,6 +246,8 @@ class InteractiveShell:
         max_cost: float | None = None,
         workspace: str | None = None,
         max_parallel: int = 3,
+        session_id: str | None = None,
+        resume_latest: bool = False,
     ) -> None:
         self.model = model
         self.mode = mode
@@ -223,10 +259,11 @@ class InteractiveShell:
         self.workspace = workspace or str(Path.cwd())
         self.max_parallel = max_parallel
         self.verbose = False
+        self.session_id = session_id
+        self.resume_latest = resume_latest
 
         self.console = Console(no_color=plain, force_terminal=not plain)
 
-        self.session_id: str | None = None
         self.session_manager: Any = None
         self.current_model: str = ""
         self.current_provider: str = ""
@@ -270,9 +307,10 @@ class InteractiveShell:
             model=self.current_model or self.model or "",
             provider=self.current_provider or "",
             has_router=self._router is not None,
+            session_id=self.session_id or "",
             plain=self.plain,
         )
-        self.console.print("[dim]Tips: Use Ctrl+Enter for a new line, and / for commands.[/]")
+        self.console.print("  [dim]Tips: Enter to send, / for commands: /sessions, /models, /diff, /help[/]")
         self.console.print("")
 
     def _print_status_line(self) -> None:
@@ -451,6 +489,8 @@ class InteractiveShell:
                         self.console.print("⚡ Routed through 9router")
                     else:
                         self.console.print("  [cyan]⚡ Routed through 9router[/]", highlight=False)
+                if _conv() is not None:
+                    _conv().set_9router(True)
                 if self.verbose:
                     self.console.print(f"  [dim]  model: {model} ({provider})[/]", highlight=False)
             else:
@@ -470,8 +510,9 @@ class InteractiveShell:
 
 
         async def on_model_switched(event: Any) -> None:
-            old_id = str(event.data.get("from", ""))
-            new_id = str(event.data.get("to", ""))
+            old_id = str(event.data.get("from") or event.data.get("from_model") or event.data.get("model") or "")
+            new_id = str(event.data.get("to") or event.data.get("to_model") or event.data.get("fallback_model") or "")
+            provider = str(event.data.get("to_provider") or event.data.get("provider") or "")
             pair = (old_id, new_id)
             if pair in self._shown_failovers:
                 return
@@ -480,7 +521,9 @@ class InteractiveShell:
             self.current_model = new_id or self.current_model
             if _conv() is not None and new_id:
                 _conv().update_model_activity(new_id)
-                _conv().update_models([old_id, new_id])
+                _conv().update_models([m for m in (old_id, new_id) if m])
+                stage_label = f"Failing over to {provider} ({new_id})…" if provider else f"Failing over to {new_id}…"
+                _conv().set_stage(stage_label)
                 
             # Do NOT expose internal model routing details in normal UI.
             if not self.verbose:
@@ -515,8 +558,13 @@ class InteractiveShell:
         async def on_tool_call(event: Any) -> None:
             tool = event.data.get("tool", "")
             args = event.data.get("args", {})
-            if event.data.get("workflow") and _conv() is not None:
-                _conv().tool_started(tool, args)
+            call_id = str(event.data.get("call_id") or event.data.get("id") or "")
+            if _conv() is not None:
+                _conv().tool_started(tool, args, call_id=call_id)
+                path = (args.get("path") if isinstance(args, dict) else "") or (args.get("file_path") if isinstance(args, dict) else "") or ""
+                if path and tool in ("read_file", "write_file", "edit_file"):
+                    action = "reading" if tool == "read_file" else ("writing" if tool == "write_file" else "editing")
+                    _conv().record_file_activity(path, action)
             if self.verbose:
                 display = _tool_display_name(tool, args)
                 self.console.print(f"  [cyan]→[/] {display}", highlight=False)
@@ -526,33 +574,70 @@ class InteractiveShell:
             status = event.data.get("status", "")
             exit_code = event.data.get("exit_code")
             error = event.data.get("error", "")
+            stderr = event.data.get("stderr", "")
+            call_id = str(event.data.get("call_id") or event.data.get("id") or "")
+            metadata = event.data.get("metadata") or {}
+            args = event.data.get("args") or {}
             self.total_tool_calls += 1
-            if event.data.get("workflow") and _conv() is not None:
+
+            # Extract actionable error explanation
+            failure_detail = ""
+            if status != "success":
+                diagnosis_reason = metadata.get("diagnosis_reason", "")
+                if diagnosis_reason:
+                    failure_detail = diagnosis_reason
+                elif stderr:
+                    failure_detail = stderr.strip().splitlines()[0].strip()
+                elif error:
+                    failure_detail = error.strip().splitlines()[0].strip()
+
+            if _conv() is not None:
                 _conv().tool_completed(
                     tool,
                     "success" if status == "success" else "failed",
+                    exit_code=exit_code,
+                    error=failure_detail,
+                    call_id=call_id,
                 )
+                path = (
+                    event.data.get("path")
+                    or (args.get("path") if isinstance(args, dict) else "")
+                    or (args.get("file_path") if isinstance(args, dict) else "")
+                    or (metadata.get("path") if isinstance(metadata, dict) else "")
+                    or ""
+                )
+                if path and tool in ("read_file", "write_file", "edit_file"):
+                    if status == "success":
+                        action = "inspected" if tool == "read_file" else ("created" if tool == "write_file" else "modified")
+                    else:
+                        action = "failed"
+                    _conv().record_file_activity(path, action)
+
             # Compact, truthful console echo only when not in Live mode
             if self.plain or _conv() is None:
                 activity_name = tool
                 if status == "success":
-                    self.console.print(f"  [green]✓[/] [dim]{activity_name}[/]", highlight=False)
+                    self.console.print(f"  [green]{Sym.CHECK}[/] [dim]{activity_name}[/]", highlight=False)
                 elif status == "permission_denied":
-                    self.console.print(f"  [yellow]⚠[/] {tool} [dim](permission denied)[/]", highlight=False)
+                    self.console.print(f"  [yellow]{Sym.WARN}[/] {tool} [dim](permission denied)[/]", highlight=False)
                 elif exit_code is not None and exit_code != 0:
-                    self.console.print(f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
-                    if error:
-                        first_line = _safe_str(error.split("\n")[0].strip())
+                    self.console.print(f"  [red]{Sym.CROSS}[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
+                    if failure_detail:
+                        first_line = _safe_str(failure_detail)
                         if first_line:
                             self.console.print(f"  [red]  {first_line}[/]", highlight=False)
                 else:
-                    self.console.print(f"  [red]✗[/] {tool} [dim]({status})[/]", highlight=False)
+                    self.console.print(f"  [red]{Sym.CROSS}[/] {tool} [dim]({status})[/]", highlight=False)
+                    if failure_detail:
+                        first_line = _safe_str(failure_detail)
+                        if first_line:
+                            self.console.print(f"  [red]  {first_line}[/]", highlight=False)
             elif status != "success" and status != "permission_denied":
                 # In rich mode, still surface failures dimly outside Live if verbose
                 if self.verbose and exit_code not in (None, 0):
-                    self.console.print(f"  [red]✗[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
-                    if error:
-                        first_line = _safe_str(error.split("\n")[0].strip())
+                    self.console.print(f"  [red]{Sym.CROSS}[/] {tool} [dim](exit {exit_code})[/]", highlight=False)
+                    if failure_detail:
+                        first_line = _safe_str(failure_detail)
                         if first_line:
                             self.console.print(f"  [red]  {first_line}[/]", highlight=False)
 
@@ -560,6 +645,13 @@ class InteractiveShell:
             # Retain the diagnostic for accurate final classification; never
             # print provider details in normal mode.
             self._last_model_error = str(event.data.get("error", ""))
+
+        async def on_model_cooldown(event: Any) -> None:
+            cooldown = float(event.data.get("cooldown_seconds", 0) or 0)
+            if _conv() is not None:
+                _conv().set_stage("Retrying model…")
+            if self.verbose and cooldown > 0:
+                self.console.print(f"  [yellow]Rate limited, cooling down {cooldown:.1f}s...[/]", highlight=False)
 
         async def on_task_phase(event: Any) -> None:
             phase = event.data.get("phase", "")
@@ -584,16 +676,22 @@ class InteractiveShell:
 
         async def on_tool_started(event: Any) -> None:
             if _conv() is not None:
+                call_id = str(event.data.get("call_id") or event.data.get("id") or "")
                 _conv().tool_started_safe(
                     str(event.data.get("tool", "")),
                     str(event.data.get("summary", "")),
+                    call_id=call_id,
                 )
 
         async def on_tool_terminal(event: Any) -> None:
             if _conv() is not None:
+                err_class = str(event.data.get("error_class", ""))
+                call_id = str(event.data.get("call_id") or event.data.get("id") or "")
                 _conv().tool_completed(
                     str(event.data.get("tool", "")),
                     "success" if event.type == "tool.completed" else "failed",
+                    error=err_class,
+                    call_id=call_id,
                 )
 
         async def on_task_completed(event: Any) -> None:
@@ -672,6 +770,7 @@ class InteractiveShell:
                 removed = int(event.data.get("removed", 0))
                 diff = str(event.data.get("diff", ""))
                 _conv().update_file_changed(path, added, removed, diff)
+                _conv().record_file_activity(path, "modified")
 
         async def on_task_paused(event: Any) -> None:
             # Pause status is surfaced in completion status.
@@ -704,6 +803,7 @@ class InteractiveShell:
         bus.on("tool.failed", on_tool_terminal)
         bus.on("file.changed", on_file_changed)
         bus.on("model.error", on_model_error)
+        bus.on("model.cooldown", on_model_cooldown)
         bus.on("task.completed", on_task_completed)
         bus.on("task.failed", on_task_failed)
         bus.on("task.paused", on_task_paused)
@@ -724,15 +824,38 @@ class InteractiveShell:
     def _setup_session(self) -> None:
         try:
             from harness_core.session.manager import SessionManager
-            self.session_manager = SessionManager()
-            sessions = self.session_manager.storage.list_sessions(limit=20)
-            active = [s for s in sessions if s.workspace_path == self.workspace and s.status.value in ("active", "paused")]
-            if active:
-                session = active[0]
-                self.session_id = session.session_id
+            if self.session_manager is None:
+                self.session_manager = SessionManager()
+
+            target_session = None
+            if self.session_id:
+                target_session = self.session_manager.storage.get_session(self.session_id)
+                if target_session is None:
+                    all_s = self.session_manager.storage.list_sessions(limit=100)
+                    matching = [s for s in all_s if s.session_id.startswith(self.session_id)]
+                    if len(matching) == 1:
+                        target_session = matching[0]
+            elif self.resume_latest:
+                target_session = self.session_manager.get_latest_session(workspace_path=self.workspace)
+
+            if target_session:
+                self.session_id = target_session.session_id
+                report = self.session_manager.reconcile_workspace(self.session_id, self.workspace)
+                if not self.plain:
+                    self.console.print(f"\n[cyan]{report.recap}[/]\n", highlight=False)
+                else:
+                    self.console.print(f"\n{report.recap}\n", highlight=False)
             else:
-                session = self.session_manager.create_session(workspace_path=self.workspace, title="Interactive session")
+                session = self.session_manager.create_session(
+                    workspace_path=self.workspace,
+                    title=f"Session {Path(self.workspace).name}",
+                )
                 self.session_id = session.session_id
+
+            try:
+                self.session_manager.sync_memory_file(self.workspace)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -753,8 +876,10 @@ class InteractiveShell:
             await self._cmd_model(args)
         elif command == "/models":
             await self._cmd_models()
-        elif command == "/session":
-            self._cmd_session(args)
+        elif command in ("/providers", "/provider"):
+            await self._cmd_providers(args)
+        elif command in ("/session", "/sessions"):
+            await self._cmd_session(args)
         elif command == "/diff":
             self._cmd_diff()
         elif command == "/clear":
@@ -776,18 +901,36 @@ class InteractiveShell:
         elif command == "/pause":
             await self._cmd_pause()
         elif command == "/resume":
-            await self._cmd_resume()
+            await self._cmd_resume(args)
+        elif command == "/continue":
+            self._cmd_continue()
+        elif command == "/recap":
+            self._cmd_recap()
+        elif command == "/new":
+            self._cmd_new_session(args)
+        elif command == "/rename":
+            self._cmd_rename_session(args)
+        elif command == "/archive":
+            self._cmd_archive_session()
+        elif command == "/export":
+            self._cmd_export_session(args)
+        elif command == "/compact":
+            self._cmd_compact()
+        elif command == "/ask":
+            await self._cmd_ask(args)
+        elif command == "/plan":
+            await self._cmd_plan(args)
+        elif command == "/review":
+            await self._cmd_review()
         elif command == "/agents":
             self._cmd_agents()
-        elif command == "/plan":
-            self._cmd_plan()
         elif command == "/activity":
             self._cmd_activity()
         elif command == "/files":
             self._cmd_files()
         elif command == "/tests":
             self._cmd_tests()
-        elif command == "/exit" or command == "/quit":
+        elif command in ("/exit", "/quit"):
             return False
         else:
             self.console.print(f"  [yellow]Unknown command: {command}[/]")
@@ -797,26 +940,69 @@ class InteractiveShell:
     def _cmd_help(self) -> None:
         if self.plain:
             self.console.print("Available commands:")
-            self.console.print("  /help     Show this help")
-            self.console.print("  /status   Show session status")
-            self.console.print("  /model    Show current model")
-            self.console.print("  /models   List available models")
-            self.console.print("  /session  Session management")
-            self.console.print("  /diff     Show git diff")
-            self.console.print("  /clear    Clear screen")
-            self.console.print("  /config   Show configuration")
-            self.console.print("  /doctor   System health check")
-            self.console.print("  /history  Command history")
-            self.console.print("  /memory   Session memory")
-            self.console.print("  /free     Switch to free model")
-            self.console.print("  /cancel   Cancel running task")
-            self.console.print("  /resume   Resume paused task")
-            self.console.print("  /exit     Exit Harness")
+            self.console.print("  /help              Show this help")
+            self.console.print("  /status            Show session status")
+            self.console.print("  /model             Show current model")
+            self.console.print("  /models            List available models")
+            self.console.print("  /session, /sessions Browse date-grouped sessions (/sessions, view <id>, resume <id>)")
+            self.console.print("  /continue          Continue most recent session in workspace")
+            self.console.print("  /resume [id]       Resume paused task or specific session")
+            self.console.print("  /recap             Reconcile workspace and show session recap")
+            self.console.print("  /new [title]       Start a new session")
+            self.console.print("  /rename <title>    Rename active session")
+            self.console.print("  /archive           Archive active session")
+            self.console.print("  /export [json|md]  Export session history")
+            self.console.print("  /compact           Compact dialogue context")
+            self.console.print("  /ask <query>       Read-only question answering")
+            self.console.print("  /plan <task>       Plan-only mode (no mutating actions)")
+            self.console.print("  /review            Review uncommitted git changes")
+            self.console.print("  /diff              Show syntax-highlighted git diff")
+            self.console.print("  /clear             Clear screen")
+            self.console.print("  /config            Show configuration")
+            self.console.print("  /doctor            System health check")
+            self.console.print("  /history           Command history")
+            self.console.print("  /memory            Session memory")
+            self.console.print("  /free              Switch to free model routing")
+            self.console.print("  /cancel            Cancel running task")
+            self.console.print("  /pause             Pause execution (state preserved)")
+            self.console.print("  /exit              Exit Harness")
             return
-        table = Table(title="Commands", show_header=True, border_style="dim")
+        table = Table(title="Commands", show_header=True, border_style="dim", box=box.SIMPLE, pad_edge=False)
         table.add_column("Command", style="cyan", no_wrap=True)
         table.add_column("Description")
-        commands = [("/help", "Show this help"), ("/status", "Show session status and stats"), ("/model", "Show current model information"), ("/models", "List available models"), ("/verbose", "Toggle verbose tool output"), ("/session [list|show|create]", "Session management"), ("/diff", "Show git diff"), ("/clear", "Clear the screen"), ("/config", "Show configuration"), ("/doctor", "System health check"), ("/history", "Command history"), ("/memory [search]", "Session memory"), ("/free", "Switch to free model routing"), ("/cancel", "Cancel running task"), ("/pause", "Pause unified execution (state preserved)"), ("/resume", "Resume paused task"), ("/agents", "Show agent statuses (unified mode)"), ("/plan", "Show plan / stage (unified mode)"), ("/activity", "Show activity trail (unified mode)"), ("/files", "Show file changes (unified mode)"), ("/tests", "Show test evidence (unified mode)"), ("/exit", "Exit Harness")]
+        commands = [
+            ("/help", "Show this help"),
+            ("/status", "Show session status and stats"),
+            ("/model", "Show current model information"),
+            ("/models", "List available models and tier/health"),
+            ("/verbose", "Toggle verbose tool output"),
+            ("/session, /sessions", "Browse date-grouped sessions (view <id>, resume <id>)"),
+            ("/continue", "Continue most recent session in workspace"),
+            ("/resume [id]", "Resume paused task or specific session"),
+            ("/recap", "Reconcile workspace and show session recap"),
+            ("/new [title]", "Start a fresh session in this workspace"),
+            ("/rename <title>", "Rename the active session"),
+            ("/archive", "Archive active session"),
+            ("/export [json|md]", "Export session transcript and memories"),
+            ("/compact", "Compact conversation context and summarize"),
+            ("/ask <query>", "Read-only question answering mode"),
+            ("/plan [task]", "Plan-only mode or show plan stage"),
+            ("/review", "Inspect git diff and perform code review"),
+            ("/diff", "Show syntax-highlighted git diff"),
+            ("/clear", "Clear the screen"),
+            ("/config", "Show configuration"),
+            ("/doctor", "System health check"),
+            ("/history", "Command history"),
+            ("/memory [add|search]", "Session memory and notes"),
+            ("/free", "Switch to free model routing"),
+            ("/cancel", "Cancel running task"),
+            ("/pause", "Pause unified execution (state preserved)"),
+            ("/agents", "Show agent statuses (unified mode)"),
+            ("/activity", "Show activity trail (unified mode)"),
+            ("/files", "Show file changes (unified mode)"),
+            ("/tests", "Show test evidence (unified mode)"),
+            ("/exit", "Exit Harness"),
+        ]
         for cmd, desc in commands:
             table.add_row(cmd, desc)
         self.console.print(table)
@@ -836,7 +1022,7 @@ class InteractiveShell:
             if self.running:
                 self.console.print(f"Task time: {task_elapsed:.1f}s")
             return
-        table = Table(title="Status", border_style="blue", show_header=False)
+        table = Table(title="Status", border_style="blue", show_header=False, box=box.SIMPLE, pad_edge=False)
         table.add_column("Key", style="bold")
         table.add_column("Value")
         table.add_row("Workspace", self.workspace)
@@ -883,7 +1069,7 @@ class InteractiveShell:
             self.console.print(f"Provider: {self.current_provider or 'not set'}")
             self.console.print(f"Mode: {self.mode}")
             return
-        table = Table(title="Model", border_style="green", show_header=False)
+        table = Table(title="Model", border_style="green", show_header=False, box=box.SIMPLE, pad_edge=False)
         table.add_column("Key", style="bold")
         table.add_column("Value")
         table.add_row("Current", self.current_model or "not set")
@@ -906,14 +1092,21 @@ class InteractiveShell:
             models = list({(m.provider, m.id): m for m in models}.values())
             health = getattr(self._router, "health", None)
             is_free_mode = self.free or (getattr(self._router, "config", None) and getattr(self._router.config, "routing_mode", "") == "free")
-            table = Table(title=f"Configured / Discovered Models{' (Free Mode)' if is_free_mode else ''}")
-            table.add_column("Model", style="cyan", max_width=40)
+            is_narrow = self.console.size.width < 90
+            table = Table(
+                title=f"Configured / Discovered Models{' (Free Mode)' if is_free_mode else ''}",
+                box=box.SIMPLE,
+                pad_edge=False,
+            )
+            table.add_column("Model", style="cyan", max_width=32 if is_narrow else 40)
             table.add_column("Provider", style="green")
             table.add_column("Tier")
-            table.add_column("Source")
+            if not is_narrow:
+                table.add_column("Source")
             table.add_column("Health")
             table.add_column("Cooldown")
-            table.add_column("Tools")
+            if not is_narrow:
+                table.add_column("Tools")
             # If in free mode, prioritize free models
             display_models = sorted(models, key=lambda m: (not m.is_free if is_free_mode else 0, m.id))
             for model in display_models[:60]:
@@ -928,35 +1121,149 @@ class InteractiveShell:
                     status, cooldown = "Unknown", "—"
                 configured = "Configured" if model_id in {m.id for p in (self._router.providers.values() if self._router else []) for m in getattr(p, "configured_models", [])} else "Discovered"
                 tools = "Supported" if model.supports_tools is True else "Unsupported" if model.supports_tools is False else "Unknown"
-                table.add_row(model.name or model_id, model.provider, tier, configured, status, cooldown, tools)
+                if is_narrow:
+                    table.add_row(model.name or model_id, model.provider, tier, status, cooldown)
+                else:
+                    table.add_row(model.name or model_id, model.provider, tier, configured, status, cooldown, tools)
             self.console.print(table)
         except Exception as e:
             self.console.print(f"  [red]✗ Unable to retrieve models[/]")
             if self.verbose:
                 self.console.print(f"  [dim]{_safe_str(e)}[/]")
 
-    def _cmd_session(self, args: str) -> None:
-        sub = args.strip().lower() if args else "show"
-        if sub == "list" or sub == "":
-            if self.session_manager is None:
-                self.console.print("  [dim]No session manager[/]")
+    async def _cmd_providers(self, args: str = "") -> None:
+        target = args.strip().lower()
+        if target:
+            matching = [p for p in (self._providers or []) if p.name.lower() == target]
+            if matching:
+                self._provider = matching[0]
+                self.current_provider = self._provider.name
+                self.console.print(f"  [green]Switched active provider to {self._provider.name}[/]")
+            else:
+                available = ", ".join(p.name for p in (self._providers or []))
+                self.console.print(f"  [yellow]Provider '{target}' not found in active providers. Available: {available}[/]")
+            return
+
+        table = Table(title="Provider Status", border_style="dim", box=box.SIMPLE, pad_edge=False)
+        table.add_column("Provider", style="cyan")
+        table.add_column("Status")
+        table.add_column("Active", justify="center")
+        table.add_column("Discovered Models", justify="right")
+
+        for p in (self._providers or []):
+            is_active = (p.name == getattr(self, "current_provider", ""))
+            try:
+                healthy = await p.health_check()
+                status = "[green]Healthy[/]" if healthy else "[yellow]Degraded[/]"
+            except Exception:
+                status = "[red]Unavailable[/]"
+            try:
+                models = await p.list_models()
+                m_count = len(models)
+            except Exception:
+                m_count = len(getattr(p, "configured_models", []))
+
+            table.add_row(
+                p.name,
+                status,
+                "[green]*[/]" if is_active else " ",
+                str(m_count) if m_count else "-",
+            )
+        self.console.print(table)
+
+    async def _cmd_session(self, args: str) -> None:
+        if self.session_manager is None:
+            self.console.print("  [dim]No session manager[/]")
+            return
+
+        parts = args.strip().split(maxsplit=1)
+        sub = parts[0].lower() if parts else ""
+        sub_arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub in ("list", "", "all"):
+            ws_path = None if sub == "all" else self.workspace
+            import sys
+            is_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty() and hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+            if not self.plain and is_tty:
+                from harness_core.cli.session_browser import InteractiveSessionBrowser
+                try:
+                    browser = InteractiveSessionBrowser(
+                        self.console,
+                        self.session_manager.storage,
+                        current_session_id=self.session_id or "",
+                        workspace_filter=ws_path or "",
+                        plain=self.plain,
+                    )
+                    action = await browser.run_async()
+                    if action and action.get("action") == "resume":
+                        await self._cmd_resume(action.get("session_id", ""))
+                    return
+                except Exception:
+                    pass
+
+            sessions = self.session_manager.storage.list_sessions(workspace_path=ws_path, limit=50)
+            if not sessions and ws_path is not None:
+                sessions = self.session_manager.storage.list_sessions(limit=50)
+            from harness_core.cli.session_browser import render_session_browser
+            render_session_browser(
+                self.console,
+                sessions,
+                self.session_manager.storage,
+                current_session_id=self.session_id or "",
+                plain=self.plain,
+            )
+        elif sub == "view":
+            if not sub_arg:
+                self.console.print("  [yellow]Usage: /sessions view <session-id>[/]")
                 return
-            sessions = self.session_manager.storage.list_sessions(limit=10)
-            if not sessions:
-                self.console.print("  [dim]No sessions found.[/]")
+            from harness_core.cli.session_browser import render_historical_transcript
+            render_historical_transcript(
+                self.console,
+                sub_arg,
+                self.session_manager.storage,
+                plain=self.plain,
+            )
+        elif sub == "resume":
+            if not sub_arg:
+                self.console.print("  [yellow]Usage: /sessions resume <session-id>[/]")
                 return
-            table = Table(title="Sessions")
-            table.add_column("ID", style="cyan")
-            table.add_column("Title", max_width=30)
-            table.add_column("Status")
-            table.add_column("Updated", style="dim")
-            for s in sessions:
-                import datetime
-                updated = datetime.datetime.fromtimestamp(s.updated_at).strftime("%m-%d %H:%M")
-                status_color = {"active": "green", "paused": "yellow", "completed": "blue", "failed": "red"}.get(s.status.value, "white")
-                current = " * " if s.session_id == self.session_id else "   "
-                table.add_row(f"{current}{s.session_id[:10]}", s.title[:30], f"[{status_color}]{s.status.value}[/]", updated)
-            self.console.print(table)
+            await self._cmd_resume(sub_arg)
+        elif sub in ("new", "create"):
+            self._cmd_new_session(sub_arg)
+        elif sub == "search":
+            if not sub_arg:
+                self.console.print("  [yellow]Usage: /sessions search <query>[/]")
+                return
+            import sys
+            is_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty() and hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+            if not self.plain and is_tty:
+                from harness_core.cli.session_browser import InteractiveSessionBrowser
+                try:
+                    browser = InteractiveSessionBrowser(
+                        self.console,
+                        self.session_manager.storage,
+                        current_session_id=self.session_id or "",
+                        workspace_filter=self.workspace,
+                        initial_query=sub_arg,
+                        plain=self.plain,
+                    )
+                    action = await browser.run_async()
+                    if action and action.get("action") == "resume":
+                        await self._cmd_resume(action.get("session_id", ""))
+                    return
+                except Exception:
+                    pass
+
+            sessions = self.session_manager.storage.list_sessions(limit=100)
+            from harness_core.cli.session_browser import render_session_browser
+            render_session_browser(
+                self.console,
+                sessions,
+                self.session_manager.storage,
+                current_session_id=self.session_id or "",
+                query=sub_arg,
+                plain=self.plain,
+            )
         elif sub == "show":
             if self.session_id and self.session_manager:
                 state = self.session_manager.get_resume_state(self.session_id)
@@ -972,27 +1279,144 @@ class InteractiveShell:
                         self.console.print(f"    {status} {r.task[:50]}")
             else:
                 self.console.print("  [dim]No active session[/]")
-        elif sub == "create":
-            if self.session_manager:
-                session = self.session_manager.create_session(workspace_path=self.workspace, title="Manual session")
-                self.session_id = session.session_id
-                self.console.print(f"  [green]✓[/] Created: {self.session_id}")
         else:
-            self.console.print(f"  [yellow]Unknown session command: {sub}[/]")
+            # Match query against sessions
+            query_str = args.strip()
+            import sys
+            is_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty() and hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+            if not self.plain and is_tty:
+                from harness_core.cli.session_browser import InteractiveSessionBrowser
+                try:
+                    browser = InteractiveSessionBrowser(
+                        self.console,
+                        self.session_manager.storage,
+                        current_session_id=self.session_id or "",
+                        workspace_filter=self.workspace,
+                        initial_query=query_str,
+                        plain=self.plain,
+                    )
+                    action = await browser.run_async()
+                    if action and action.get("action") == "resume":
+                        await self._cmd_resume(action.get("session_id", ""))
+                    return
+                except Exception:
+                    pass
+
+            sessions = self.session_manager.storage.list_sessions(limit=100)
+            from harness_core.cli.session_browser import render_session_browser
+            render_session_browser(
+                self.console,
+                sessions,
+                self.session_manager.storage,
+                current_session_id=self.session_id or "",
+                query=query_str,
+                plain=self.plain,
+            )
 
     def _cmd_diff(self) -> None:
         import subprocess
+        import re
         try:
-            result = subprocess.run(["git", "diff", "--stat"], capture_output=True, text=True, cwd=self.workspace, timeout=5)
-            if result.stdout.strip():
-                self.console.print("  [bold]Changed files:[/]")
-                for line in result.stdout.strip().split("\n"):
-                    self.console.print(f"    {line}")
-                self.console.print("  [dim]Run `git diff` in terminal for full diff.[/]")
-            else:
-                self.console.print("  [dim]No changes detected.[/]")
-        except Exception:
-            self.console.print("  [dim]Not a git repository or git not available.[/]")
+            stat_res = subprocess.run(
+                ["git", "diff", "--stat"],
+                capture_output=True,
+                text=True,
+                cwd=self.workspace,
+                timeout=5,
+            )
+            diff_res = subprocess.run(
+                ["git", "diff", "-U3"],
+                capture_output=True,
+                text=True,
+                cwd=self.workspace,
+                timeout=10,
+            )
+            raw_diff = diff_res.stdout if diff_res.returncode == 0 else ""
+            stat_text = stat_res.stdout.strip() if stat_res.returncode == 0 else ""
+
+            # Check untracked files
+            untracked_files: list[str] = []
+            try:
+                untracked_res = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    cwd=self.workspace,
+                    timeout=5,
+                )
+                if untracked_res.returncode == 0 and untracked_res.stdout.strip():
+                    for line in untracked_res.stdout.strip().splitlines():
+                        if line.startswith("??"):
+                            untracked_files.append(line[3:].strip())
+            except Exception:
+                pass
+
+            if not raw_diff.strip() and not stat_text and not untracked_files:
+                self.console.print("  [dim]No uncommitted changes detected in workspace.[/]")
+                return
+
+            if self.plain:
+                self.console.print("=== Uncommitted Changes ===")
+                if stat_text:
+                    self.console.print(stat_text)
+                if untracked_files:
+                    self.console.print("--- Untracked / New Files ---")
+                    for uf in untracked_files:
+                        self.console.print(f"+ {uf}")
+                if raw_diff.strip():
+                    self.console.print("--- Diff ---")
+                    cleaned = re.sub(r'(sk-[a-zA-Z0-9_-]{10,})', r'sk-***[REDACTED]', raw_diff)
+                    cleaned = re.sub(r'(Bearer\s+[a-zA-Z0-9_\-\.]{15,})', r'Bearer ***[REDACTED]', cleaned)
+                    self.console.print(cleaned[:4000])
+                    if len(cleaned) > 4000:
+                        self.console.print("\n...[diff truncated]")
+                return
+
+            self.console.print("")
+            self.console.print("  [bold cyan]◆[/] [bold white]Uncommitted Changes[/]")
+            if stat_text:
+                self.console.print("  [dim]Summary:[/]")
+                for line in stat_text.splitlines():
+                    self.console.print(f"    [dim]{line}[/]")
+                self.console.print("")
+
+            if untracked_files:
+                self.console.print("  [bold]Untracked / New Files:[/]", highlight=False)
+                for uf in untracked_files[:15]:
+                    self.console.print(f"    [green]+[/] {uf}", highlight=False)
+                if len(untracked_files) > 15:
+                    self.console.print(f"    [dim]... +{len(untracked_files) - 15} more untracked files[/]")
+                self.console.print("")
+
+            if raw_diff.strip():
+                cleaned_diff = re.sub(r'(sk-[a-zA-Z0-9_-]{10,})', r'sk-***[REDACTED]', raw_diff)
+                cleaned_diff = re.sub(r'(Bearer\s+[a-zA-Z0-9_\-\.]{15,})', r'Bearer ***[REDACTED]', cleaned_diff)
+
+                diff_lines = cleaned_diff.splitlines()
+                max_lines = 120
+                shown_lines = diff_lines[:max_lines]
+
+                for line in shown_lines:
+                    if line.startswith("diff --git"):
+                        self.console.print(f"  [bold cyan]{line}[/]", highlight=False)
+                    elif line.startswith("index ") or line.startswith("--- ") or line.startswith("+++ "):
+                        self.console.print(f"  [dim]{line}[/]", highlight=False)
+                    elif line.startswith("@@"):
+                        self.console.print(f"  [cyan]{line}[/]", highlight=False)
+                    elif line.startswith("+"):
+                        self.console.print(f"  [green]{line}[/]", highlight=False)
+                    elif line.startswith("-"):
+                        self.console.print(f"  [red]{line}[/]", highlight=False)
+                    else:
+                        self.console.print(f"  [dim]{line}[/]", highlight=False)
+
+                if len(diff_lines) > max_lines:
+                    self.console.print(f"\n  [dim]... [+{len(diff_lines) - max_lines} more diff lines truncated. Run git diff for complete diff.][/]")
+            self.console.print("")
+        except Exception as e:
+            self.console.print("  [dim]Not a git repository or git error occurred.[/]")
+            if self.verbose:
+                self.console.print(f"  [dim]{_safe_str(e)}[/]")
 
     def _cmd_config(self) -> None:
         config_file = Path(self.workspace) / ".harness" / "config.yaml"
@@ -1090,23 +1514,189 @@ class InteractiveShell:
         self.console.print("  [yellow]⚠ Task cancelled[/]")
         self._render_cancellation()
 
-    async def _cmd_resume(self) -> None:
-        if not self._agent_loop:
-            self.console.print("  [dim]Agent not initialized.[/]")
+    def _cmd_continue(self) -> None:
+        if not self.session_manager:
+            self.console.print("  [dim]Session manager not initialized.[/]")
             return
-        task = self._agent_loop._active_task
-        if task is None:
-            self.console.print("  [dim]No paused task to resume.[/]")
+        target = self.session_manager.get_latest_session(workspace_path=self.workspace)
+        if not target:
+            self.console.print("  [dim]No previous session found in this workspace.[/]")
             return
-        if task.status != TaskStatus.PAUSED:
-            self.console.print(f"  [dim]Task is not paused. Current status: {task.status.value}[/]")
-            return
-        first_todo = task.task_plan.first_unresolved()
-        if first_todo:
-            self.console.print(f"  [green]✓[/] Resuming from: {first_todo.description}")
+        self.session_id = target.session_id
+        report = self.session_manager.reconcile_workspace(self.session_id, self.workspace)
+        if not self.plain:
+            self.console.print(f"\n[cyan]{report.recap}[/]\n", highlight=False)
         else:
-            self.console.print("  [green]✓[/] Resuming task")
-        await self._execute_task(task.goal)
+            self.console.print(f"\n{report.recap}\n", highlight=False)
+
+    async def _cmd_resume(self, args: str = "") -> None:
+        target_id = args.strip()
+        if target_id and self.session_manager:
+            sess = self.session_manager.storage.get_session(target_id)
+            if sess is None:
+                self.console.print(f"  [red]✗ Session not found:[/] {target_id}")
+                return
+            self.session_id = sess.session_id
+            report = self.session_manager.reconcile_workspace(self.session_id, self.workspace)
+            if not self.plain:
+                self.console.print(f"\n[cyan]{report.recap}[/]\n", highlight=False)
+            else:
+                self.console.print(f"\n{report.recap}\n", highlight=False)
+            return
+
+        if self._agent_loop:
+            task = self._agent_loop._active_task
+            if task is not None and task.status == TaskStatus.PAUSED:
+                first_todo = task.task_plan.first_unresolved()
+                if first_todo:
+                    self.console.print(f"  [green]✓[/] Resuming from: {first_todo.description}")
+                else:
+                    self.console.print("  [green]✓[/] Resuming task")
+                await self._execute_task(task.goal)
+                return
+
+        # Fallback to continuing latest session in workspace
+        self._cmd_continue()
+
+    def _cmd_recap(self) -> None:
+        if not self.session_id or not self.session_manager:
+            self.console.print("  [dim]No active session to recap.[/]")
+            return
+        report = self.session_manager.reconcile_workspace(self.session_id, self.workspace)
+        if not self.plain:
+            self.console.print(f"\n[cyan]{report.recap}[/]\n", highlight=False)
+        else:
+            self.console.print(f"\n{report.recap}\n", highlight=False)
+
+    def _cmd_new_session(self, args: str = "") -> None:
+        if not self.session_manager:
+            self.console.print("  [dim]Session manager not initialized.[/]")
+            return
+        title = args.strip() or f"Session {Path(self.workspace).name}"
+        session = self.session_manager.create_session(
+            workspace_path=self.workspace,
+            title=title,
+        )
+        self.session_id = session.session_id
+        try:
+            self.session_manager.sync_memory_file(self.workspace)
+        except Exception:
+            pass
+        self.console.print(f"  [green]✓[/] Started new session: [cyan]{self.session_id}[/] ({title})")
+
+    def _cmd_rename_session(self, args: str = "") -> None:
+        if not self.session_id or not self.session_manager:
+            self.console.print("  [dim]No active session to rename.[/]")
+            return
+        title = args.strip()
+        if not title:
+            self.console.print("  [yellow]Usage: /rename <new-title>[/]")
+            return
+        self.session_manager.rename_session(self.session_id, title)
+        self.console.print(f"  [green]✓[/] Session renamed to: [bold]{title}[/]")
+
+    def _cmd_archive_session(self) -> None:
+        if not self.session_id or not self.session_manager:
+            self.console.print("  [dim]No active session to archive.[/]")
+            return
+        old_id = self.session_id
+        self.session_manager.archive_session(self.session_id)
+        self.console.print(f"  [green]✓[/] Archived session: [cyan]{old_id}[/]")
+        self.session_id = None
+
+    def _cmd_export_session(self, args: str = "") -> None:
+        if not self.session_id or not self.session_manager:
+            self.console.print("  [dim]No active session to export.[/]")
+            return
+        fmt = "json" if "json" in args.lower() else "markdown"
+        try:
+            exported = self.session_manager.export_session(self.session_id, fmt=fmt)
+            out_file = Path(self.workspace) / ".harness" / f"session_{self.session_id[:8]}.{'json' if fmt == 'json' else 'md'}"
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_text(exported, encoding="utf-8")
+            self.console.print(f"  [green]✓[/] Session exported to [cyan]{out_file}[/]")
+        except Exception as e:
+            self.console.print(f"  [red]Failed to export session: {_safe_str(e)}[/]")
+
+    def _cmd_compact(self) -> None:
+        from harness_core.context.compaction import ContextCompactor, AgentMessage
+        if not self.session_id or not self.session_manager:
+            self.console.print("  [dim]No active session to compact.[/]")
+            return
+        events = self.session_manager.storage.get_events(self.session_id, limit=200)
+        if not events:
+            self.console.print("  [dim]Session has no message history to compact yet.[/]")
+            return
+        msgs: list[AgentMessage] = []
+        for e in events:
+            text = e.data.get("message", "") if isinstance(e.data, dict) else ""
+            if text:
+                role = "assistant" if "assistant" in e.event_type else "user"
+                msgs.append(AgentMessage(role=role, content=text, kind="text"))
+        if not msgs:
+            self.console.print("  [dim]No dialogue history found to compact.[/]")
+            return
+        compactor = ContextCompactor(preserve_recent=5)
+        summary = compactor.compact(msgs)
+        if summary.tokens_saved > 0:
+            self.console.print(
+                f"  [green]✓[/] Context compacted: [bold]{summary.compacted_count}[/] messages summarized, saved ~[green]{summary.tokens_saved}[/] tokens."
+            )
+        else:
+            self.console.print(f"  [dim]Context is already compact ({len(msgs)} messages).[/]")
+
+    async def _cmd_ask(self, args: str) -> None:
+        query = args.strip()
+        if not query:
+            self.console.print("  [yellow]Usage: /ask <question or code inquiry>[/]")
+            return
+        prompt = f"[READ-ONLY INQUIRY - Do not modify any files or execute destructive actions]\n{query}"
+        await self._execute_task(prompt)
+
+    async def _cmd_plan(self, args: str = "") -> None:
+        task_desc = args.strip()
+        if not task_desc:
+            snap = self._vm_snapshot()
+            if not snap:
+                self.console.print("  [dim]No unified execution active. To plan a task, use: /plan <task description>[/]")
+                return
+            self.console.print(f"  Stage: [bold]{snap.get('stage', '?')}[/]")
+            metrics = snap.get("metrics", {})
+            planned = metrics.get("plan_tasks", 0)
+            agents = snap.get("agents", [])
+            if planned:
+                self.console.print(f"  Planned tasks: {planned}")
+            if agents:
+                done = sum(1 for a in agents if a.get("status") == "completed")
+                self.console.print(f"  Agents: {done}/{len(agents)} complete")
+            return
+        prompt = f"[PLAN-ONLY MODE - Do not modify files, create commits, or run mutating commands]\nAnalyze this task and output a thorough, structured implementation plan with step-by-step verification criteria:\n{task_desc}"
+        await self._execute_task(prompt)
+
+    async def _cmd_review(self) -> None:
+        import subprocess
+        diff_text = ""
+        try:
+            r = subprocess.run(
+                ["git", "diff", "HEAD"],
+                cwd=str(self.workspace),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            if r.returncode == 0:
+                diff_text = r.stdout.strip()
+        except Exception:
+            pass
+        if not diff_text:
+            self.console.print("  [dim]No uncommitted git changes found to review.[/]")
+            return
+        if len(diff_text) > 4000:
+            diff_text = diff_text[:3900] + "\n...[truncated diff]"
+        prompt = f"[CODE REVIEW MODE]\nReview the following uncommitted git changes in this repository. Identify any bugs, security flaws, missing edge cases, test gaps, or architectural issues:\n\n```diff\n{diff_text}\n```"
+        await self._execute_task(prompt)
 
     async def _cmd_pause(self) -> None:
         if not self.running or self._active_runtime is None:
@@ -1115,45 +1705,6 @@ class InteractiveShell:
         await self._active_runtime.request_cancel("Paused by user (/pause)")
         self.console.print("  [yellow]⚠ Execution paused — state preserved.[/]")
         self.console.print("  [dim]Use /resume to re-run from the preserved state.[/]")
-
-    def _vm_snapshot(self) -> dict[str, Any] | None:
-        if self._view_model is None:
-            return None
-        return self._view_model.snapshot()
-
-    def _cmd_agents(self) -> None:
-        snap = self._vm_snapshot()
-        if not snap:
-            self.console.print("  [dim]No unified execution active. Use mode=unified.[/]")
-            return
-        agents = snap.get("agents", [])
-        if not agents:
-            self.console.print("  [dim]No agents started yet.[/]")
-            return
-        table = Table(title="Agents", border_style="dim")
-        table.add_column("Role", style="bold")
-        table.add_column("Status")
-        table.add_column("Operation", max_width=40)
-        table.add_column("Elapsed", justify="right")
-        for a in agents:
-            color = {"completed": "green", "failed": "red", "running": "cyan", "waiting": "yellow", "blocked": "red", "queued": "dim"}.get(a.get("status", ""), "white")
-            table.add_row((a.get("role") or "agent").upper(), f"[{color}]{a.get('status', '?')}[/]", a.get("operation") or "", _format_elapsed(a.get("elapsed", 0)))
-        self.console.print(table)
-
-    def _cmd_plan(self) -> None:
-        snap = self._vm_snapshot()
-        if not snap:
-            self.console.print("  [dim]No unified execution active. Use mode=unified.[/]")
-            return
-        self.console.print(f"  Stage: [bold]{snap.get('stage', '?')}[/]")
-        metrics = snap.get("metrics", {})
-        planned = metrics.get("plan_tasks", 0)
-        agents = snap.get("agents", [])
-        if planned:
-            self.console.print(f"  Planned tasks: {planned}")
-        if agents:
-            done = sum(1 for a in agents if a.get("status") == "completed")
-            self.console.print(f"  Agents: {done}/{len(agents)} complete")
 
     def _cmd_activity(self) -> None:
         snap = self._vm_snapshot()
@@ -1201,7 +1752,6 @@ class InteractiveShell:
         self._last_model_error = ""
         self._9router_indicated = False
         if getattr(self, '_first_task', True):
-            self.console.clear()
             self._first_task = False
             
         if self.mode == "unified":
@@ -1263,7 +1813,15 @@ class InteractiveShell:
         run = None
         if self.session_manager and self.session_id:
             try:
-                run = self.session_manager.start_run(self.session_id, task=goal, model_id=self.current_model, provider=self.current_provider)
+                run = self.session_manager.start_run(self.session_id, task=goal, model_id=self.current_model or self.model or "", provider=self.current_provider or "")
+                from harness_core.session.domain import SessionEvent
+                self.session_manager.storage.record_event(
+                    SessionEvent(
+                        session_id=self.session_id,
+                        event_type="user.message",
+                        data={"message": goal},
+                    )
+                )
             except Exception:
                 pass
         try:
@@ -1325,15 +1883,28 @@ class InteractiveShell:
             engine = NextActionEngine()
             actions = engine.suggest(goal, files=files_changed)
 
+            # Compute failure diagnosis and verification status upfront
+            error_line = ""
+            if status_val != "completed":
+                error_msg = outcome.state.blockers[-1] if outcome.state.blockers else ""
+                diagnostic = str(error_msg or self._last_model_error)
+                error_line = _safe_str(diagnostic) if self.verbose and diagnostic else _friendly_model_error(diagnostic)
+
+            v_status = outcome.state.verification_status.value if outcome.state.verification_status else "not_started"
+            v_reason = outcome.state.verification_summary or ("task stopped before verification ran" if status_val != "completed" else "")
+
             # Stream final response (spec §9) — then completion indicator (spec §8)
             if conv is not None:
                 try:
+                    if getattr(self, "_9router_indicated", False):
+                        conv.set_9router(True)
                     if agent_text:
                         conv.stream_response(agent_text)
                     conv.render_completion(
                         elapsed,
                         success=(status_val == "completed"),
                         status=status_val,
+                        error_detail=error_line,
                         model=self.current_model,
                         models_used=models_used,
                         phase_durations=execution_timing,
@@ -1341,6 +1912,9 @@ class InteractiveShell:
                         files_changed=files_changed,
                         file_change_stats=file_change_stats,
                         test_results=test_results,
+                        verification_status=v_status if status_val != "completed" else None,
+                        verification_summary=v_reason if status_val != "completed" else None,
+                        unverified_files=files_changed if status_val != "completed" else None,
                     )
                 except Exception:
                     # Fallback markdown print
@@ -1353,11 +1927,13 @@ class InteractiveShell:
                             self.console.print(f"  {line}", highlight=False)
                     elapsed_str = _format_elapsed(elapsed)
                     if status_val == "completed":
-                        mark = "✓" if not self.plain else "✓"
+                        mark = Sym.CHECK
                         self.console.print(f"  [green]{mark}[/] [dim]Done · {elapsed_str}[/]", highlight=False)
                     else:
-                        mark = "✗"
+                        mark = Sym.CROSS
                         self.console.print(f"  [red]{mark}[/] [dim]{status_val.title()} · {elapsed_str}[/]", highlight=False)
+                        if error_line:
+                            self.console.print(f"  [dim red]{error_line}[/]", highlight=False)
                     self.console.print("", highlight=False)
             else:
                 if agent_text and not self.plain:
@@ -1371,38 +1947,85 @@ class InteractiveShell:
 
                 elapsed_str = _format_elapsed(elapsed)
                 if status_val == "completed":
-                    self.console.print(f"  [green]✓[/] [dim]Done · {elapsed_str}[/]", highlight=False)
+                    self.console.print(f"  [green]{Sym.CHECK}[/] [dim]Done · {elapsed_str}[/]", highlight=False)
                 else:
-                    self.console.print(f"  [red]✗[/] [dim]{status_val.title()} · {elapsed_str}[/]", highlight=False)
-                self.console.print("", highlight=False)
-
-            # Keep detailed diagnostics available in verbose mode; normal mode
-            # gets a category-specific summary without provider internals.
-            if status_val != "completed":
-                error_msg = outcome.state.blockers[-1] if outcome.state.blockers else ""
-                diagnostic = str(error_msg or self._last_model_error)
-                error_line = _safe_str(diagnostic) if self.verbose and diagnostic else _friendly_model_error(diagnostic)
-                self.console.print(f"  {error_line}", highlight=False)
-                if files_changed:
-                    files_str = ", ".join(files_changed)
-                    self.console.print(
-                        f"  [yellow]Note: Partial changes were saved in {len(files_changed)} file(s): {files_str}.[/]\n"
-                        f"  [yellow]These changes are UNVERIFIED. Inspect or revert them before retrying.[/]",
-                        highlight=False,
-                    )
-                v_status = outcome.state.verification_status.value if outcome.state.verification_status else "not_started"
-                if v_status in ("not_started", "failed"):
-                    v_reason = outcome.state.verification_summary or "task stopped before verification ran"
-                    self.console.print(f"  [dim]Verification: {v_status.title()} ({v_reason})[/]", highlight=False)
+                    self.console.print(f"  [red]{Sym.CROSS}[/] [dim]{status_val.title()} · {elapsed_str}[/]", highlight=False)
+                    if error_line:
+                        self.console.print(f"  [dim red]{error_line}[/]", highlight=False)
                 self.console.print("", highlight=False)
             if run and self.session_manager:
                 try:
+                    v_passed = (
+                        (status_val == "completed")
+                        if (outcome.state.verification_status and outcome.state.verification_status.value == "skipped")
+                        else (outcome.state.verification_status.value == "passed" if outcome.state.verification_status else status_val == "completed")
+                    )
                     self.session_manager.complete_run(
                         run.run_id,
                         outcome="success" if status_val == "completed" else "failure",
-                        verification_passed=(outcome.state.verification_status.value == "passed" if outcome.state.verification_status else status_val == "completed"),
+                        verification_passed=v_passed,
                         result_summary=agent_text[:500],
                     )
+                    if status_val == "completed":
+                        try:
+                            self.session_manager.complete_session(self.session_id)
+                        except Exception:
+                            pass
+                    elif status_val == "failed":
+                        try:
+                            self.session_manager.fail_session(self.session_id)
+                        except Exception:
+                            pass
+                    from harness_core.session.domain import SessionEvent
+                    self.session_manager.storage.record_event(
+                        SessionEvent(
+                            session_id=self.session_id,
+                            event_type="assistant.message",
+                            data={"message": agent_text[:1000]},
+                        )
+                    )
+                    import hashlib
+                    import subprocess
+                    git_head = ""
+                    git_branch = ""
+                    git_dirty = False
+                    try:
+                        r_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(self.workspace), capture_output=True, text=True, timeout=5)
+                        if r_head.returncode == 0:
+                            git_head = r_head.stdout.strip()
+                        r_branch = subprocess.run(["git", "branch", "--show-current"], cwd=str(self.workspace), capture_output=True, text=True, timeout=5)
+                        if r_branch.returncode == 0:
+                            git_branch = r_branch.stdout.strip()
+                        r_status = subprocess.run(["git", "status", "--porcelain"], cwd=str(self.workspace), capture_output=True, text=True, timeout=5)
+                        if r_status.returncode == 0:
+                            git_dirty = bool(r_status.stdout.strip())
+                    except Exception:
+                        pass
+
+                    file_hashes: dict[str, str] = {}
+                    for f in files_changed:
+                        fp = Path(self.workspace) / f
+                        if fp.exists() and fp.is_file():
+                            try:
+                                file_hashes[f] = hashlib.sha256(fp.read_bytes()).hexdigest()
+                            except Exception:
+                                pass
+
+                    self.session_manager.create_checkpoint(
+                        session_id=self.session_id,
+                        run_id=run.run_id,
+                        git_head=git_head,
+                        git_branch=git_branch,
+                        git_dirty=git_dirty,
+                        changed_files=files_changed,
+                        current_task=goal,
+                        model_id=self.current_model or "",
+                        verification_status=v_status,
+                        tests_passing=test_results.get("passed", 0) if test_results else 0,
+                        tests_total=test_results.get("total", 0) if test_results else 0,
+                        context_file_hashes=file_hashes,
+                    )
+                    self.session_manager.sync_memory_file(self.workspace)
                 except Exception:
                     pass
             return agent_text or None
@@ -1590,14 +2213,7 @@ class InteractiveShell:
                 event.current_buffer.insert_text("\n")
                 
             def get_prompt_text() -> Any:
-                width = self._get_real_terminal_width()
-                line = "─" * width
-                prompt = (
-                    f"<ansicyan>{line}</ansicyan>\n"
-                    "\n"
-                    '<style fg="#6366f1">></style> '
-                )
-                return HTML(prompt)
+                return self._get_prompt_html()
 
             def get_continuation(width: int, line_number: int, is_soft_wrap: bool) -> Any:
                 return HTML("  ")
@@ -1623,6 +2239,13 @@ class InteractiveShell:
         return self._prompt_session
 
     # ─── Input Handling ──────────────────────────────────────────────
+
+    def _get_prompt_html(self) -> Any:
+        """Return the formatted HTML prompt without auto-wrapping dividers."""
+        from prompt_toolkit.formatted_text import HTML
+        from harness_core.cli.ui import Sym, is_unicode_supported
+        sym = Sym.PROMPT if (is_unicode_supported() and not self.plain) else Sym.PROMPT_ASCII
+        return HTML(f'<style fg="#06b6d4">{sym}</style> ')
 
     def _get_real_terminal_width(self, fallback: int = 80) -> int:
         try:
@@ -1717,6 +2340,7 @@ class InteractiveShell:
                     
                 # The execution runs and blockingly updates the Live UI.
                 # No prompt is shown while this runs, matching the spec.
+                user_input = expand_file_mentions(user_input, self.workspace)
                 await self._execute_task(user_input)
                 
         except KeyboardInterrupt:
@@ -1746,6 +2370,18 @@ def run_interactive(
     plain: bool = False,
     max_iterations: int = 30,
     max_cost: float | None = None,
+    session_id: str | None = None,
+    resume_latest: bool = False,
 ) -> None:
-    shell = InteractiveShell(model=model, mode=mode, free=free, local=local, plain=plain, max_iterations=max_iterations, max_cost=max_cost)
+    shell = InteractiveShell(
+        model=model,
+        mode=mode,
+        free=free,
+        local=local,
+        plain=plain,
+        max_iterations=max_iterations,
+        max_cost=max_cost,
+        session_id=session_id,
+        resume_latest=resume_latest,
+    )
     asyncio.run(shell.run())

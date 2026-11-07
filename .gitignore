@@ -69,6 +69,11 @@ model-cache/
 embeddings/
 *.sqlite-wal
 *.sqlite-shm
+*.sqlite
+*.db
+tasks.db
+project-tree.txt
+cleanup-report*.md
 
 # Benchmark generated artifacts
 benchmarks/output/

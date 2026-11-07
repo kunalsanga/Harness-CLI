@@ -412,7 +412,7 @@ class TestErrorClassification:
         assert classify_error(Exception("500 Internal Server Error")) == ErrorClassification.RETRYABLE
 
     def test_context_overflow_is_rate_limited(self):
-        assert classify_error(Exception("maximum context length exceeded")) == ErrorClassification.RATE_LIMITED
+        assert classify_error(Exception("maximum context length exceeded")) == ErrorClassification.CONTEXT_OVERFLOW
 
 
 # ── Retry Config Tests ──────────────────────────────────────────────────────

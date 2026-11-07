@@ -52,26 +52,33 @@ harness session list
 harness session resume <id>
 ```
 
-## Current Provider Setup
+## Multi-Provider Support & Intelligent Failover
 
-| Provider | Normal task runtime | Credential |
-|----------|---------------------|------------|
-| [OpenRouter](https://openrouter.ai) | Active | `OPENROUTER_API_KEY` |
+Harness supports enterprise-grade multi-provider routing with automatic failover and load distribution across:
 
-Other provider adapter modules remain in the source tree for compatibility and
-isolated tests; they are not selected by the default interactive runtime.
+| Provider | Status | Credential | Default / Tested Models |
+|----------|--------|------------|------------------------|
+| [OpenRouter](https://openrouter.ai) | Active / Gateway | `OPENROUTER_API_KEY` | Dynamic free routing (`openrouter/free`), Mistral, Qwen, DeepSeek |
+| [NVIDIA NIM](https://build.nvidia.com) | Active / High Performance | `NVIDIA_NIM_API_KEY` | `meta/llama-3.1-70b-instruct`, Nemotron, Mixtral |
+| [Groq](https://groq.com) | Active / Ultra Fast LPU | `GROQ_API_KEY` | `llama-3.3-70b-versatile`, `mixtral-8x7b-32768` |
+| [FreeLLMAPI](https://freellmapi.com) | Active / Free Tier | `FREELLMAPI_API_KEY` | Auto-discovery, free models |
+| [Azure OpenAI](https://azure.microsoft.com/en-us/products/ai-services/openai-service) | Active / Enterprise | `AZURE_OPENAI_API_KEY` | Custom deployment endpoints, GPT-4o |
+| [OpenAI](https://platform.openai.com) | Active / Custom Endpoint | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini`, `gpt-4o-mini`, compatible endpoints |
 
-### Free Models
-
-Harness supports free models out of the box:
+### Pre-Deployment & Provider Management Commands
 
 ```bash
-harness models list --free
-harness models recommend --task "Fix failing tests"
-```
+# Provider Status & Health
+harness providers status          # Show connection health, masked credentials, and model counts
+harness providers test            # Non-destructive connectivity and latency probe
+harness config validate           # Validate configuration and provider priority order
 
-`harness models local` reports provider status. It currently does not activate
-or discover Ollama models.
+# Model Discovery
+harness models list               # List all discovered models across active providers
+harness models list --free        # Free models only
+harness models list --provider nvidia # Specific provider catalog
+harness models recommend --task "..." # Best model for a task
+```
 
 ## Commands
 

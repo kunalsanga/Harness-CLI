@@ -28,10 +28,12 @@ def _error_category(status: int, message: str) -> ProviderErrorCategory:
         return ProviderErrorCategory.AUTHENTICATION
     if status == 403 or "forbidden" in low or "permission" in low or "only available on" in low or "access denied" in low:
         return ProviderErrorCategory.PERMISSION
+    if status == 402 or "payment required" in low or "insufficient credits" in low or any(
+        kw in low for kw in ("insufficient_quota", "exceeded your current quota", "check your plan and billing", "quota exceeded")
+    ):
+        return ProviderErrorCategory.PAYMENT_REQUIRED
     if status == 429 or "rate limit" in low or "too many requests" in low:
         return ProviderErrorCategory.RATE_LIMIT
-    if status == 402 or "payment required" in low or "insufficient credits" in low:
-        return ProviderErrorCategory.PAYMENT_REQUIRED
     if status == 408 or "request timeout" in low:
         return ProviderErrorCategory.TIMEOUT
     if status == 413 or any(
@@ -234,6 +236,154 @@ class OpenAIProvider(OpenAICompatibleProvider):
     default_base_url = "https://api.openai.com/v1"
     default_model = "gpt-4o-mini"
     api_key_env = "OPENAI_API_KEY"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        default_model: str | None = None,
+        timeout: float = 120.0,
+    ) -> None:
+        import os
+        from harness_core.config.credentials import CredentialResolver
+        resolver = CredentialResolver()
+        cred = resolver.resolve("openai")
+        resolved_key = api_key or (cred.api_key if cred else "") or os.environ.get("OPENAI_API_KEY", "")
+        resolved_url = (
+            base_url
+            or (cred.base_url if cred else None)
+            or os.environ.get("OPENAI_BASE_URL")
+            or self.default_base_url
+        )
+        resolved_model = (
+            default_model
+            or (cred.default_model if cred else None)
+            or os.environ.get("OPENAI_MODEL")
+            or self.default_model
+        )
+        super().__init__(
+            api_key=resolved_key,
+            base_url=resolved_url,
+            default_model=resolved_model,
+            provider_name=self.provider_name,
+            api_key_env=self.api_key_env,
+            timeout=timeout,
+        )
+
+    async def health_check(self) -> bool:
+        if not self.api_key:
+            return False
+        try:
+            resp = await self._client.get("/models", timeout=8.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def list_models(self) -> list[ModelInfo]:
+        """List models with OpenAI-specific capability and context inference."""
+        known_context = {
+            "gpt-4o": 128000,
+            "gpt-4o-mini": 128000,
+            "gpt-4o-2024-08-06": 128000,
+            "gpt-4o-2024-05-13": 128000,
+            "gpt-4o-mini-2024-07-18": 128000,
+            "gpt-4-turbo": 128000,
+            "gpt-4": 8192,
+            "gpt-3.5-turbo": 16385,
+            "o1": 200000,
+            "o1-preview": 128000,
+            "o1-mini": 128000,
+            "o3-mini": 200000,
+            "gpt-5": 200000,
+            "gpt-5-mini": 200000,
+            "gpt-5-turbo": 200000,
+        }
+        excluded_prefixes = (
+            "text-embedding", "whisper", "dall-e", "tts", "davinci", "babbage",
+            "moderation", "audio", "realtime", "canary"
+        )
+        try:
+            raw_models = await super().list_models()
+            chat_models: list[ModelInfo] = []
+            for m in raw_models:
+                m_id = m.id.lower()
+                if any(m_id.startswith(p) for p in excluded_prefixes):
+                    continue
+                is_chat = (
+                    "gpt" in m_id
+                    or m_id.startswith("o1")
+                    or m_id.startswith("o3")
+                    or "chat" in m_id
+                )
+                if not is_chat:
+                    continue
+                supports_tools = True
+                if m_id.startswith(("o1-preview", "o1-mini")):
+                    supports_tools = False
+
+                cw = known_context.get(m_id, m.context_window or 128000)
+                chat_models.append(ModelInfo(
+                    id=m.id,
+                    name=m.name,
+                    provider=self.name,
+                    context_window=cw,
+                    supports_tools=supports_tools,
+                    supports_streaming=True,
+                    supports_vision="vision" in m_id or "gpt-4o" in m_id or "gpt-5" in m_id,
+                    supports_structured_output=True,
+                    is_free=False,
+                    is_local=False,
+                ))
+            if chat_models:
+                return chat_models
+        except Exception:
+            pass
+
+        return [
+            ModelInfo(
+                id="gpt-4o-mini",
+                name="GPT-4o mini",
+                provider=self.name,
+                context_window=128000,
+                supports_tools=True,
+                supports_streaming=True,
+                supports_structured_output=True,
+                is_free=False,
+            ),
+            ModelInfo(
+                id="gpt-4o",
+                name="GPT-4o",
+                provider=self.name,
+                context_window=128000,
+                supports_tools=True,
+                supports_streaming=True,
+                supports_vision=True,
+                supports_structured_output=True,
+                is_free=False,
+            ),
+            ModelInfo(
+                id="o3-mini",
+                name="o3-mini",
+                provider=self.name,
+                context_window=200000,
+                supports_tools=True,
+                supports_streaming=True,
+                supports_reasoning=True,
+                is_free=False,
+            ),
+            ModelInfo(
+                id="gpt-5",
+                name="GPT-5",
+                provider=self.name,
+                context_window=200000,
+                supports_tools=True,
+                supports_streaming=True,
+                supports_vision=True,
+                supports_structured_output=True,
+                is_free=False,
+            ),
+        ]
 
 
 class AnthropicProvider(ModelProvider):

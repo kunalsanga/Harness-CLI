@@ -195,7 +195,7 @@ class GroqProvider(ModelProvider):
                     supports_tools=True,
                     cost_per_1k_input=0,
                     cost_per_1k_output=0,
-                    is_free=False,
+                    is_free=True,
                 )
             )
         return models

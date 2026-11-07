@@ -452,6 +452,30 @@ class SessionStorage:
                 cursor = conn.execute(query, params)
                 return [self._row_to_memory(r) for r in cursor.fetchall()]
 
+    def get_project_memories(
+        self,
+        workspace_path: str,
+        memory_type: MemoryType | None = None,
+        min_importance: float = 0.0,
+        limit: int = 100,
+    ) -> list[MemoryItem]:
+        """Get all memories across sessions belonging to the given workspace."""
+        with self._lock:
+            with self._get_conn() as conn:
+                query = """
+                    SELECT m.* FROM memory m
+                    JOIN sessions s ON m.session_id = s.session_id
+                    WHERE s.workspace_path = ? AND m.importance >= ?
+                """
+                params: list[Any] = [workspace_path, min_importance]
+                if memory_type:
+                    query += " AND m.memory_type = ?"
+                    params.append(memory_type.value)
+                query += " ORDER BY m.importance DESC, m.created_at DESC LIMIT ?"
+                params.append(limit)
+                cursor = conn.execute(query, params)
+                return [self._row_to_memory(r) for r in cursor.fetchall()]
+
     def search_memories(
         self,
         session_id: str,

@@ -376,3 +376,69 @@ class TestAsyncBugFix:
         shell = self._make_shell()
         source = inspect.getsource(shell._handle_command)
         assert "asyncio.run" not in source, "_handle_command must not call asyncio.run()"
+
+
+class TestCommandRenderingNarrowWide:
+    """Test command output readability across narrow (<90 cols) and wide terminals."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [60, 100])
+    async def test_commands_render_cleanly(self, width: int):
+        import io
+        from rich.console import Console
+        from harness_core.routing.router import ModelRouter, RouterConfig
+        from harness_core.models.registry import ModelRegistry
+        from harness_core.routing.task_aware import TaskAwareRouter
+        from harness_core.providers.base import ModelProvider, ModelInfo
+
+        class DummyProvider(ModelProvider):
+            name = "dummy"
+            def is_available(self): return True
+            async def generate(self, *a, **k): return None
+            async def stream(self, *a, **k): yield ""
+            async def health_check(self): return True
+            async def complete(self, *a, **k): return None
+            async def list_models(self):
+                return [ModelInfo(id="dummy/m1", name="Dummy 1", provider="dummy", is_free=True, supports_tools=True)]
+
+        shell = InteractiveShell(plain=False)
+        out = io.StringIO()
+        shell.console = Console(file=out, width=width, force_terminal=True)
+        provider = DummyProvider()
+        shell._router = ModelRouter(
+            providers=[provider],
+            config=RouterConfig(),
+            task_aware=TaskAwareRouter(registry=ModelRegistry()),
+        )
+
+        # 1. /help
+        shell._cmd_help()
+        help_output = out.getvalue()
+        assert "Commands" in help_output
+        assert "/help" in help_output
+
+        # 2. /status
+        out.seek(0); out.truncate(0)
+        shell._cmd_status()
+        status_output = out.getvalue()
+        assert "Status" in status_output
+        assert "Workspace" in status_output
+
+        # 3. /models
+        out.seek(0); out.truncate(0)
+        await shell._cmd_models()
+        models_output = out.getvalue()
+        assert "Models" in models_output
+        assert "Dummy 1" in models_output or "dummy/m1" in models_output
+        if width < 90:
+            # Narrow mode hides Source and Tools columns
+            assert "Source" not in models_output
+        else:
+            assert "Source" in models_output
+            assert "Tools" in models_output
+
+        # 4. /session
+        out.seek(0); out.truncate(0)
+        shell._cmd_session("show")
+        shell._cmd_session("list")
+

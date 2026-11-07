@@ -13,14 +13,12 @@ from harness_core.providers.base import CompletionRequest
 def clean_env():
     """Ensure clean environment for provider tests."""
     old_env = dict(os.environ)
-    if "NVIDIA_API_KEY" in os.environ:
-        del os.environ["NVIDIA_API_KEY"]
-    if "NVIDIA_BASE_URL" in os.environ:
-        del os.environ["NVIDIA_BASE_URL"]
-    if "NVIDIA_MODEL" in os.environ:
-        del os.environ["NVIDIA_MODEL"]
+    for k in list(os.environ.keys()):
+        if k.startswith("NVIDIA_"):
+            del os.environ[k]
     
-    yield
+    with patch("harness_core.config.dotenv.load_dotenv"):
+        yield
     
     os.environ.clear()
     os.environ.update(old_env)

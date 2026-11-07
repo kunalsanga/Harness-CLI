@@ -654,6 +654,10 @@ class Task:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     tokens_estimated: bool = False
+    providers_used: list[str] = field(default_factory=list)
+    provider_token_usage: dict[str, dict[str, int]] = field(default_factory=dict)
+    model_token_usage: dict[str, dict[str, int]] = field(default_factory=dict)
+    estimated_cost: float = 0.0
 
 
 class TaskPhase(Enum):

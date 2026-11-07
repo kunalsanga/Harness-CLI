@@ -43,11 +43,18 @@ console = Console()
 
 
 @app.callback(invoke_without_command=True)
-def _main_callback(ctx: typer.Context) -> None:
+def _main_callback(
+    ctx: typer.Context,
+    continue_session: bool = typer.Option(False, "--continue", "-c", help="Continue the most recent session in this workspace"),
+    resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a specific session ID"),
+) -> None:
     """Start interactive shell when no subcommand is given."""
     if ctx.invoked_subcommand is None:
         from harness_core.cli.interactive import run_interactive
-        run_interactive()
+        run_interactive(
+            resume_latest=continue_session,
+            session_id=resume,
+        )
 
 # Sub-commands
 config_app = typer.Typer(help="Configuration commands")
@@ -576,6 +583,8 @@ def shell(
     plain: bool = typer.Option(False, "--plain", help="Plain terminal mode"),
     max_iterations: int = typer.Option(30, "--max-iterations", help="Max iterations"),
     max_cost: Optional[float] = typer.Option(None, "--max-cost", help="Max cost"),
+    continue_session: bool = typer.Option(False, "--continue", "-c", help="Continue the most recent session in this workspace"),
+    resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a specific session ID"),
 ) -> None:
     """Start an interactive coding session."""
     from harness_core.cli.interactive import run_interactive
@@ -587,6 +596,8 @@ def shell(
         plain=plain,
         max_iterations=max_iterations,
         max_cost=max_cost,
+        resume_latest=continue_session,
+        session_id=resume,
     )
 
 
@@ -606,7 +617,7 @@ def doctor() -> None:
     console.print("\n[bold]Providers[/]")
 
     async def _check_providers() -> None:
-        configured = create_providers(load_project_provider_config(Path.cwd()))
+        configured = create_providers(load_project_provider_config(Path.cwd()), auto_discover=True)
         try:
             for provider in configured:
                 if await provider.health_check():
@@ -751,7 +762,7 @@ async def _discover_configured_model_profiles():
     from harness_core.models.discovery import discover_provider
     from harness_core.providers.factory import create_providers, load_project_provider_config
 
-    providers = create_providers(load_project_provider_config(Path.cwd()))
+    providers = create_providers(load_project_provider_config(Path.cwd()), auto_discover=True)
     profiles = []
     try:
         for configured_provider in providers:
@@ -770,7 +781,12 @@ def models_list(
     from harness_core.providers.factory import create_providers, load_project_provider_config
 
     async def _list_models() -> None:
-        providers = create_providers(load_project_provider_config(Path.cwd()))
+        p_ids = [provider.lower()] if provider else None
+        providers = create_providers(
+            load_project_provider_config(Path.cwd()),
+            provider_ids=p_ids,
+            auto_discover=True,
+        )
         all_models = []
         try:
             for configured_provider in providers:
@@ -1084,7 +1100,7 @@ def models_benchmark(
         console.print(f"[bold blue]Benchmarking {model}...[/]")
         console.print("[dim]Running in isolated workspaces. This may take a while.[/]")
 
-        configured_providers = create_providers(load_project_provider_config(Path.cwd()))
+        configured_providers = create_providers(load_project_provider_config(Path.cwd()), auto_discover=True)
         model_provider = model.split("::", 1)[0] if "::" in model else ""
         provider = next((item for item in configured_providers if item.name == model_provider), None)
         if provider is None:
@@ -1538,6 +1554,54 @@ def config_show() -> None:
         console.print("[red]No configuration found. Run `harness init` first.[/]")
 
 
+@config_app.command("validate")
+def config_validate() -> None:
+    """Validate project configuration and provider environment variables."""
+    from harness_core.config.credentials import CredentialResolver
+    from harness_core.providers.factory import load_project_provider_config
+
+    console.print("[bold]Validating Harness Configuration...[/]\n")
+    resolver = CredentialResolver()
+
+    # 1. Validate .harness/config.yaml if present
+    cfg_file = Path(".harness/config.yaml")
+    if cfg_file.exists():
+        try:
+            cfg = load_project_provider_config(Path.cwd())
+            console.print("  [green][PASS][/] .harness/config.yaml parsed successfully")
+            if "providers_priority" in cfg or "provider_priority" in cfg:
+                prio = cfg.get("providers_priority") or cfg.get("provider_priority")
+                console.print(f"  [cyan][INFO][/] Provider priority: {prio}")
+        except Exception as exc:
+            console.print(f"  [red][FAIL][/] .harness/config.yaml error: {exc}")
+    else:
+        console.print("  [yellow][INFO][/] No local .harness/config.yaml (using environment configuration)")
+
+    # 2. Check Target AI Providers
+    target_providers = [
+        ("openrouter", "OPENROUTER_API_KEY"),
+        ("openai", "OPENAI_API_KEY"),
+        ("nvidia", "NVIDIA_NIM_API_KEY / NVIDIA_API_KEY"),
+        ("freellmapi", "FREELLMAPI_API_KEY / FREELLMAPI_BASE_URL"),
+    ]
+
+    configured_count = 0
+    console.print("\n[bold]Target Providers Status:[/]")
+    for name, env_hint in target_providers:
+        cred = resolver.resolve(name)
+        if cred and (cred.api_key or cred.base_url):
+            configured_count += 1
+            masked = cred.masked_key if cred.api_key else "(no key required)"
+            console.print(f"  [green][OK][/] {name:12} Configured ({masked})")
+        else:
+            console.print(f"  [dim][--][/] {name:12} Not configured ({env_hint})")
+
+    if configured_count == 0:
+        console.print("\n[bold red][!] No AI providers configured.[/] Set OPENROUTER_API_KEY or configure a provider.")
+    else:
+        console.print(f"\n[bold green][PASS][/] {configured_count} provider(s) ready.")
+
+
 # ── M7 Extension CLI Commands ──────────────────────────────────────────────
 
 plugin_app = typer.Typer(help="Plugin management")
@@ -1862,9 +1926,10 @@ def providers_list(
     providers_info = [
         {"name": "openrouter", "env_var": "OPENROUTER_API_KEY", "description": "OpenRouter model gateway"},
         {"name": "openai", "env_var": "OPENAI_API_KEY", "description": "OpenAI API"},
+        {"name": "freellmapi", "env_var": "FREELLMAPI_API_KEY / FREELLMAPI_BASE_URL", "description": "FreeLLMAPI gateway endpoint"},
+        {"name": "nvidia", "env_var": "NVIDIA_NIM_API_KEY / NVIDIA_API_KEY", "description": "NVIDIA NIM API"},
         {"name": "anthropic", "env_var": "ANTHROPIC_API_KEY", "description": "Anthropic Messages API"},
         {"name": "gemini", "env_var": "GEMINI_API_KEY", "description": "Google Gemini API"},
-        {"name": "nvidia", "env_var": "NVIDIA_API_KEY", "description": "NVIDIA NIM API"},
         {"name": "groq", "env_var": "GROQ_API_KEY", "description": "Groq API"},
         {"name": "ollama", "env_var": "", "description": "Local Ollama endpoint"},
         {"name": "9router", "env_var": "NINE_ROUTER_API_KEY", "description": "9router gateway"},
@@ -1893,6 +1958,158 @@ def providers_list(
     console.print(table)
     console.print("\n[bold]Configure:[/]")
     console.print("  [cyan]harness auth setup --provider <name>[/]")
+
+
+@providers_app.command("status")
+def providers_status(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Show detailed provider status, health, endpoints, and credentials."""
+    from harness_core.config.credentials import CredentialResolver, mask_secret
+    from harness_core.providers.factory import create_providers, load_project_provider_config
+
+    resolver = CredentialResolver()
+    providers_list_names = ["openrouter", "openai", "nvidia", "freellmapi", "groq", "anthropic", "gemini", "ollama"]
+
+    async def _gather_status():
+        try:
+            configured_instances = {
+                p.name: p
+                for p in create_providers(load_project_provider_config(Path.cwd()), auto_discover=True)
+            }
+        except Exception:
+            configured_instances = {}
+
+        results = []
+        for name in providers_list_names:
+            cred = resolver.resolve(name)
+            has_cred = cred is not None and bool(cred.api_key or cred.base_url)
+            inst = configured_instances.get(name)
+
+            state = "Unconfigured"
+            models_count = 0
+            base_url = (cred.base_url if cred else None) or (getattr(inst, "base_url", None) if inst else "-") or "-"
+            masked_key = mask_secret(cred.api_key) if cred and cred.api_key else ("(none)" if name == "ollama" else "-")
+
+            if inst:
+                try:
+                    is_healthy = await inst.health_check()
+                    state = "Healthy" if is_healthy else "Degraded"
+                except Exception:
+                    state = "Temporarily unavailable"
+                try:
+                    models = await inst.list_models()
+                    models_count = len(models)
+                except Exception:
+                    models_count = len(getattr(inst, "configured_models", []))
+            elif has_cred:
+                state = "Configured"
+
+            results.append({
+                "provider": name,
+                "status": state,
+                "credential": masked_key,
+                "base_url": str(base_url),
+                "models": models_count,
+            })
+        return results
+
+    status_data = asyncio.run(_gather_status())
+
+    if json_output:
+        print(json.dumps(status_data, indent=2))
+        return
+
+    table = Table(title="PROVIDER STATUS")
+    table.add_column("Provider", style="cyan")
+    table.add_column("Status")
+    table.add_column("Credential", style="dim")
+    table.add_column("Base URL", max_width=38)
+    table.add_column("Models", justify="right")
+
+    for row in status_data:
+        st = row["status"]
+        if st in ("Healthy", "Available"):
+            status_fmt = f"[green]{st}[/]"
+        elif st in ("Configured",):
+            status_fmt = f"[blue]{st}[/]"
+        elif st in ("Degraded", "Temporarily unavailable"):
+            status_fmt = f"[yellow]{st}[/]"
+        elif st in ("Auth Failed", "Rate Limited", "Quota Exhausted"):
+            status_fmt = f"[red]{st}[/]"
+        else:
+            status_fmt = f"[dim]{st}[/]"
+
+        table.add_row(
+            row["provider"],
+            status_fmt,
+            row["credential"],
+            row["base_url"],
+            str(row["models"]) if row["models"] else "-",
+        )
+
+    console.print(table)
+
+
+@providers_app.command("test")
+def providers_test(
+    provider_name: Optional[str] = typer.Option(None, "--provider", "-p", help="Specific provider to test"),
+) -> None:
+    """Test connection, authentication, and capability across configured providers."""
+    import time
+    from harness_core.providers.factory import create_providers, load_project_provider_config
+    from harness_core.providers.base import CompletionRequest
+
+    async def _test():
+        try:
+            providers = create_providers(load_project_provider_config(Path.cwd()), auto_discover=True)
+        except Exception as exc:
+            console.print(f"[red]Error loading providers: {exc}[/]")
+            return
+
+        if provider_name:
+            providers = [p for p in providers if p.name == provider_name.lower()]
+            if not providers:
+                console.print(f"[yellow]Provider '{provider_name}' is not configured or enabled.[/]")
+                return
+
+        table = Table(title="Provider Connection Tests")
+        table.add_column("Provider", style="cyan")
+        table.add_column("Result")
+        table.add_column("Latency")
+        table.add_column("Details")
+
+        for p in providers:
+            start = time.time()
+            try:
+                health = await p.health_check()
+                latency = round((time.time() - start) * 1000, 1)
+                if not health:
+                    table.add_row(p.name, "[red]FAIL[/]", f"{latency}ms", "Health check returned False")
+                    continue
+
+                models = await p.list_models()
+                models_summary = f"{len(models)} models discovered"
+
+                test_req = CompletionRequest(
+                    messages=[{"role": "user", "content": "Reply with exactly: provider connection successful."}],
+                    max_tokens=10,
+                )
+                try:
+                    res = await p.generate(test_req)
+                    res_text = (res.content or "").strip()[:50]
+                    table.add_row(p.name, "[green]PASS[/]", f"{latency}ms", f"{models_summary}; response: '{res_text}'")
+                except Exception:
+                    table.add_row(p.name, "[green]PASS[/]", f"{latency}ms", f"{models_summary} (connection verified)")
+            except Exception as exc:
+                latency = round((time.time() - start) * 1000, 1)
+                table.add_row(p.name, "[red]FAIL[/]", f"{latency}ms", str(exc)[:80])
+            finally:
+                await p.close()
+
+        console.print(table)
+
+    asyncio.run(_test())
 
 
 @providers_app.command("configure")
@@ -1936,7 +2153,7 @@ def setup() -> None:
     console.print("[bold]Step 1: Checking configuration...[/]")
     from harness_core.providers.factory import create_providers, load_project_provider_config
     try:
-        configured = create_providers(load_project_provider_config(Path.cwd()))
+        configured = create_providers(load_project_provider_config(Path.cwd()), auto_discover=True)
     except Exception as exc:
         console.print(f"[red]Provider configuration error: {exc}[/]")
         return

@@ -18,6 +18,7 @@ from .domain import (
     Checkpoint,
     MemoryItem,
     MemoryType,
+    ReconciliationReport,
     Run,
     RunStatus,
     Session,
@@ -115,10 +116,27 @@ class SessionManager:
         session = self.storage.get_session(session_id)
         if session is None:
             raise ValueError(f"Session {session_id} not found")
+        if session.status == SessionStatus.ACTIVE:
+            session.transition_to(SessionStatus.COMPLETED)
         session.transition_to(SessionStatus.ARCHIVED)
         self.storage.update_session(session)
         self._emit_event(session_id, "session.archived", {})
         return session
+
+    def rename_session(self, session_id: str, new_title: str) -> Session:
+        """Rename an existing session."""
+        session = self.storage.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Session {session_id} not found")
+        session.title = new_title.strip()
+        self.storage.update_session(session)
+        self._emit_event(session_id, "session.renamed", {"title": session.title})
+        return session
+
+    def get_latest_session(self, workspace_path: str | None = None) -> Session | None:
+        """Get the most recently updated session, optionally scoped to a workspace."""
+        sessions = self.storage.list_sessions(workspace_path=workspace_path, limit=1)
+        return sessions[0] if sessions else None
 
     # ── Run management ───────────────────────────────────────────────────
 
@@ -241,6 +259,7 @@ class SessionManager:
         tests_passing: int = 0,
         tests_total: int = 0,
         context_files: list[str] | None = None,
+        context_file_hashes: dict[str, str] | None = None,
         repository_summary: str = "",
     ) -> Checkpoint:
         """Create a checkpoint at a safe boundary."""
@@ -258,6 +277,7 @@ class SessionManager:
             tests_passing=tests_passing,
             tests_total=tests_total,
             context_files=context_files or [],
+            context_file_hashes=context_file_hashes or {},
             repository_summary=repository_summary,
         )
         self.storage.create_checkpoint(cp)
@@ -279,7 +299,7 @@ class SessionManager:
             return None
 
         # Check if resumable
-        if session.status not in (SessionStatus.ACTIVE, SessionStatus.PAUSED, SessionStatus.FAILED):
+        if session.status not in (SessionStatus.ACTIVE, SessionStatus.PAUSED, SessionStatus.FAILED, SessionStatus.COMPLETED):
             return None
 
         runs = self.storage.get_runs(session_id)
@@ -303,6 +323,151 @@ class SessionManager:
             "completed_runs": len([r for r in runs if r.status == RunStatus.COMPLETED]),
             "failed_runs": len([r for r in runs if r.status == RunStatus.FAILED]),
         }
+
+    def reconcile_workspace(
+        self,
+        session_id: str,
+        workspace_path: str | None = None,
+    ) -> ReconciliationReport:
+        """Inspect and reconcile workspace and git state for a resumed session."""
+        session = self.storage.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Session {session_id} not found")
+
+        runs = self.storage.get_runs(session_id)
+        checkpoint = self.storage.get_latest_checkpoint(session_id)
+        target_ws = Path(workspace_path or session.workspace_path or Path.cwd()).resolve()
+
+        # 1. Inspect Git state in target workspace
+        git_head = ""
+        git_branch = ""
+        git_dirty = False
+        import hashlib
+        import subprocess
+
+        try:
+            r_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(target_ws), capture_output=True, text=True, timeout=5)
+            if r_head.returncode == 0:
+                git_head = r_head.stdout.strip()
+            r_branch = subprocess.run(["git", "branch", "--show-current"], cwd=str(target_ws), capture_output=True, text=True, timeout=5)
+            if r_branch.returncode == 0:
+                git_branch = r_branch.stdout.strip()
+            r_status = subprocess.run(["git", "status", "--porcelain"], cwd=str(target_ws), capture_output=True, text=True, timeout=5)
+            if r_status.returncode == 0:
+                git_dirty = bool(r_status.stdout.strip())
+        except Exception:
+            pass
+
+        # 2. Compare against checkpoint
+        head_matches = True
+        missing_files: list[str] = []
+        externally_modified: list[str] = []
+        stale_tests = False
+
+        if checkpoint:
+            if checkpoint.git_head and git_head and checkpoint.git_head != git_head:
+                head_matches = False
+                stale_tests = True
+
+            for rel_path in checkpoint.changed_files:
+                fpath = target_ws / rel_path
+                if not fpath.exists():
+                    missing_files.append(rel_path)
+                    stale_tests = True
+                elif rel_path in checkpoint.context_file_hashes:
+                    try:
+                        cur_hash = hashlib.sha256(fpath.read_bytes()).hexdigest()
+                        if cur_hash != checkpoint.context_file_hashes[rel_path]:
+                            externally_modified.append(rel_path)
+                            stale_tests = True
+                    except Exception:
+                        pass
+
+            if checkpoint.verification_status != "passed":
+                stale_tests = True
+
+        # 3. Analyze runs and tasks
+        last_task = ""
+        last_outcome = ""
+        completed_steps: list[str] = []
+        unresolved_steps: list[str] = []
+
+        for r in runs:
+            if r.status == RunStatus.COMPLETED:
+                completed_steps.append(r.task)
+            elif r.status in (RunStatus.FAILED, RunStatus.INTERRUPTED):
+                unresolved_steps.append(f"{r.task} ({r.status.value})")
+
+        if runs:
+            last_run = runs[-1]
+            last_task = last_run.task
+            last_outcome = last_run.outcome or last_run.status.value
+
+        # 4. Determine recommended action
+        if unresolved_steps:
+            recommended_action = f"Continue unfinished work: '{unresolved_steps[-1]}'"
+        elif externally_modified:
+            recommended_action = f"Review external changes to {', '.join(externally_modified[:3])} and run tests."
+        elif stale_tests:
+            recommended_action = "Run verification tests to validate current codebase state."
+        elif last_task:
+            recommended_action = f"Ready for next phase after: '{last_task}'"
+        else:
+            recommended_action = "Ready for instructions."
+
+        # 5. Build recap text
+        lines = [
+            f"◆ Harness Session Resume",
+            f"  Session: {session.title} ({session.session_id})",
+            f"  Workspace: {target_ws.name}",
+        ]
+        if last_task:
+            lines.append(f"  Last Goal: {last_task} [{last_outcome}]")
+        if checkpoint and checkpoint.changed_files:
+            lines.append(f"  Changed Files: {', '.join(checkpoint.changed_files[:5])}")
+        if externally_modified:
+            lines.append(f"  External Modifications: {', '.join(externally_modified)} (detected since last session)")
+        if missing_files:
+            lines.append(f"  Missing Files: {', '.join(missing_files)}")
+        if checkpoint:
+            v_status = checkpoint.verification_status or "None"
+            t_info = f" ({checkpoint.tests_passing}/{checkpoint.tests_total} passed)" if checkpoint.tests_total > 0 else ""
+            lines.append(f"  Verification: {v_status}{t_info}")
+        lines.append(f"  Next Action: {recommended_action}")
+
+        recap = "\n".join(lines)
+
+        # 6. Re-activate session if paused or failed
+        if session.status in (SessionStatus.PAUSED, SessionStatus.FAILED):
+            session.transition_to(SessionStatus.ACTIVE)
+            self.storage.update_session(session)
+
+        self._emit_event(session_id, "session.reconciled", {
+            "head_matches": head_matches,
+            "modified_files": externally_modified,
+            "missing_files": missing_files,
+            "stale_tests": stale_tests,
+        })
+
+        return ReconciliationReport(
+            session_id=session_id,
+            workspace_path=str(target_ws),
+            session_title=session.title,
+            git_head=git_head,
+            git_branch=git_branch,
+            git_dirty=git_dirty,
+            head_matches=head_matches,
+            externally_modified_files=externally_modified,
+            missing_files=missing_files,
+            stale_tests=stale_tests,
+            last_task=last_task,
+            last_outcome=last_outcome,
+            verification_status=checkpoint.verification_status if checkpoint else "",
+            completed_steps=completed_steps,
+            unresolved_steps=unresolved_steps,
+            recommended_action=recommended_action,
+            recap=recap,
+        )
 
     # ── Memory management ────────────────────────────────────────────────
 
@@ -361,6 +526,72 @@ class SessionManager:
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [m for _, m in scored[:limit]]
+
+    def get_project_memories(
+        self,
+        workspace_path: str,
+        task_keywords: list[str] | None = None,
+        limit: int = 20,
+    ) -> list[MemoryItem]:
+        """Retrieve memories relevant to a project workspace."""
+        all_memories = self.storage.get_project_memories(workspace_path, limit=200)
+
+        if not task_keywords:
+            return sorted(all_memories, key=lambda m: m.importance, reverse=True)[:limit]
+
+        scored: list[tuple[float, MemoryItem]] = []
+        keyword_set = set(k.lower() for k in task_keywords)
+
+        for mem in all_memories:
+            content_lower = mem.content.lower()
+            relevance = sum(1 for k in keyword_set if k in content_lower)
+            score = relevance * 0.6 + mem.importance * 0.4
+            if relevance > 0 or mem.importance >= 0.7:
+                scored.append((score, mem))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, m in scored[:limit]]
+
+    def sync_memory_file(self, workspace_path: str) -> Path:
+        """Write human-readable project memory file in .harness/MEMORY.md."""
+        ws = Path(workspace_path).resolve()
+        harness_dir = ws / ".harness"
+        harness_dir.mkdir(parents=True, exist_ok=True)
+        mem_file = harness_dir / "MEMORY.md"
+
+        memories = self.storage.get_project_memories(str(ws), limit=100)
+        by_type: dict[str, list[MemoryItem]] = {}
+        for m in memories:
+            by_type.setdefault(m.memory_type.value, []).append(m)
+
+        lines = [
+            f"# Project Memory — {ws.name}",
+            "",
+            "> Persistent architectural context, confirmed decisions, and constraints.",
+            "> Automatically synced by Harness across sessions.",
+            "",
+        ]
+
+        section_titles = {
+            "decision": "Confirmed Decisions",
+            "architecture": "Architecture & Structure",
+            "constraint": "Project Constraints",
+            "discovery": "Discoveries & Conventions",
+            "warning": "Known Issues & Warnings",
+            "todo": "Open Items & Next Steps",
+            "note": "General Notes",
+        }
+
+        for mtype, title in section_titles.items():
+            items = by_type.get(mtype, [])
+            if items:
+                lines.append(f"## {title}")
+                for item in items:
+                    lines.append(f"- {item.content}")
+                lines.append("")
+
+        mem_file.write_text("\n".join(lines), encoding="utf-8")
+        return mem_file
 
     def add_decision(self, session_id: str, content: str, importance: float = 0.7) -> MemoryItem:
         """Convenience: add a DECISION memory."""

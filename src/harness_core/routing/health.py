@@ -279,9 +279,11 @@ class ModelHealthTracker:
             state.cooldown_seconds = min(
                 300.0, self._default_cooldown * (2 ** min(state.rate_limit_hits - 1, 4))
             )
+            if cooldown_override is not None:
+                state.cooldown_seconds = cooldown_override
             state.health_status = ModelHealthStatus.RATE_LIMITED
             state.last_error_category = "rate_limit"
-            self._apply_cooldown_for(state, cooldown_override or state.cooldown_seconds)
+            self._apply_cooldown_for(state, state.cooldown_seconds)
         elif event == HealthEvent.TIMEOUT:
             state.timeouts += 1
             state.health_status = ModelHealthStatus.TIMEOUT

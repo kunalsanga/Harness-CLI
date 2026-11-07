@@ -107,6 +107,7 @@ class VerificationStatus(enum.Enum):
     IN_PROGRESS = "in_progress"
     PASSED = "passed"
     FAILED = "failed"
+    SKIPPED = "skipped"
 
 
 @dataclass

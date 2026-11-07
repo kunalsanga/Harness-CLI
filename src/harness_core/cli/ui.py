@@ -44,27 +44,44 @@ class Color:
     NONE = ""
 
 
+def is_unicode_supported() -> bool:
+    """Check if the current terminal encoding supports Unicode symbols."""
+    import sys
+    enc = getattr(sys.stdout, "encoding", None) or ""
+    if not enc:
+        return True
+    try:
+        "❯✓✗⚠⚡◆↳".encode(enc)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
 # ── Symbols ─────────────────────────────────────────────────────────────────
 
-class Sym:
-    """Unicode symbols for consistent visual language."""
+_UNICODE_SUPPORTED = is_unicode_supported()
 
-    DOT = "•"          # •
-    DIAMOND = "◆"      # ◆
-    CHECK = "✓"        # ✓
-    CROSS = "✗"        # ✗
-    WARN = "⚠"         # ⚠
-    SPINNER = "◐"      # ◐
-    CIRCLE = "○"       # ○
-    RING = "◎"         # ◎
-    DASH = "—"         # —
-    ARROW = "→"        # →
-    ARROW_R = "▶"      # ▶
-    THIN_LINE = "─"    # ─
-    BULLET = "•"       # •
-    BOLT = "⚡"         # ⚡
-    STOP = "⏹"         # ⏹
-    HOOK = "↳"         # ↳
+class Sym:
+    """Unicode symbols for consistent visual language with safe ASCII fallbacks."""
+
+    DOT = "•" if _UNICODE_SUPPORTED else "*"
+    DIAMOND = "◆" if _UNICODE_SUPPORTED else "*"
+    CHECK = "✓" if _UNICODE_SUPPORTED else "+"
+    CROSS = "✗" if _UNICODE_SUPPORTED else "x"
+    WARN = "⚠" if _UNICODE_SUPPORTED else "!"
+    SPINNER = "◐" if _UNICODE_SUPPORTED else "*"
+    CIRCLE = "○" if _UNICODE_SUPPORTED else "o"
+    RING = "◎" if _UNICODE_SUPPORTED else "O"
+    DASH = "—" if _UNICODE_SUPPORTED else "-"
+    ARROW = "→" if _UNICODE_SUPPORTED else "->"
+    ARROW_R = "▶" if _UNICODE_SUPPORTED else ">"
+    THIN_LINE = "─" if _UNICODE_SUPPORTED else "-"
+    BULLET = "•" if _UNICODE_SUPPORTED else "*"
+    BOLT = "⚡" if _UNICODE_SUPPORTED else "*"
+    STOP = "⏹" if _UNICODE_SUPPORTED else "[stop]"
+    HOOK = "↳" if _UNICODE_SUPPORTED else "->"
+    PROMPT = "❯" if _UNICODE_SUPPORTED else ">"
+    PROMPT_ASCII = ">"
 
     @classmethod
     def safe_check(cls) -> str:
@@ -304,6 +321,7 @@ def render_welcome(
     model: str = "",
     provider: str = "",
     has_router: bool = False,
+    session_id: str = "",
     *,
     plain: bool = False,
 ) -> None:
@@ -314,17 +332,26 @@ def render_welcome(
       project-name
     """
     import os
-    project_name = os.path.basename(workspace)
+    from pathlib import Path
+    try:
+        home = str(Path.home())
+        ws_display = workspace.replace(home, "~") if home in workspace else workspace
+        if len(ws_display) > 50:
+            ws_display = "~/" + os.path.basename(workspace)
+    except Exception:
+        ws_display = os.path.basename(workspace)
+
+    session_tag = f"  ·  Session: {session_id[:8]}" if session_id else ""
     if plain:
         console.print(f"{Sym.safe_diamond()} Harness")
         console.print(f"  Autonomous AI Engineering")
-        console.print(f"  {project_name}")
+        console.print(f"  {ws_display}{session_tag}")
         console.print("")
         return
     console.print("")
     console.print(f"  [cyan]{Sym.DIAMOND}[/] [bold white]Harness[/]", highlight=False)
     console.print(f"  [dim]Autonomous AI Engineering[/]", highlight=False)
-    console.print(f"  [dim]{project_name}[/]", highlight=False)
+    console.print(f"  [dim]{ws_display}[/][cyan]{session_tag}[/]", highlight=False)
     console.print("")
 
 

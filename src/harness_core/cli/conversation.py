@@ -28,6 +28,7 @@ Layout:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,9 +36,9 @@ from typing import Any
 from rich.console import Console, Group
 from rich.text import Text
 
-from harness_core.cli.ui import Color, Sym, fmt_elapsed, shorten_path, PHASE_DISPLAY, PHASE_ICON
+from harness_core.cli.ui import Color, Sym, fmt_elapsed, shorten_path, PHASE_DISPLAY, PHASE_ICON, is_unicode_supported
 
-_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_SPINNER_FRAMES = ("✳", "✻", "✽", "✶", "·", "✳") if is_unicode_supported() else ("*", "+", "*", "-", ".", "*")
 
 
 def format_token_count(tokens: int, estimated: bool = False, concise: bool = False) -> str:
@@ -49,6 +50,81 @@ def format_token_count(tokens: int, estimated: bool = False, concise: bool = Fal
     if concise:
         return f"~{val} (est)" if estimated else val
     return f"~{val} tokens (est)" if estimated else f"{val} tokens"
+
+
+_INTRO_NARRATION_RE = re.compile(
+    r"^(?:"
+    r"based on (?:my|the|our) (?:analysis|inspection|examination|review)[^.\n]*[.:,]\s*|"
+    r"let me (?:provide|give|present|explain|walk you through)[^.\n]*[.:,]\s*|"
+    r"certainly[,!.]?\s*|"
+    r"sure[,!.]?\s*|"
+    r"i have (?:examined|inspected|analyzed|reviewed) (?:the|these) (?:codebase|files?|project)[^.\n]*[.:,]\s*"
+    r")+\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_intro_narration(text: str) -> str:
+    """Strip redundant meta-narration / throat-clearing from the start of responses."""
+    if not text:
+        return ""
+    stripped = _INTRO_NARRATION_RE.sub("", text.lstrip())
+    return stripped if stripped.strip() else text
+
+
+def compact_markdown_tables(text: str, max_width: int = 80) -> str:
+    """Transform overly wide markdown tables into compact structured lists for readability on narrow terminals."""
+    if not text or "|" not in text:
+        return text
+
+    bullet = Sym.BULLET if is_unicode_supported() else "-"
+    lines = text.splitlines()
+    output_lines: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        # Potential table header: starts and ends with '|'
+        if stripped.startswith("|") and stripped.endswith("|") and i + 1 < len(lines):
+            sep_line = lines[i + 1].strip()
+            # Verify separator: |---|---|
+            if sep_line.startswith("|") and all(c in "| -:\t" for c in sep_line) and "-" in sep_line:
+                header_cells = [c.strip() for c in stripped.strip("|").split("|")]
+                sep_cells = [c.strip() for c in sep_line.strip("|").split("|")]
+                if len(header_cells) >= 2 and len(header_cells) == len(sep_cells):
+                    rows: list[list[str]] = []
+                    j = i + 2
+                    while j < len(lines) and lines[j].strip().startswith("|") and lines[j].strip().endswith("|"):
+                        row_cells = [c.strip() for c in lines[j].strip().strip("|").split("|")]
+                        if len(row_cells) < len(header_cells):
+                            row_cells.extend([""] * (len(header_cells) - len(row_cells)))
+                        rows.append(row_cells[:len(header_cells)])
+                        j += 1
+
+                    if rows:
+                        col_widths = [len(h) for h in header_cells]
+                        for r in rows:
+                            for col_idx, cell in enumerate(r):
+                                if col_idx < len(col_widths):
+                                    col_widths[col_idx] = max(col_widths[col_idx], len(cell))
+                        est_table_width = sum(col_widths) + (len(col_widths) * 3) + 1
+
+                        # Threshold: if number of columns > 3 or est_table_width > max_width - 4
+                        if len(header_cells) > 3 or est_table_width > max_width - 4:
+                            for r in rows:
+                                first_val = r[0]
+                                if first_val:
+                                    lead = f"**{first_val}**" if not first_val.startswith("**") else first_val
+                                    output_lines.append(f"{bullet} {lead}:")
+                                for col_name, val in zip(header_cells[1:], r[1:]):
+                                    if val:
+                                        output_lines.append(f"  - **{col_name}**: {val}")
+                            output_lines.append("")
+                            i = j
+                            continue
+        output_lines.append(line)
+        i += 1
+    return "\n".join(output_lines)
 
 
 # ── Intent-derived thinking ───────────────────────────────────────────────
@@ -117,7 +193,55 @@ def _compact_tool_display(tool: str, args: dict[str, Any]) -> str:
     return tool
 
 
+def _tool_name_from_display(display: str) -> str:
+    """Extract tool name from display string for icon lookup."""
+    _map = {
+        "read": "read_file", "write": "write_file",
+        "edit": "edit_file", "list": "list_files",
+        "run": "run_command", "grep": "grep",
+        "glob": "glob", "git": "git_status",
+    }
+    for prefix, tool in _map.items():
+        if display.lower().startswith(prefix):
+            return tool
+    return ""
+
+
 # ── Conversation state ────────────────────────────────────────────────────
+
+class ActivityItem(tuple):
+    """Backward-compatible tuple (icon, display, status) with rich metadata."""
+
+    def __new__(
+        cls,
+        icon: str,
+        display: str,
+        status: str,
+        detail: str = "",
+        exit_code: int | None = None,
+        error: str = "",
+        call_id: str = "",
+        tool: str = "",
+    ) -> ActivityItem:
+        return super().__new__(cls, (icon, display, status))
+
+    def __init__(
+        self,
+        icon: str,
+        display: str,
+        status: str,
+        detail: str = "",
+        exit_code: int | None = None,
+        error: str = "",
+        call_id: str = "",
+        tool: str = "",
+    ) -> None:
+        self.detail = detail
+        self.exit_code = exit_code
+        self.error = error
+        self.call_id = call_id
+        self.tool = tool
+
 
 @dataclass
 class AgentState:
@@ -137,8 +261,8 @@ class ConversationState:
     models_used: list[str] = field(default_factory=list)
     verification_note: str = ""
     model_activity: str = ""
-    # Each entry: (icon, display, status)  status in running|success|failed
-    items: list[tuple[str, str, str]] = field(default_factory=list)
+    # Each entry: ActivityItem (tuple: icon, display, status) status in running|success|failed
+    items: list[ActivityItem] = field(default_factory=list)
     current_tool: str = ""
     iterations: int = 0
     tool_calls: int = 0
@@ -150,14 +274,17 @@ class ConversationState:
     workspace: str = ""
     # Activity aggregation: track consecutive reads for collapsing
     _consecutive_reads: int = 0
+    _last_read_display: str = ""
     stage: str = "Connecting…"
     current_turn_tokens: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     tokens_estimated: bool = False
     file_change_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    files_activity: dict[str, str] = field(default_factory=dict)
     current_diff_preview: dict[str, Any] | None = None
     test_summary: dict[str, Any] | None = None
+    is_9router: bool = False
 
     def update_agent(self, name: str, status: str) -> None:
         if name not in self.agents:
@@ -165,43 +292,164 @@ class ConversationState:
         else:
             self.agents[name].status = status
 
-    def add_running(self, display: str, tool: str = "") -> None:
+    def add_running(self, display: str, tool: str = "", call_id: str = "") -> None:
+        # Check for duplicate start event for currently running invocation
+        if self.items and self.items[-1][2] == "running":
+            last = self.items[-1]
+            last_call_id = getattr(last, "call_id", "")
+            last_tool = getattr(last, "tool", "") or self.current_tool
+            is_dup = False
+            if call_id and last_call_id:
+                is_dup = (call_id == last_call_id)
+            elif tool and last_tool == tool:
+                is_dup = True
+
+            if is_dup:
+                if display and len(display) > len(last[1]):
+                    self.items[-1] = ActivityItem(
+                        last[0],
+                        display,
+                        "running",
+                        detail=getattr(last, "detail", ""),
+                        exit_code=getattr(last, "exit_code", None),
+                        error=getattr(last, "error", ""),
+                        call_id=call_id or last_call_id,
+                        tool=tool or last_tool,
+                    )
+                return
+
         # Activity aggregation: collapse consecutive reads into summary
         is_read = tool in ("read_file", "list_files", "glob", "grep")
         if is_read:
             self._consecutive_reads += 1
+            self._last_read_display = display
             if self._consecutive_reads >= 3:
-                # Replace the aggregated entry or add one
                 agg_display = f"Inspected {self._consecutive_reads} files"
-                # Find and update existing aggregate entry
                 for i in range(len(self.items) - 1, -1, -1):
-                    if self.items[i][2] in ("success", "running") and self.items[i][1].startswith("Inspected "):
-                        self.items[i] = (Sym.CHECK, agg_display, "success")
+                    if self.items[i][1].startswith("Inspected "):
+                        self.items[i] = ActivityItem(Sym.SPINNER, agg_display, "running", call_id=call_id, tool=tool)
                         self.tool_calls += 1
                         return
-                # First time aggregating: replace last 2 individual reads
-                self.items.append((Sym.SPINNER, agg_display, "running"))
+                self.items.append(ActivityItem(Sym.SPINNER, agg_display, "running", call_id=call_id, tool=tool))
                 self.tool_calls += 1
                 return
         else:
             self._consecutive_reads = 0
+            self._last_read_display = ""
 
-        self.items.append((Sym.SPINNER, display, "running"))
+        self.items.append(ActivityItem(Sym.SPINNER, display, "running", call_id=call_id, tool=tool))
         if len(self.items) > self.max_items:
             self.items = self.items[-self.max_items:]
         self.tool_calls += 1
 
-    def complete_last(self, status: str) -> None:
+    def complete_last(
+        self,
+        status: str,
+        exit_code: int | None = None,
+        error: str = "",
+        detail: str = "",
+        call_id: str = "",
+        tool: str = "",
+    ) -> None:
         if not self.items:
             return
-        icon, text, _ = self.items[-1]
+
+        target_idx = -1
+        if call_id:
+            for i in range(len(self.items) - 1, -1, -1):
+                if getattr(self.items[i], "call_id", "") == call_id:
+                    target_idx = i
+                    break
+        if target_idx == -1 and tool:
+            for i in range(len(self.items) - 1, -1, -1):
+                if getattr(self.items[i], "tool", "") == tool and self.items[i][2] == "running":
+                    target_idx = i
+                    break
+        if target_idx == -1:
+            for i in range(len(self.items) - 1, -1, -1):
+                if self.items[i][2] == "running":
+                    target_idx = i
+                    break
+        if target_idx == -1:
+            target_idx = len(self.items) - 1
+
+        old = self.items[target_idx]
+        # Avoid duplicate completion overwriting rich error data with empty data
+        if old[2] in ("success", "failed", "error", "cancelled") and status in ("success", "failed", "error", "cancelled"):
+            if not (exit_code is not None or error) and (getattr(old, "exit_code", None) is not None or getattr(old, "error", "")):
+                return
+
+        icon, text = old[0], old[1]
+        tool_name = getattr(old, "tool", "") or tool or _tool_name_from_display(text)
         if status == "success":
             new_icon = Sym.CHECK
             new_status = "success"
+            if text.startswith("Inspected "):
+                text = f"Inspected {self._consecutive_reads} files"
+        elif status == "cancelled":
+            new_icon = "!"
+            new_status = "cancelled"
         else:
             new_icon = Sym.CROSS
             new_status = "error" if status in ("error", "failed") else status
-        self.items[-1] = (new_icon, text, new_status)
+
+        cleaned_error = ""
+        if error:
+            cleaned_error = error.strip().splitlines()[0].strip()
+        elif detail:
+            cleaned_error = detail.strip().splitlines()[0].strip()
+
+        # Handle failure inside an aggregated read block:
+        # Do not mark all N inspected files as failed if only the last read failed.
+        if new_status in ("error", "failed") and text.startswith("Inspected "):
+            if self._consecutive_reads > 1:
+                prev_count = self._consecutive_reads - 1
+                prev_text = f"Inspected {prev_count} files" if prev_count > 1 else "Inspected 1 file"
+                self.items[target_idx] = ActivityItem(
+                    Sym.CHECK,
+                    prev_text,
+                    "success",
+                    call_id=getattr(old, "call_id", ""),
+                    tool="read_file",
+                )
+                failed_display = getattr(self, "_last_read_display", "") or text
+                self.items.append(
+                    ActivityItem(
+                        new_icon,
+                        failed_display,
+                        new_status,
+                        detail=detail,
+                        exit_code=exit_code,
+                        error=cleaned_error,
+                        call_id=call_id or getattr(old, "call_id", ""),
+                        tool=tool or tool_name,
+                    )
+                )
+            else:
+                failed_display = getattr(self, "_last_read_display", "") or text
+                self.items[target_idx] = ActivityItem(
+                    new_icon,
+                    failed_display,
+                    new_status,
+                    detail=detail,
+                    exit_code=exit_code,
+                    error=cleaned_error,
+                    call_id=call_id or getattr(old, "call_id", ""),
+                    tool=tool or tool_name,
+                )
+            self._consecutive_reads = 0
+            return
+
+        self.items[target_idx] = ActivityItem(
+            new_icon,
+            text,
+            new_status,
+            detail=detail,
+            exit_code=exit_code,
+            error=cleaned_error,
+            call_id=call_id or getattr(old, "call_id", ""),
+            tool=tool or tool_name,
+        )
 
     def to_snapshot(self) -> dict[str, Any]:
         return {
@@ -264,6 +512,17 @@ class ConversationRenderer:
 
     def stop(self) -> None:
         self._active = False
+        # Sweep any in-flight items so no spinner is ever frozen into history
+        for i in range(len(self.state.items)):
+            if self.state.items[i][2] == "running":
+                tool_name = getattr(self.state.items[i], "tool", "") or self._tool_name_from_display(self.state.items[i][1])
+                self.state.items[i] = ActivityItem(
+                    Sym.CHECK,
+                    self.state.items[i][1],
+                    "success",
+                    call_id=getattr(self.state.items[i], "call_id", ""),
+                    tool=tool_name,
+                )
         if self._live is not None:
             try:
                 self._live.update(self._renderable())
@@ -302,7 +561,8 @@ class ConversationRenderer:
         In plain mode, we print the prompt to keep history intact.
         """
         if self.plain:
-            self.console.print(f"\n❯ {goal}", highlight=False)
+            prompt_sym = Sym.PROMPT_ASCII if self.plain or not _UNICODE_SUPPORTED else Sym.PROMPT
+            self.console.print(f"\n{prompt_sym} {goal}", highlight=False)
 
     def _show_thinking(self) -> None:
         # No-op: intent is shown via _renderable(), not as a separate print.
@@ -350,7 +610,7 @@ class ConversationRenderer:
         self.state.iterations = count
         self._refresh()
 
-    def tool_started(self, tool: str, args: dict[str, Any]) -> None:
+    def tool_started(self, tool: str, args: dict[str, Any], call_id: str = "") -> None:
         display = _compact_tool_display(tool, args)
         if tool == "run_command":
             cmd = args.get("command", "")
@@ -359,6 +619,8 @@ class ConversationRenderer:
             cmd_lower = str(cmd).lower()
             if any(w in cmd_lower for w in ("pytest", "test", "unittest", "cargo test", "npm test")):
                 self.state.stage = "Running tests…"
+            elif any(w in cmd_lower for w in ("git status", "git diff", "git log", "git commit", "git push")):
+                self.state.stage = "Git operation…"
             else:
                 self.state.stage = "Running command…"
         elif tool in ("read_file", "list_files", "grep", "glob"):
@@ -370,10 +632,10 @@ class ConversationRenderer:
         elif tool.startswith("mcp_"):
             self.state.stage = f"Calling {tool}…"
         self.state.current_tool = tool
-        self.state.add_running(display, tool=tool)
+        self.state.add_running(display, tool=tool, call_id=call_id)
         self._refresh()
 
-    def tool_started_safe(self, tool: str, summary: str) -> None:
+    def tool_started_safe(self, tool: str, summary: str, call_id: str = "") -> None:
         """Render the semantic tool summary without consuming raw arguments."""
         detail = summary.partition(":")[2].strip() if ":" in summary else ""
         if tool == "run_command":
@@ -399,11 +661,19 @@ class ConversationRenderer:
             elif tool.startswith("git_"):
                 self.state.stage = "Git operation…"
         self.state.current_tool = tool
-        self.state.add_running(display, tool=tool)
+        self.state.add_running(display, tool=tool, call_id=call_id)
         self._refresh()
 
-    def tool_completed(self, tool: str, status: str) -> None:
-        self.state.complete_last(status)
+    def tool_completed(
+        self,
+        tool: str,
+        status: str,
+        exit_code: int | None = None,
+        error: str = "",
+        detail: str = "",
+        call_id: str = "",
+    ) -> None:
+        self.state.complete_last(status, exit_code=exit_code, error=error, detail=detail, call_id=call_id, tool=tool)
         self.state.current_tool = ""
         self._refresh()
 
@@ -444,7 +714,19 @@ class ConversationRenderer:
             "diff": diff,
         }
         self.state.stage = "Editing code…"
+        self.record_file_activity(path, "modified")
         self._refresh()
+
+    def record_file_activity(self, path: str, action: str) -> None:
+        """Record real-time file activity (inspected, created, modified, deleted, failed)."""
+        if not path:
+            return
+        short = shorten_path(str(path), self.state.workspace)
+        self.state.files_activity[short] = action
+        self._refresh()
+
+    def update_file_activity(self, path: str, action: str) -> None:
+        self.record_file_activity(path, action)
 
     def update_test_completed(
         self,
@@ -530,18 +812,10 @@ class ConversationRenderer:
             return ("▶", "cyan")
         return (Sym.SPINNER, "cyan")
 
-    def _tool_name_from_display(self, display: str) -> str:
+    @staticmethod
+    def _tool_name_from_display(display: str) -> str:
         """Extract tool name from display string for icon lookup."""
-        _map = {
-            "read": "read_file", "write": "write_file",
-            "edit": "edit_file", "list": "list_files",
-            "run": "run_command", "grep": "grep",
-            "glob": "glob", "git": "git_status",
-        }
-        for prefix, tool in _map.items():
-            if display.lower().startswith(prefix):
-                return tool
-        return ""
+        return _tool_name_from_display(display)
 
     def _renderable(self) -> Any:
         """Build the live renderable: phase header + intent + compact tool activity.
@@ -549,6 +823,10 @@ class ConversationRenderer:
         No 'Working...' placeholder.  No fake progress.  Just real activity.
         """
         lines: list[Any] = []
+
+        def _add_sep() -> None:
+            if lines and getattr(lines[-1], "plain", None) != "":
+                lines.append(Text(""))
 
         # Agent display — progressive disclosure
         if len(self.state.agents) > 1:
@@ -578,14 +856,15 @@ class ConversationRenderer:
                     parts.append(f"{len(failed)} failed")
                 summary = " · ".join(parts) if parts else f"{agent_count} workers"
                 lines.append(Text(f"  {Sym.SPINNER} {summary}", style="cyan"))
-            lines.append(Text(""))
+            _add_sep()
 
         # Phase section header — driven by real backend task.phase events
         if self.state.display_phase and self.state.display_phase != "Completed":
             phase_text = Text()
             phase_text.append(f"  {self.state.display_phase}", style="bold cyan")
             lines.append(phase_text)
-            lines.append(Text(""))
+            if self.state.todos or self.state.intent:
+                _add_sep()
 
         if self.state.todos:
             lines.append(Text("  Plan", style="bold"))
@@ -615,7 +894,7 @@ class ConversationRenderer:
                 lines.append(Text(f"  {tree_prefix}{icon} {title}", style=color))
             if len(self.state.todos) > limit:
                 lines.append(Text(f"  └─ +{len(self.state.todos) - limit} more", style="dim"))
-            lines.append(Text(""))
+            _add_sep()
         if self.state.verification_note:
             lines.append(Text(f"  {self.state.verification_note}", style="dim"))
         if self.state.model_activity:
@@ -625,13 +904,15 @@ class ConversationRenderer:
         if self.state.intent and not self._thinking_shown:
             self._thinking_shown = True
             lines.append(Text(f"    {self.state.intent}", style="dim"))
-            lines.append(Text(""))
+            _add_sep()
 
         # Tool activity (spec §6) — compact list with tree structure
         total_items = len(self.state.items)
-        for i, (icon, display, status) in enumerate(self.state.items):
+        has_plan = bool(self.state.todos)
+        for i, item in enumerate(self.state.items):
+            icon, display, status = item[0], item[1], item[2]
             is_last = (i == total_items - 1)
-            tree_prefix = "└─ " if is_last else "├─ "
+            tree_prefix = ("└─ " if is_last else "├─ ") if has_plan else "  "
             
             txt = Text()
             tool_name = self._tool_name_from_display(display)
@@ -644,17 +925,37 @@ class ConversationRenderer:
                 txt.append(display, style="dim")
                 if tool_name == "run_command":
                     txt.append(" ...", style="dim")
+                lines.append(txt)
             elif status == "success":
                 tool_icon, tool_style = self._tool_icon(tool_name, "success")
                 txt.append(f"{tool_icon} ", style=tool_style)
                 txt.append(display, style="dim")
+                lines.append(txt)
             elif status in ("failed", "error"):
                 txt.append(f"{Sym.CROSS} ", style="red")
                 txt.append(display, style="dim")
+                lines.append(txt)
+
+                # Indented diagnostic explanation for failed tool
+                exit_code = getattr(item, "exit_code", None)
+                error_msg = getattr(item, "error", "")
+                if exit_code is not None or error_msg:
+                    err_txt = Text()
+                    indent = "      " if has_plan else "    "
+                    err_txt.append(indent, style="dim")
+                    parts = []
+                    if exit_code is not None and exit_code != 0:
+                        parts.append(f"Exit {exit_code}")
+                    if error_msg:
+                        max_w = max(20, self.console.size.width - len(indent) - 10)
+                        short_err = error_msg[:max_w] + "..." if len(error_msg) > max_w else error_msg
+                        parts.append(short_err)
+                    err_txt.append(": ".join(parts) if parts else "Failed", style="dim red")
+                    lines.append(err_txt)
             else:
                 txt.append(f"{Sym.DOT} ", style="dim")
                 txt.append(display, style="dim")
-            lines.append(txt)
+                lines.append(txt)
 
         # Test results status if recent
         if self.state.test_summary:
@@ -671,6 +972,31 @@ class ConversationRenderer:
             if diff_box:
                 lines.append(diff_box)
 
+        # File activity tracking
+        if self.state.files_activity:
+            act_items = list(self.state.files_activity.items())
+            limit = min(len(act_items), 5)
+            file_texts: list[Text] = []
+            for path, act in act_items[-limit:]:
+                act_lower = act.lower()
+                if "created" in act_lower:
+                    icon, col = "+", "green"
+                elif "modified" in act_lower or "editing" in act_lower:
+                    icon, col = "●", "yellow"
+                elif "deleted" in act_lower:
+                    icon, col = "-", "red"
+                elif "failed" in act_lower:
+                    icon, col = "✗", "red"
+                else:
+                    icon, col = "✓", "dim cyan"
+                file_texts.append(Text(f"    [{icon}] {path} ({act})", style=col))
+            if file_texts:
+                _add_sep()
+                lines.append(Text("  Files", style="bold"))
+                lines.extend(file_texts)
+                if len(act_items) > limit:
+                    lines.append(Text(f"    └─ +{len(act_items) - limit} more files", style="dim"))
+
         # Status line (spinner + stage + elapsed + token indicator)
         if self._active:
             lines.append(self._render_status_line())
@@ -679,13 +1005,12 @@ class ConversationRenderer:
         return Group(*lines) if lines else Text("")
 
     def _render_status_line(self) -> Text:
-        """Render the live animated status line (spinner + stage + elapsed + tokens)."""
-        idx = int(time.monotonic() * 10) % len(_SPINNER_FRAMES)
+        """Render the live animated status line (sparkle + stage + elapsed + tokens)."""
+        idx = int(time.monotonic() * 8) % len(_SPINNER_FRAMES)
         spinner = _SPINNER_FRAMES[idx]
 
         elapsed_sec = int(time.monotonic() - self.state.started_at) if self.state.started_at else 0
-        mins, secs = divmod(max(0, elapsed_sec), 60)
-        time_str = f"{mins:02d}:{secs:02d}"
+        elapsed_str = fmt_elapsed(elapsed_sec)
 
         stage = self.state.stage or "Working…"
         tok_str = ""
@@ -696,7 +1021,7 @@ class ConversationRenderer:
         txt = Text()
         txt.append(f"  {spinner} ", style="bold cyan")
         txt.append(stage, style="bold")
-        txt.append(f"   {time_str}{tok_str}", style="dim")
+        txt.append(f" ({elapsed_str}{tok_str})", style="dim")
         return txt
 
     def _render_diff_preview(self, preview: dict[str, Any]) -> Any:
@@ -751,7 +1076,8 @@ class ConversationRenderer:
     def _render_plain(self) -> None:
         # Plain mode: one line per tool, printed immediately
         if self.state.items:
-            icon, display, status = self.state.items[-1]
+            item = self.state.items[-1]
+            icon, display, status = item[0], item[1], item[2]
             elapsed_sec = int(time.monotonic() - self.state.started_at) if self.state.started_at else 0
             mins, secs = divmod(max(0, elapsed_sec), 60)
             time_str = f"{mins:02d}:{secs:02d}"
@@ -759,24 +1085,39 @@ class ConversationRenderer:
             if self.state.current_turn_tokens > 0:
                 tok_str = f" · ↓ {format_token_count(self.state.current_turn_tokens, self.state.tokens_estimated)}"
             line = f"  [{self.state.stage}] {icon} {display} ({time_str}{tok_str})"
+            exit_code = getattr(item, "exit_code", None)
+            error_msg = getattr(item, "error", "")
+            if status in ("failed", "error") and (exit_code is not None or error_msg):
+                parts = []
+                if exit_code is not None and exit_code != 0:
+                    parts.append(f"exit {exit_code}")
+                if error_msg:
+                    parts.append(error_msg)
+                if parts:
+                    line += f" [{': '.join(parts)}]"
             if line != self._last_plain_line:
                 self._last_plain_line = line
-                self.console.print(line, highlight=False)
+                self.console.print(line, highlight=False, markup=False)
+
+    def set_9router(self, is_9router: bool = True) -> None:
+        """Record that the current task is handled by 9router."""
+        self.state.is_9router = is_9router
 
     # ── streaming final response ──────────────────────────────────────
 
     def stream_response(self, text: str, delay: float = 0.0) -> None:
         """Stream the final response progressively (spec §9).
 
-        In rich mode, we render Markdown incrementally via a Live region.
+        In rich mode with delay > 0, we render Markdown incrementally via a Live region.
         In plain mode, we print line by line.
-        If delay is 0, we print immediately (still appears as streaming to
-        the user because prior Live activity was live).
+        If delay is 0, we render Markdown directly without Live context to prevent flicker.
         """
         if not text or not text.strip():
             return
         self.state.stage = "Preparing response…"
-        clean = text.strip()
+        clean = _clean_intro_narration(text.strip())
+        term_width = max(40, self.console.size.width)
+        clean = compact_markdown_tables(clean, max_width=term_width)
         if self.plain:
             for line in clean.splitlines():
                 self.console.print(f"  {line}", highlight=False)
@@ -785,23 +1126,28 @@ class ConversationRenderer:
             self.console.print("", highlight=False)
             return
 
-        # Rich mode: progressive reveal via Live + Markdown
-        from rich.live import Live
         from rich.markdown import Markdown
         from rich.padding import Padding
 
+        if delay <= 0:
+            # Direct, crisp render without Live overhead or redraw flicker
+            self.console.print(Padding(Markdown(clean, code_theme="monokai"), (0, 0, 0, 2)))
+            self.console.print("", highlight=False)
+            return
+
+        # Rich mode: progressive reveal via Live + Markdown
+        from rich.live import Live
         paragraphs = clean.split("\n\n")
         shown: list[str] = []
         try:
             with Live(console=self.console, refresh_per_second=12, transient=False) as live:
                 for para in paragraphs:
                     shown.append(para)
-                    md = Markdown("\n\n".join(shown))
+                    md = Markdown("\n\n".join(shown), code_theme="monokai")
                     live.update(Padding(md, (0, 0, 0, 2)))
-                    if delay:
-                        time.sleep(min(delay, 0.08))
+                    time.sleep(min(delay, 0.08))
         except Exception:
-            self.console.print(Padding(Markdown(clean), (0, 0, 0, 2)))
+            self.console.print(Padding(Markdown(clean, code_theme="monokai"), (0, 0, 0, 2)))
         self.console.print("", highlight=False)
 
     def render_completion(
@@ -817,6 +1163,9 @@ class ConversationRenderer:
         files_changed: list[str] | None = None,
         file_change_stats: dict[str, dict[str, int]] | None = None,
         test_results: dict[str, Any] | None = None,
+        verification_status: str | None = None,
+        verification_summary: str | None = None,
+        unverified_files: list[str] | None = None,
     ) -> None:
         """Completion indicator with duration, tokens, file changes, and test results."""
         elapsed_str = fmt_elapsed(elapsed)
@@ -834,12 +1183,18 @@ class ConversationRenderer:
             mark, label, style = Sym.CROSS, "Failed", "red"
         count = self.state.tool_calls
         self.console.print(
-            f"  {mark} {label}  {elapsed_str}  {count} tool calls",
+            f"  {mark} {label} · {elapsed_str} · {count} tool calls",
             style=style if not self.plain else None,
             highlight=False,
         )
         model_list = list(dict.fromkeys(models_used or self.state.models_used or ([model] if model else [])))
-        if model_list:
+        is_9router = (
+            getattr(self.state, "is_9router", False)
+            or any(str(m).lower() in ("9router", "ninerouter") for m in model_list)
+        )
+        if is_9router:
+            self.console.print("    Model  ⚡ Routed through 9router", style="dim", highlight=False)
+        elif model_list:
             names = [self._model_display_name(name) for name in model_list]
             label_key = "Model" if len(names) == 1 else "Models"
             self.console.print(f"    {label_key}  {'  →  '.join(names)}", style="dim", highlight=False)
@@ -861,7 +1216,7 @@ class ConversationRenderer:
 
         # Files changed & stats
         stats_map = dict(file_change_stats or self.state.file_change_stats)
-        file_list = files_changed or list(stats_map.keys())
+        file_list = files_changed or unverified_files or list(stats_map.keys())
         if file_list:
             parts = []
             for f in file_list:
@@ -871,7 +1226,8 @@ class ConversationRenderer:
                     parts.append(f"{short_f} (+{st['added']} -{st['removed']})")
                 else:
                     parts.append(short_f)
-            self.console.print(f"    Files  {', '.join(parts)}", style="dim", highlight=False)
+            files_label = "Files (unverified)" if not success and unverified_files else "Files"
+            self.console.print(f"    {files_label}  {', '.join(parts)}", style="yellow" if not success and unverified_files else "dim", highlight=False)
 
         # Test results
         tests = test_results or self.state.test_summary
@@ -884,19 +1240,35 @@ class ConversationRenderer:
                 self.console.print(f"    Tests  {passed} passed", style="green", highlight=False)
         elif not success and file_list:
             self.console.print("    Tests  None run (task stopped before tests)", style="dim", highlight=False)
+
+        # Verification status
+        if verification_status and verification_status.lower() not in ("not_started", "none", "unknown"):
+            if verification_status.lower() == "skipped":
+                v_style = "dim"
+                v_label = "Not applicable" if "not applicable" in (verification_summary or "").lower() or "read-only" in (verification_summary or "").lower() else "Skipped"
+                v_detail = f" ({verification_summary})" if verification_summary else ""
+                self.console.print(f"    Verification  {v_label}{v_detail}", style=v_style, highlight=False)
+            else:
+                v_style = "green" if verification_status.lower() == "passed" else "red" if verification_status.lower() in ("failed", "error") else "dim"
+                v_detail = f" ({verification_summary})" if verification_summary else ""
+                self.console.print(f"    Verification  {verification_status.title()}{v_detail}", style=v_style, highlight=False)
+        elif not success and file_list:
             self.console.print("    Verification  Not completed (task stopped before verification)", style="dim", highlight=False)
 
         durations = phase_durations or self.state.phase_durations
         phase_labels = ("planning", "thinking", "working", "repairing", "verifying")
-        summary = "  ".join(
+        summary_phases = [
             f"{phase.title()} {fmt_elapsed(durations[phase])}"
             for phase in phase_labels if durations.get(phase, 0) >= 0.5
-        )
-        if summary:
-            self.console.print(f"    {summary}", style="dim", highlight=False)
-        # Optional one-line error detail
+        ]
+        if len(summary_phases) >= 2 and any(durations.get(phase, 0) >= 1.0 for phase in phase_labels):
+            self.console.print(f"    {'  '.join(summary_phases)}", style="dim", highlight=False)
+
+        # Actionable failure error detail
         if error_detail and not success:
-            self.console.print(f"  [dim]{error_detail}[/]", highlight=False)
+            for err_l in error_detail.splitlines():
+                if err_l.strip():
+                    self.console.print(f"  [dim red]{err_l.strip()}[/]", highlight=False)
         self.console.print("", highlight=False)
 
     @staticmethod

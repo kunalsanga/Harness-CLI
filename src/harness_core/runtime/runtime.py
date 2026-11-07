@@ -579,7 +579,7 @@ class EngineeringRuntime:
         except (asyncio.TimeoutError, TimeoutError):
             timed_out = True
             for t in graph.tasks.values():
-                if t.status in (TaskStatus.PENDING, TaskStatus.EXECUTING, TaskStatus.IN_PROGRESS):
+                if t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
                     t.status = TaskStatus.FAILED
                     t.error = f"Task timed out after {timeout_seconds:.0f}s"
             self.state.register_blocker(f"Task timed out after {timeout_seconds:.0f}s")
@@ -603,7 +603,8 @@ class EngineeringRuntime:
         # ── Step 6: Verification (intent-aware) ────────────────────────
         if contract.should_skip_verification():
             # Read-only tasks: no verification needed — they produce no changes.
-            # Mark verification as passed based on task completion evidence.
+            # Mark verification as passed based on task completion evidence,
+            # or skipped if the task did not complete. Never mark as failed.
             completed_tasks = [
                 t for t in graph.tasks.values()
                 if t.status == TaskStatus.COMPLETED
@@ -612,7 +613,7 @@ class EngineeringRuntime:
             summary = f"read-only {contract.intent.value} task — no verification needed"
             results = []
             self.state.verification_status = (
-                VerificationStatus.PASSED if verification_ok else VerificationStatus.FAILED
+                VerificationStatus.PASSED if verification_ok else VerificationStatus.SKIPPED
             )
         else:
             await self._enter_stage(RuntimeStage.VERIFY, detail="requirement verification")

@@ -31,12 +31,37 @@ from typing import Any
 _PROVIDER_ENV_KEYS: dict[str, list[str]] = {
     "openrouter": ["OPENROUTER_API_KEY"],
     "openai": ["OPENAI_API_KEY"],
+    "azure": ["AZURE_OPENAI_API_KEY", "AZURE_API_KEY"],
     "anthropic": ["ANTHROPIC_API_KEY"],
     "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-    "nvidia": ["NVIDIA_API_KEY"],
+    "nvidia": ["NVIDIA_NIM_API_KEY", "NVIDIA_API_KEY"],
+    "freellmapi": ["FREELLMAPI_API_KEY"],
     "groq": ["GROQ_API_KEY"],
     "9router": ["NINE_ROUTER_API_KEY"],
     "ollama": [],  # No key needed, just host
+}
+
+_PROVIDER_BASE_URL_ENVS: dict[str, list[str]] = {
+    "openrouter": ["OPENROUTER_BASE_URL"],
+    "openai": ["OPENAI_BASE_URL"],
+    "azure": ["AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_BASE_URL", "AZURE_ENDPOINT"],
+    "freellmapi": ["FREELLMAPI_BASE_URL"],
+    "nvidia": ["NVIDIA_NIM_BASE_URL", "NVIDIA_BASE_URL"],
+    "anthropic": ["ANTHROPIC_BASE_URL"],
+    "gemini": ["GEMINI_BASE_URL", "GOOGLE_BASE_URL"],
+    "groq": ["GROQ_BASE_URL"],
+    "9router": ["NINE_ROUTER_BASE_URL"],
+}
+
+_PROVIDER_DEFAULT_MODEL_ENVS: dict[str, list[str]] = {
+    "openrouter": ["OPENROUTER_MODEL"],
+    "openai": ["OPENAI_MODEL"],
+    "azure": ["AZURE_OPENAI_DEPLOYMENT", "AZURE_DEPLOYMENT", "AZURE_OPENAI_MODEL", "AZURE_MODEL"],
+    "freellmapi": ["FREELLMAPI_MODEL"],
+    "nvidia": ["NVIDIA_NIM_MODEL", "NVIDIA_MODEL"],
+    "anthropic": ["ANTHROPIC_MODEL"],
+    "gemini": ["GEMINI_MODEL", "GOOGLE_MODEL"],
+    "groq": ["GROQ_MODEL"],
 }
 
 
@@ -182,6 +207,9 @@ class CredentialResolver:
 
         Returns None if no credential is available.
         """
+        base_url = self._resolve_base_url(provider)
+        default_model = self._resolve_default_model(provider)
+
         # 1. Environment variable
         env_key = self._resolve_env_key(provider)
         if env_key:
@@ -189,12 +217,28 @@ class CredentialResolver:
                 provider=provider,
                 api_key=env_key,
                 source="env",
+                base_url=base_url,
+                default_model=default_model,
             )
 
         # 2. Persistent user credential
         stored = self._store.load_credential(provider)
         if stored and stored.is_valid:
+            if base_url and not stored.base_url:
+                stored.base_url = base_url
+            if default_model and not stored.default_model:
+                stored.default_model = default_model
             return stored
+
+        # 3. Host-based endpoints with base_url (like ollama or local freellmapi)
+        if provider in {"ollama", "freellmapi"} and base_url:
+            return ProviderCredential(
+                provider=provider,
+                api_key="",
+                source="env",
+                base_url=base_url,
+                default_model=default_model,
+            )
 
         return None
 
@@ -215,6 +259,24 @@ class CredentialResolver:
             if cred and cred.is_valid:
                 results.append(cred)
         return results
+
+    def _resolve_base_url(self, provider: str) -> str | None:
+        """Check environment variables for a provider's custom base URL."""
+        urls = _PROVIDER_BASE_URL_ENVS.get(provider, [])
+        for key in urls:
+            value = os.environ.get(key, "").strip()
+            if value:
+                return value
+        return None
+
+    def _resolve_default_model(self, provider: str) -> str | None:
+        """Check environment variables for a provider's default model."""
+        models = _PROVIDER_DEFAULT_MODEL_ENVS.get(provider, [])
+        for key in models:
+            value = os.environ.get(key, "").strip()
+            if value:
+                return value
+        return None
 
     def _resolve_env_key(self, provider: str) -> str | None:
         """Check environment variables for a provider's API key."""
